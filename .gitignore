@@ -1,0 +1,7 @@
+local/
+logs/
+nrc/third_party/
+__pycache__/
+*.cubin
+*.nrc
+*.exr

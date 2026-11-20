@@ -1,0 +1,2804 @@
+diff --git a/intern/cycles/bvh/build.cpp b/intern/cycles/bvh/build.cpp
+index 42c7b32..18ce234 100644
+--- a/intern/cycles/bvh/build.cpp
++++ b/intern/cycles/bvh/build.cpp
+@@ -473,7 +473,10 @@ unique_ptr<BVHNode> BVHBuild::run()
+     params.use_spatial_split = false;
+   }
+ 
+-  if (!params.top_level && params.use_spatial_split && params.use_unaligned_nodes &&
++  /* Ours: when CYCLES_BVH2_SPATIAL_SPLIT forces spatial splits (bvh.cpp), never split curve BVHs, also without
++   * unaligned nodes (as 4.5.0 final4: spatial splits on junkshop's curves cost 16% on H100). Unset: stock. */
++  if (!params.top_level && params.use_spatial_split &&
++      (params.use_unaligned_nodes || getenv("CYCLES_BVH2_SPATIAL_SPLIT") != nullptr) &&
+       !references.empty())
+   {
+     /* Spatial splitting for curve splitting leads to very long build times.
+diff --git a/intern/cycles/bvh/bvh.cpp b/intern/cycles/bvh/bvh.cpp
+index 12466f5..0038322 100644
+--- a/intern/cycles/bvh/bvh.cpp
++++ b/intern/cycles/bvh/bvh.cpp
+@@ -100,8 +100,34 @@ unique_ptr<BVH> BVH::create(const BVHParams &params,
+                             Device *device)
+ {
+   switch (params.bvh_layout) {
+-    case BVH_LAYOUT_BVH2:
+-      return make_unique<BVH2>(params, geometry, objects);
++    case BVH_LAYOUT_BVH2: {
++      /* Ours: CYCLES_BVH2_SPATIAL_SPLIT=0|1 and CYCLES_BVH2_MAX_TRIANGLE_LEAF_SIZE=<n> override the BVH2
++       * build (4.5.0 final4 used spatial splits and leaf size 2 on CUDA). Unset: stock. */
++      BVHParams bvh2_params = params;
++      if (const char *value = getenv("CYCLES_BVH2_SPATIAL_SPLIT")) {
++        bvh2_params.use_spatial_split = atoi(value) != 0;
++      }
++      if (const char *value = getenv("CYCLES_BVH2_MAX_TRIANGLE_LEAF_SIZE")) {
++        const int leaf_size = atoi(value);
++        if (leaf_size > 0) {
++          bvh2_params.max_triangle_leaf_size = leaf_size;
++        }
++      }
++      /* Ours: SAH costs and split thresholds of the BVH2 build (unset: stock). */
++      if (const char *value = getenv("CYCLES_BVH2_SAH_NODE_COST")) {
++        bvh2_params.sah_node_cost = float(atof(value));
++      }
++      if (const char *value = getenv("CYCLES_BVH2_SAH_PRIMITIVE_COST")) {
++        bvh2_params.sah_primitive_cost = float(atof(value));
++      }
++      if (const char *value = getenv("CYCLES_BVH2_SPATIAL_SPLIT_ALPHA")) {
++        bvh2_params.spatial_split_alpha = float(atof(value));
++      }
++      if (const char *value = getenv("CYCLES_BVH2_UNALIGNED_SPLIT_THRESHOLD")) {
++        bvh2_params.unaligned_split_threshold = float(atof(value));
++      }
++      return make_unique<BVH2>(bvh2_params, geometry, objects);
++    }
+     case BVH_LAYOUT_EMBREE:
+     case BVH_LAYOUT_EMBREEGPU:
+ #ifdef WITH_EMBREE
+diff --git a/intern/cycles/bvh/bvh2.cpp b/intern/cycles/bvh/bvh2.cpp
+index 0cc2eeb..b1f7cf9 100644
+--- a/intern/cycles/bvh/bvh2.cpp
++++ b/intern/cycles/bvh/bvh2.cpp
+@@ -6,6 +6,8 @@
+  * Adapted code from NVIDIA Corporation. */
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
+ 
+ #include "bvh/bvh2.h"
+ 
+@@ -15,10 +17,13 @@
+ #include "scene/pointcloud.h"
+ 
+ #include "bvh/build.h"
++#include "bvh/bvh2_treelet.h"
+ #include "bvh/node.h"
+ #include "bvh/unaligned.h"
+ 
+ #include "util/progress.h"
++#include "util/tbb.h"
++#include "util/time.h"
+ 
+ CCL_NAMESPACE_BEGIN
+ 
+@@ -29,6 +34,114 @@ int BVHStackEntry::encodeIdx() const
+   return (node->is_leaf()) ? ~idx : idx;
+ }
+ 
++/* Ours: CYCLES_BVH2_OPTIMIZE=<passes> restructures the inner nodes of every BVH2 (top level and each object) after
++ * the build, with the leaves fixed: treelet restructuring (7 leaves, dynamic programming) on the node cost
++ * half area + (2 / L) * volume, L = CYCLES_BVH2_OPTIMIZE_F (default 0.002) times the tree's root diagonal; F = 0 is plain
++ * SAH. Rebuilt boxes are float unions of their children, so every box still contains its contents and the leaves and
++ * their primitives do not change. Trees with unaligned or motion nodes, or a child box outside its parent's, are left
++ * as built. Unset or 0: stock. Analysis: analysis/v53_bvhopt.md. */
++static void bvh2_optimize_topology(BVHNode *root, const int passes, const double fraction)
++{
++  if (root == nullptr || root->is_leaf()) {
++    return;
++  }
++  const double t_start = time_dt();
++  vector<InnerNode *> inner;
++  vector<BVHNode *> leaves;
++  bvhopt::Tree t;
++  auto to_box = [](const BoundBox &b) {
++    bvhopt::Box r;
++    r.lo[0] = b.min.x;
++    r.lo[1] = b.min.y;
++    r.lo[2] = b.min.z;
++    r.hi[0] = b.max.x;
++    r.hi[1] = b.max.y;
++    r.hi[2] = b.max.z;
++    return r;
++  };
++  auto plain = [](const BVHNode *n) {
++    return !n->is_unaligned && n->time_from == 0.0f && n->time_to == 1.0f;
++  };
++  auto add = [&](BVHNode *n) -> int {
++    if (n->is_leaf()) {
++      leaves.push_back(n);
++      t.lbox.push_back(to_box(n->bounds));
++      t.lvis.push_back(n->visibility);
++      return ~int(leaves.size() - 1);
++    }
++    inner.push_back(static_cast<InnerNode *>(n));
++    t.c0.push_back(0);
++    t.c1.push_back(0);
++    t.box.push_back(to_box(n->bounds));
++    t.vis.push_back(n->visibility);
++    t.fixed.push_back(0);
++    return int(inner.size() - 1);
++  };
++  add(root);
++  for (size_t i = 0; i < inner.size(); i++) {
++    InnerNode *n = inner[i];
++    if (n->num_children() != 2 || !plain(n)) {
++      return;
++    }
++    const bvhopt::Box pb = t.box[i]; /* a copy: add() below grows t.box */
++    int e[2];
++    for (int k = 0; k < 2; k++) {
++      BVHNode *c = n->get_child(k);
++      if (!plain(c)) {
++        return;
++      }
++      const BoundBox &cb = c->bounds;
++      if (i > 0 && (cb.min.x < pb.lo[0] || cb.min.y < pb.lo[1] || cb.min.z < pb.lo[2] ||
++                    cb.max.x > pb.hi[0] || cb.max.y > pb.hi[1] || cb.max.z > pb.hi[2]))
++      {
++        return;
++      }
++      e[k] = add(c);
++    }
++    t.c0[i] = e[0];
++    t.c1[i] = e[1];
++  }
++  bvhopt::refit(t);
++  if (fraction > 0.0) {
++    const bvhopt::Box &rb = t.box[0];
++    double d2 = 0.0;
++    for (int k = 0; k < 3; k++) {
++      d2 += (double(rb.hi[k]) - double(rb.lo[k])) * (double(rb.hi[k]) - double(rb.lo[k]));
++    }
++    if (d2 > 0.0) {
++      t.vol_weight = 2.0 / (fraction * std::sqrt(d2));
++    }
++  }
++  const double area_before = bvhopt::inner_area_sum(t);
++  const long long rebuilt = bvhopt::optimize<7>(
++      t, passes, [](const int n, auto &&fn) { parallel_for(0, n, fn); });
++  /* Rewire: every entity gets exactly one new parent, so release all child pointers first. */
++  for (InnerNode *n : inner) {
++    n->children[0].release();
++    n->children[1].release();
++  }
++  auto ptr = [&](const int e) -> BVHNode * { return e >= 0 ? inner[e] : leaves[~e]; };
++  for (size_t i = 0; i < inner.size(); i++) {
++    InnerNode *n = inner[i];
++    n->children[0].reset(ptr(t.c0[i]));
++    n->children[1].reset(ptr(t.c1[i]));
++    const bvhopt::Box &b = t.box[i];
++    n->bounds = BoundBox(make_float3(b.lo[0], b.lo[1], b.lo[2]), make_float3(b.hi[0], b.hi[1], b.hi[2]));
++    n->visibility = t.vis[i];
++  }
++  if (inner.size() >= 100000) {
++    fprintf(stderr,
++            "CYCLES_BVH2_OPTIMIZE: %zu inner nodes, %d passes, F %g: %lld treelets rebuilt, inner area %.4f of "
++            "built, %.2f s\n",
++            inner.size(),
++            passes,
++            fraction,
++            rebuilt,
++            bvhopt::inner_area_sum(t) / std::max(area_before, 1e-300),
++            time_dt() - t_start);
++  }
++}
++
+ BVH2::BVH2(const BVHParams &params_,
+            const vector<Geometry *> &geometry_,
+            const vector<Object *> &objects_)
+@@ -54,6 +167,15 @@ void BVH2::build(Progress &progress, Stats * /*unused*/)
+     return;
+   }
+ 
++  /* Ours: CYCLES_BVH2_OPTIMIZE=<passes>, see bvh2_optimize_topology(). Unset or 0: stock. */
++  if (const char *value = getenv("CYCLES_BVH2_OPTIMIZE")) {
++    const int passes = atoi(value);
++    if (passes > 0) {
++      const char *f = getenv("CYCLES_BVH2_OPTIMIZE_F");
++      bvh2_optimize_topology(bvh2_root.get(), passes, f ? atof(f) : 0.002);
++    }
++  }
++
+   /* BVH builder returns tree in a binary mode (with two children per inner
+    * node. Need to adopt that for a wider BVH implementations. */
+   const unique_ptr<BVHNode> root = widen_children_nodes(std::move(bvh2_root));
+diff --git a/intern/cycles/bvh/bvh2_treelet.h b/intern/cycles/bvh/bvh2_treelet.h
+new file mode 100644
+index 0000000..f092d52
+--- /dev/null
++++ b/intern/cycles/bvh/bvh2_treelet.h
+@@ -0,0 +1,346 @@
++/* Ours (cycles-h100, CYCLES_BVH2_OPTIMIZE; copy of bvhopt/treelet.h). Post-build BVH2 topology optimizer with fixed leaves.
++ *
++ * Treelet restructuring after Karras & Aila 2013 ("Fast parallel construction of high-quality bounding volume
++ * hierarchies"): for every inner node r (children before parents), grow a treelet of up to N leaves by repeatedly
++ * opening the treelet leaf with the largest surface area that is an inner node, then find by dynamic programming over
++ * leaf subsets the binary tree over those leaves with the smallest sum of inner-node surface areas, and rebuild the
++ * treelet if it is cheaper. With the BVH leaves fixed, the leaf term of the SAH is constant, so the sum of inner-node
++ * areas is the whole objective.
++ *
++ * Boxes: every rebuilt inner box is the float min/max union of its children's boxes (the builder's BoundBox::grow), so
++ * no box shrinks below its contents; the treelet root's box is the union of the same leaves, hence unchanged bit for
++ * bit, and nothing above the treelet changes. Visibility is the OR of the children.
++ *
++ * Header-only, no Cycles types. Entities: inner node i >= 0, BVH leaf l encoded as ~l (< 0). Node 0 is the root.
++ * The parallel driver cuts the tree at depth `cut_depth`; the subtrees below the cut are disjoint, so their nodes are
++ * processed in parallel, then the nodes above the cut sequentially. The result does not depend on the thread count.
++ */
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <vector>
++
++namespace bvhopt {
++
++struct Box {
++  float lo[3], hi[3];
++};
++
++static inline double overlap_half_area(const Box &a, const Box &b)
++{
++  double e[3];
++  for (int k = 0; k < 3; k++) {
++    e[k] = double(std::min(a.hi[k], b.hi[k])) - double(std::max(a.lo[k], b.lo[k]));
++    if (e[k] <= 0.0) {
++      return 0.0;
++    }
++  }
++  return e[0] * e[1] + e[1] * e[2] + e[2] * e[0];
++}
++
++static inline Box box_union(const Box &a, const Box &b)
++{
++  Box r;
++  for (int k = 0; k < 3; k++) {
++    r.lo[k] = std::min(a.lo[k], b.lo[k]);
++    r.hi[k] = std::max(a.hi[k], b.hi[k]);
++  }
++  return r;
++}
++
++static inline double half_area(const Box &b)
++{
++  const double x = std::max(0.0, double(b.hi[0]) - double(b.lo[0]));
++  const double y = std::max(0.0, double(b.hi[1]) - double(b.lo[1]));
++  const double z = std::max(0.0, double(b.hi[2]) - double(b.lo[2]));
++  return x * y + y * z + z * x;
++}
++
++static inline double volume(const Box &b)
++{
++  const double x = std::max(0.0, double(b.hi[0]) - double(b.lo[0]));
++  const double y = std::max(0.0, double(b.hi[1]) - double(b.lo[1]));
++  const double z = std::max(0.0, double(b.hi[2]) - double(b.lo[2]));
++  return x * y * z;
++}
++
++struct Tree {
++  /* Node cost = half area + vol_weight * volume. 0: SAH. For segments of length L in random directions, the measure
++   * of segments that meet a convex box is proportional to V + L*A/4 = V + L*H/2, so vol_weight = 2/L. */
++  double vol_weight = 0.0;
++  /* Extra cost per inner node = overlap_weight * half area of the intersection of its two child boxes. Sibling overlap
++   * makes nearest-first traversal of terminating rays (occluded shadow rays) open both children. 0: off. */
++  double overlap_weight = 0.0;
++  /* Child order of rebuilt nodes. Traversal visits the nearer child first and child 0 on ties (a ray starting inside
++   * both boxes), so the order matters for rays that stop at their first hit. 1: as the builder's splits, the child
++   * with the lower box center on the axis where the centers differ most comes first. 0: DP order. -1: reversed. */
++  int order = 1;
++  double cost(const Box &b) const
++  {
++    return vol_weight > 0.0 ? half_area(b) + vol_weight * volume(b) : half_area(b);
++  }
++  /* inner nodes */
++  std::vector<int> c0, c1;
++  std::vector<Box> box;
++  std::vector<uint32_t> vis;
++  std::vector<uint8_t> fixed; /* 1: never restructure through this node (e.g. unaligned or motion node) */
++  /* leaves */
++  std::vector<Box> lbox;
++  std::vector<uint32_t> lvis;
++
++  int num_inner() const
++  {
++    return int(c0.size());
++  }
++  const Box &ebox(int e) const
++  {
++    return e >= 0 ? box[e] : lbox[~e];
++  }
++  uint32_t evis(int e) const
++  {
++    return e >= 0 ? vis[e] : lvis[~e];
++  }
++};
++
++/* Sum of inner-node half areas (root included). */
++static inline double inner_area_sum(const Tree &t)
++{
++  double s = 0;
++  for (int i = 0; i < t.num_inner(); i++) {
++    s += half_area(t.box[i]);
++  }
++  return s;
++}
++
++/* Recompute every inner box and visibility from the leaves (same topology). Children-first order via post-order. */
++static inline void refit(Tree &t)
++{
++  if (t.num_inner() == 0) {
++    return;
++  }
++  std::vector<int> order;
++  order.reserve(t.num_inner());
++  std::vector<std::pair<int, int>> st;
++  st.push_back({0, 0});
++  while (!st.empty()) {
++    auto &f = st.back();
++    if (f.second < 2) {
++      const int c = f.second++ == 0 ? t.c0[f.first] : t.c1[f.first];
++      if (c >= 0) {
++        st.push_back({c, 0});
++      }
++    }
++    else {
++      order.push_back(f.first);
++      st.pop_back();
++    }
++  }
++  for (int i : order) {
++    t.box[i] = box_union(t.ebox(t.c0[i]), t.ebox(t.c1[i]));
++    t.vis[i] = t.evis(t.c0[i]) | t.evis(t.c1[i]);
++  }
++}
++
++struct Scratch {
++  Box sbox[128];
++  double area[128];
++  double cost[128];
++  uint8_t split[128];
++  int leaves[8];
++  int inner[8];
++  int next_inner;
++};
++
++template<int N> static int treelet_rebuild(Tree &t, Scratch &s, int mask, int full, int r)
++{
++  if ((mask & (mask - 1)) == 0) {
++    int b = 0;
++    while (!(mask >> b & 1)) {
++      b++;
++    }
++    return s.leaves[b];
++  }
++  const int id = (mask == full) ? r : s.inner[s.next_inner++];
++  const int p = s.split[mask];
++  const int a = treelet_rebuild<N>(t, s, p, full, r);
++  const int b = treelet_rebuild<N>(t, s, mask ^ p, full, r);
++  bool swap = false;
++  if (t.order != 0) {
++    const Box &ba = t.ebox(a), &bb = t.ebox(b);
++    int axis = 0;
++    double best = -1.0;
++    for (int k = 0; k < 3; k++) {
++      const double d = std::abs((double(ba.lo[k]) + double(ba.hi[k])) - (double(bb.lo[k]) + double(bb.hi[k])));
++      if (d > best) {
++        best = d;
++        axis = k;
++      }
++    }
++    const double ca = double(ba.lo[axis]) + double(ba.hi[axis]), cb = double(bb.lo[axis]) + double(bb.hi[axis]);
++    swap = (t.order > 0) ? (cb < ca) : (ca < cb);
++  }
++  t.c0[id] = swap ? b : a;
++  t.c1[id] = swap ? a : b;
++  t.box[id] = box_union(t.ebox(a), t.ebox(b));
++  t.vis[id] = t.evis(a) | t.evis(b);
++  return id;
++}
++
++/* Restructure the treelet rooted at r. Returns 1 if it was rebuilt. */
++template<int N> static int treelet_optimize(Tree &t, Scratch &s, int r, double rel_eps)
++{
++  if (t.fixed[r]) {
++    return 0;
++  }
++  int n = 2, ni = 1;
++  s.leaves[0] = t.c0[r];
++  s.leaves[1] = t.c1[r];
++  s.inner[0] = r;
++  double old_cost = t.cost(t.box[r]);
++  while (n < N) {
++    int best = -1;
++    double best_a = -1;
++    for (int i = 0; i < n; i++) {
++      const int e = s.leaves[i];
++      if (e >= 0 && !t.fixed[e]) {
++        const double a = t.cost(t.box[e]);
++        if (a > best_a) {
++          best_a = a;
++          best = i;
++        }
++      }
++    }
++    if (best < 0) {
++      break;
++    }
++    const int e = s.leaves[best];
++    s.inner[ni++] = e;
++    old_cost += best_a;
++    s.leaves[best] = t.c0[e];
++    s.leaves[n++] = t.c1[e];
++  }
++  if (n < 3) {
++    return 0;
++  }
++  if (t.overlap_weight > 0.0) {
++    for (int i = 0; i < ni; i++) {
++      old_cost += t.overlap_weight * overlap_half_area(t.ebox(t.c0[s.inner[i]]), t.ebox(t.c1[s.inner[i]]));
++    }
++  }
++  const int full = (1 << n) - 1;
++  for (int i = 0; i < n; i++) {
++    s.sbox[1 << i] = t.ebox(s.leaves[i]);
++    s.cost[1 << i] = 0;
++  }
++  for (int m = 1; m <= full; m++) {
++    if ((m & (m - 1)) == 0) {
++      continue;
++    }
++    const int low = m & -m;
++    s.sbox[m] = box_union(s.sbox[m ^ low], s.sbox[low]);
++    s.area[m] = t.cost(s.sbox[m]);
++  }
++  /* masks in increasing order: every proper subset is smaller than its superset */
++  for (int m = 1; m <= full; m++) {
++    if ((m & (m - 1)) == 0) {
++      continue;
++    }
++    const int low = m & -m;
++    double best = INFINITY;
++    int bp = 0;
++    /* partitions {p, m^p} with the lowest bit in p, p != m */
++    const int rest = m ^ low;
++    for (int q = (rest - 1) & rest;; q = (q - 1) & rest) {
++      const int p = q | low;
++      double c = s.cost[p] + s.cost[m ^ p];
++      if (t.overlap_weight > 0.0) {
++        c += t.overlap_weight * overlap_half_area(s.sbox[p], s.sbox[m ^ p]);
++      }
++      if (c < best) {
++        best = c;
++        bp = p;
++      }
++      if (q == 0) {
++        break;
++      }
++    }
++    s.cost[m] = s.area[m] + best;
++    s.split[m] = uint8_t(bp);
++  }
++  if (!(s.cost[full] < old_cost * (1.0 - rel_eps))) {
++    return 0;
++  }
++  s.next_inner = 1;
++  treelet_rebuild<N>(t, s, full, full, r);
++  return 1;
++}
++
++static inline void post_order(const Tree &t, int root, int depth0, int cut_depth, std::vector<int> &out,
++                              std::vector<int> *cut_roots)
++{
++  std::vector<std::pair<int, int>> st; /* node, state; depth tracked in a parallel stack */
++  std::vector<int> dep;
++  st.push_back({root, 0});
++  dep.push_back(depth0);
++  while (!st.empty()) {
++    const int node = st.back().first;
++    const int d = dep.back();
++    if (cut_roots && d == cut_depth) {
++      cut_roots->push_back(node);
++      st.pop_back();
++      dep.pop_back();
++      continue;
++    }
++    int &state = st.back().second;
++    if (state < 2) {
++      const int c = state++ == 0 ? t.c0[node] : t.c1[node];
++      if (c >= 0) {
++        st.push_back({c, 0});
++        dep.push_back(d + 1);
++      }
++    }
++    else {
++      out.push_back(node);
++      st.pop_back();
++      dep.pop_back();
++    }
++  }
++}
++
++/* passes: number of sweeps; N: treelet leaves (5..7). ParallelFor(n, fn(i)) runs fn for i in [0, n). */
++template<int N, class ParallelFor>
++static long long optimize(Tree &t, int passes, ParallelFor &&pfor, int cut_depth = 12, double rel_eps = 1e-6)
++{
++  static_assert(N >= 3 && N <= 7, "treelet size");
++  if (t.num_inner() < 2) {
++    return 0;
++  }
++  long long rebuilt = 0;
++  for (int pass = 0; pass < passes; pass++) {
++    std::vector<int> top, cuts;
++    post_order(t, 0, 0, cut_depth, top, &cuts);
++    std::vector<long long> per(cuts.size(), 0);
++    pfor(int(cuts.size()), [&](int i) {
++      std::vector<int> order;
++      post_order(t, cuts[i], 0, -1, order, nullptr);
++      Scratch s;
++      long long k = 0;
++      for (int node : order) {
++        k += treelet_optimize<N>(t, s, node, rel_eps);
++      }
++      per[i] = k;
++    });
++    Scratch s;
++    for (int node : top) {
++      rebuilt += treelet_optimize<N>(t, s, node, rel_eps);
++    }
++    for (long long k : per) {
++      rebuilt += k;
++    }
++  }
++  return rebuilt;
++}
++
++}  // namespace bvhopt
+diff --git a/intern/cycles/device/cpu/device_impl.cpp b/intern/cycles/device/cpu/device_impl.cpp
+index 31e29b0..def350e 100644
+--- a/intern/cycles/device/cpu/device_impl.cpp
++++ b/intern/cycles/device/cpu/device_impl.cpp
+@@ -5,6 +5,7 @@
+ #include "device/cpu/device_impl.h"
+ 
+ #include <algorithm>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ 
+@@ -39,11 +40,35 @@
+ #include "util/task.h"
+ #include "util/types_image.h"
+ 
++extern "C" {
++unsigned long long *ccl_permat_prof_cpu = nullptr;
++}
++
+ CCL_NAMESPACE_BEGIN
+ 
++/* Ours (analysis/v53_permat.md): per-shader shade_surface profile, env CYCLES_PERMAT_PROFILE=1. */
++static void permat_print(const char *dev, const unsigned long long *t)
++{
++  for (int s = 0; s < 256; s++) {
++    const unsigned long long *r = t + s * 64;
++    if (r[0] == 0) {
++      continue;
++    }
++    fprintf(stderr, "PERMAT %s %d", dev, s);
++    for (int f = 0; f < 64; f++) {
++      fprintf(stderr, " %llu", f == 6 ? ~r[f] : r[f]);
++    }
++    fprintf(stderr, "\n");
++  }
++  fflush(stderr);
++}
++
+ CPUDevice::CPUDevice(const DeviceInfo &info_, Stats &stats_, Profiler &profiler_, bool headless_)
+     : Device(info_, stats_, profiler_, headless_)
+ {
++  if (getenv("CYCLES_PERMAT_PROFILE") && ccl_permat_prof_cpu == nullptr) {
++    ccl_permat_prof_cpu = (unsigned long long *)calloc(256 * 64, sizeof(unsigned long long));
++  }
+   image_info = make_unique<device_vector<KernelImageInfo>>(this, "image_info", MEM_GLOBAL);
+ 
+   /* Pick any kernel, all of them are supposed to have same level of microarchitecture
+@@ -62,6 +87,10 @@ CPUDevice::CPUDevice(const DeviceInfo &info_, Stats &stats_, Profiler &profiler_
+ 
+ CPUDevice::~CPUDevice()
+ {
++  if (ccl_permat_prof_cpu) {
++    permat_print("cpu", ccl_permat_prof_cpu);
++    memset(ccl_permat_prof_cpu, 0, 256 * 64 * sizeof(unsigned long long));
++  }
+ #ifdef WITH_EMBREE
+   rtcReleaseDevice(embree_device);
+ #endif
+diff --git a/intern/cycles/device/cuda/device_impl.cpp b/intern/cycles/device/cuda/device_impl.cpp
+index 3e91dae..c05406c 100644
+--- a/intern/cycles/device/cuda/device_impl.cpp
++++ b/intern/cycles/device/cuda/device_impl.cpp
+@@ -36,6 +36,23 @@
+ 
+ CCL_NAMESPACE_BEGIN
+ 
++/* Ours (analysis/v53_permat.md): per-shader shade_surface profile, env CYCLES_PERMAT_PROFILE=1. */
++static void permat_print(const char *dev, const unsigned long long *t)
++{
++  for (int s = 0; s < 256; s++) {
++    const unsigned long long *r = t + s * 64;
++    if (r[0] == 0) {
++      continue;
++    }
++    fprintf(stderr, "PERMAT %s %d", dev, s);
++    for (int f = 0; f < 64; f++) {
++      fprintf(stderr, " %llu", f == 6 ? ~r[f] : r[f]);
++    }
++    fprintf(stderr, "\n");
++  }
++  fflush(stderr);
++}
++
+ class CUDADevice;
+ 
+ bool CUDADevice::have_precompiled_kernels()
+@@ -145,6 +162,22 @@ CUDADevice::CUDADevice(const DeviceInfo &info, Stats &stats, Profiler &profiler,
+ CUDADevice::~CUDADevice()
+ {
+   image_info.free();
++  if (cuModule && getenv("CYCLES_PERMAT_PROFILE")) {
++    /* Ours (analysis/v53_permat.md): read the per-shader table of a -DCYCLES_PERMAT_PROFILE cubin. */
++    CUDAContextScope scope(this);
++    CUdeviceptr ptr = 0;
++    size_t bytes = 0;
++    if (cuModuleGetGlobal(&ptr, &bytes, cuModule, "permat_prof") == CUDA_SUCCESS &&
++        bytes == 256 * 64 * sizeof(unsigned long long))
++    {
++      vector<unsigned long long> t(256 * 64);
++      cuda_assert(cuMemcpyDtoH(t.data(), ptr, bytes));
++      permat_print("gpu", t.data());
++    }
++    else {
++      fprintf(stderr, "PERMAT gpu: no permat_prof in the cubin\n");
++    }
++  }
+   if (cuModule) {
+     cuda_assert(cuModuleUnload(cuModule));
+   }
+@@ -453,7 +486,17 @@ bool CUDADevice::load_kernels(const uint64_t kernel_features)
+   /* get kernel */
+   const char *kernel_name = "kernel";
+   string cflags = compile_kernel_get_common_cflags(kernel_features);
+-  string cubin = compile_kernel(cflags, kernel_name);
++  string cubin;
++  /* Ours: CYCLES_CUDA_CUBIN=<path> loads that cubin (zstd or raw) in place of lib/ or a compiled kernel, so one
++   * Blender process per scene can run a per-scene kernel (as 4.5.0 final4). Unset: stock. */
++  if (const char *override_path = getenv("CYCLES_CUDA_CUBIN")) {
++    cubin = override_path;
++    printf("CUDA cubin override: path=%s\n", cubin.c_str());
++    fflush(stdout);
++  }
++  else {
++    cubin = compile_kernel(cflags, kernel_name);
++  }
+   if (cubin.empty()) {
+     return false;
+   }
+@@ -751,6 +794,17 @@ void CUDADevice::const_copy_to(const char *name, void *host, const size_t size)
+   CUdeviceptr mem;
+   size_t bytes;
+ 
++  /* Ours (NRC): the cubin's own __constant__ KernelNRC kernel_nrc (only in -DCYCLES_NRC cubins). */
++  if (strcmp(name, "kernel_nrc") == 0) {
++    if (cuModuleGetGlobal(&mem, &bytes, cuModule, "kernel_nrc") == CUDA_SUCCESS && bytes == size) {
++      cuda_assert(cuMemcpyHtoD(mem, host, size));
++    }
++    else {
++      LOG_ERROR << "NRC: cubin has no kernel_nrc of " << size << " bytes";
++    }
++    return;
++  }
++
+   cuda_assert(cuModuleGetGlobal(&mem, &bytes, cuModule, "kernel_params"));
+   assert(bytes == sizeof(KernelParamsCUDA));
+ 
+diff --git a/intern/cycles/device/cuda/queue.cpp b/intern/cycles/device/cuda/queue.cpp
+index e7ee2ad..c97ca29 100644
+--- a/intern/cycles/device/cuda/queue.cpp
++++ b/intern/cycles/device/cuda/queue.cpp
+@@ -55,7 +55,14 @@ int CUDADeviceQueue::num_sort_partitions(int max_num_paths, uint max_scene_shade
+   /* Sort partitioning becomes less effective when more shaders are in the wavefront. Also need to
+    * ensure the amount of shared memory required is within the limit. */
+   if (max_scene_shaders < min(300, cuda_device_->max_shared_mem_bytes / (int)sizeof(int))) {
+-    return max(max_num_paths / 65536, 1);
++    /* Ours: CYCLES_SORT_PARTITION_SIZE=<paths> sets the paths per sort partition (stock 65536). */
++    int partition_size = 65536;
++    if (const char *value = getenv("CYCLES_SORT_PARTITION_SIZE")) {
++      if (atoi(value) > 0) {
++        partition_size = atoi(value);
++      }
++    }
++    return max(max_num_paths / partition_size, 1);
+   }
+   else {
+     return 1;
+@@ -155,6 +162,59 @@ bool CUDADeviceQueue::enqueue(DeviceKernel kernel,
+   return !(cuda_device_->have_error());
+ }
+ 
++/* Ours (NRC): kernels outside the DeviceKernel enum, looked up by name in the loaded module. */
++bool CUDADeviceQueue::has_named_kernel(const char *name)
++{
++  if (!cuda_device_->cuModule) {
++    return false;
++  }
++  auto it = named_functions_.find(name);
++  if (it != named_functions_.end()) {
++    return it->second != nullptr;
++  }
++  const CUDAContextScope scope(cuda_device_);
++  CUfunction function = nullptr;
++  if (cuModuleGetFunction(&function, cuda_device_->cuModule, name) != CUDA_SUCCESS) {
++    function = nullptr;
++  }
++  named_functions_[name] = function;
++  return function != nullptr;
++}
++
++bool CUDADeviceQueue::enqueue_named(const char *name,
++                                    const int work_size,
++                                    const DeviceKernelArguments &args)
++{
++  if (cuda_device_->have_error() || !has_named_kernel(name)) {
++    return false;
++  }
++  if (work_size <= 0) {
++    return true;
++  }
++  const CUDAContextScope scope(cuda_device_);
++  const int num_threads_per_block = 256;
++  const int num_blocks = divide_up(work_size, num_threads_per_block);
++  assert_success(cuLaunchKernel(named_functions_[name],
++                                num_blocks,
++                                1,
++                                1,
++                                num_threads_per_block,
++                                1,
++                                1,
++                                0,
++                                cuda_stream_,
++                                const_cast<void **>(args.values),
++                                nullptr),
++                 name);
++  return !(cuda_device_->have_error());
++}
++
++void CUDADeviceQueue::run_in_context(const std::function<void()> &fn)
++{
++  const CUDAContextScope scope(cuda_device_);
++  fn();
++}
++
+ bool CUDADeviceQueue::synchronize()
+ {
+   if (cuda_device_->have_error()) {
+diff --git a/intern/cycles/device/cuda/queue.h b/intern/cycles/device/cuda/queue.h
+index fab22be..f1ab78e 100644
+--- a/intern/cycles/device/cuda/queue.h
++++ b/intern/cycles/device/cuda/queue.h
+@@ -44,11 +44,21 @@ class CUDADeviceQueue : public DeviceQueue {
+     return cuda_stream_;
+   }
+ 
++  /* Ours (NRC). */
++  bool enqueue_named(const char *name, const int work_size, const DeviceKernelArguments &args) override;
++  bool has_named_kernel(const char *name) override;
++  void *nrc_stream() override
++  {
++    return cuda_stream_;
++  }
++  void run_in_context(const std::function<void()> &fn) override;
++
+   unique_ptr<DeviceGraphicsInterop> graphics_interop_create() override;
+ 
+  protected:
+   CUDADevice *cuda_device_;
+   CUstream cuda_stream_;
++  map<string, CUfunction> named_functions_; /* Ours (NRC) */
+ 
+   ConcurrentStatesParams concurrent_states_params() const override;
+   void get_memory_info(size_t &total, size_t &free) const override;
+diff --git a/intern/cycles/device/queue.h b/intern/cycles/device/queue.h
+index 7c8804a..9ac1b95 100644
+--- a/intern/cycles/device/queue.h
++++ b/intern/cycles/device/queue.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <climits>
++#include <functional>
+ 
+ #include "device/kernel.h"
+ 
+@@ -187,6 +188,28 @@ class DeviceQueue {
+     return nullptr;
+   }
+ 
++  /* Ours (NRC): launch a kernel of the loaded module by its full name (1D, 256 threads per block); report
++   * whether such a kernel exists; the native stream (CUstream); run a function with the device context
++   * current. Defaults: unsupported. */
++  virtual bool enqueue_named(const char * /*name*/,
++                             const int /*work_size*/,
++                             const DeviceKernelArguments & /*args*/)
++  {
++    return false;
++  }
++  virtual bool has_named_kernel(const char * /*name*/)
++  {
++    return false;
++  }
++  virtual void *nrc_stream()
++  {
++    return nullptr;
++  }
++  virtual void run_in_context(const std::function<void()> &fn)
++  {
++    fn();
++  }
++
+  protected:
+   /* Hide construction so that allocation via `Device` API is enforced. */
+   explicit DeviceQueue(Device *device);
+diff --git a/intern/cycles/integrator/CMakeLists.txt b/intern/cycles/integrator/CMakeLists.txt
+index 9410109..60c60a5 100644
+--- a/intern/cycles/integrator/CMakeLists.txt
++++ b/intern/cycles/integrator/CMakeLists.txt
+@@ -28,6 +28,7 @@ set(SRC
+   path_trace_work.cpp
+   path_trace_work_cpu.cpp
+   path_trace_work_gpu.cpp
++  nrc.cpp
+   render_scheduler.cpp
+   shader_eval.cpp
+   work_balancer.cpp
+@@ -54,6 +55,7 @@ set(SRC_HEADERS
+   path_trace_work.h
+   path_trace_work_cpu.h
+   path_trace_work_gpu.h
++  nrc.h
+   render_scheduler.h
+   shader_eval.h
+   work_balancer.h
+diff --git a/intern/cycles/integrator/nrc.cpp b/intern/cycles/integrator/nrc.cpp
+new file mode 100644
+index 0000000..9b52ac4
+--- /dev/null
++++ b/intern/cycles/integrator/nrc.cpp
+@@ -0,0 +1,463 @@
++/* SPDX-FileCopyrightText: 2026 cycles-h100
++ *
++ * SPDX-License-Identifier: Apache-2.0 */
++
++#include "integrator/nrc.h"
++
++#include "device/device.h"
++
++#include "kernel/types.h"
++
++#include "kernel/integrator/nrc_types.h"
++
++#include "util/log.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <dlfcn.h>
++#include <fstream>
++#include <sstream>
++
++CCL_NAMESPACE_BEGIN
++
++struct NRCControlHost : public NRCControl {};
++static_assert(sizeof(NRCControl) == 12 * sizeof(uint), "NRCControl layout");
++
++static int env_int(const char *name, const int def)
++{
++  const char *v = getenv(name);
++  return (v && *v) ? atoi(v) : def;
++}
++
++static float env_float(const char *name, const float def)
++{
++  const char *v = getenv(name);
++  return (v && *v) ? float(atof(v)) : def;
++}
++
++bool PathTraceNRC::requested()
++{
++  const char *v = getenv("CYCLES_NRC");
++  return v && atoi(v) != 0;
++}
++
++PathTraceNRC::PathTraceNRC(Device *device, DeviceQueue *queue)
++    : device_(device),
++      queue_(queue),
++      ctrl_(device, "nrc_ctrl", MEM_READ_WRITE),
++      main_slot_(device, "nrc_main_slot"),
++      main_spread_(device, "nrc_main_spread"),
++      shadow_slot_(device, "nrc_shadow_slot"),
++      query_in_(device, "nrc_query_in"),
++      query_meta_(device, "nrc_query_meta"),
++      query_out_(device, "nrc_query_out"),
++      slots_(device, "nrc_slots"),
++      slot_feat_(device, "nrc_slot_feat"),
++      slot_T_(device, "nrc_slot_T"),
++      slot_bins_(device, "nrc_slot_bins"),
++      done_list_(device, "nrc_done_list"),
++      rec_in_(device, "nrc_rec_in"),
++      rec_target_(device, "nrc_rec_target"),
++      rec_T_(device, "nrc_rec_T"),
++      stub_table_(device, "nrc_stub_table")
++{
++  c_ = env_float("CYCLES_NRC_C", 0.01f);
++  min_bounce_ = max(env_int("CYCLES_NRC_MIN_BOUNCE", 1), 1);
++  terminate_enabled_ = env_int("CYCLES_NRC_TERM", 1);
++  skip_singular_ = env_int("CYCLES_NRC_SKIP_SINGULAR", 1);
++  train_frac_ = env_float("CYCLES_NRC_TRAIN_FRAC", 0.01f);
++  train_steps_ = max(env_int("CYCLES_NRC_TRAIN_STEPS", 4), 1);
++  train_slots_ = max(env_int("CYCLES_NRC_TRAIN_SLOTS", 65536), 1);
++  warmup_ = max(env_int("CYCLES_NRC_WARMUP", 256), 0); /* Adam steps before paths may end in the cache */
++  warmup_steps_ = max(env_int("CYCLES_NRC_WARMUP_STEPS", 16), 1); /* steps per train call during warm-up */
++  num_slots_ = max(env_int("CYCLES_NRC_SLOTS", 1 << 18), 1024);
++  record_cap_ = max(env_int("CYCLES_NRC_RECORDS", 1 << 18), 1024);
++  infer_chunk_ = max(env_int("CYCLES_NRC_INFER_CHUNK", 1 << 21), 256) & ~255;
++  stats_ = env_int("CYCLES_NRC_STATS", 0);
++  const char *e = getenv("CYCLES_NRC_ENGINE");
++  engine_name_ = (e && *e) ? e : "stub";
++  /* nrc-bake (analysis/nrc_bake.md): CYCLES_NRC_FREEZE=1 = inference only. No training paths are tagged, so
++   * nrc_collect and nrc_train never run; paths may end in the cache from the first sample (no warm-up); the
++   * training buffers shrink to the minimum. The engine reads the same variable (and CYCLES_NRC_LOAD, which must
++   * then name a baked file; it is loaded in nrc_create, inside alloc_work_memory, before the render timer). */
++  if (env_int("CYCLES_NRC_FREEZE", 0)) {
++    train_frac_ = 0.0f;
++    warmup_ = 0;
++    num_slots_ = 1024;
++    record_cap_ = 1024;
++  }
++  /* The train trigger must leave free slots for new training paths. */
++  train_slots_ = min(train_slots_, num_slots_ / 2);
++}
++
++PathTraceNRC::~PathTraceNRC()
++{
++  if (stats_) {
++    fprintf(stderr,
++            "NRC total: tagged %lld, train calls %lld, records %lld, infer calls %lld, queries %lld, "
++            "dropped %lld\n",
++            (long long)n_tagged_,
++            (long long)n_train_calls_,
++            (long long)n_records_,
++            (long long)n_infer_calls_,
++            (long long)n_queries_,
++            (long long)n_dropped_);
++  }
++  if (engine_ && api_.destroy) {
++    queue_->run_in_context([&]() { api_.destroy(engine_); });
++  }
++  if (engine_lib_) {
++    dlclose(engine_lib_);
++  }
++}
++
++NRCControlHost *PathTraceNRC::ctrl()
++{
++  return reinterpret_cast<NRCControlHost *>(ctrl_.data());
++}
++
++bool PathTraceNRC::load_engine()
++{
++  void *stream = queue_->nrc_stream();
++  if (engine_name_ == "stub" || engine_name_ == "zero") {
++    stub_mode_ = (engine_name_ == "stub") ? 1 : 0;
++    return true;
++  }
++  stub_mode_ = -1;
++  engine_lib_ = dlopen(engine_name_.c_str(), RTLD_NOW | RTLD_LOCAL);
++  if (!engine_lib_) {
++    LOG_ERROR << "NRC: dlopen " << engine_name_ << " failed: " << dlerror();
++    return false;
++  }
++  api_.create = (decltype(api_.create))dlsym(engine_lib_, "nrc_create");
++  api_.infer = (decltype(api_.infer))dlsym(engine_lib_, "nrc_infer");
++  api_.train = (decltype(api_.train))dlsym(engine_lib_, "nrc_train");
++  api_.destroy = (decltype(api_.destroy))dlsym(engine_lib_, "nrc_destroy");
++  if (!api_.create || !api_.infer || !api_.train || !api_.destroy) {
++    LOG_ERROR << "NRC: " << engine_name_ << " lacks the nrc_* symbols";
++    return false;
++  }
++  /* Default config: EMA 0.95 instead of the engine's 0.99 (A40: 0.99 lags the cold start, cache 2.5-7% low
++   * after ~300 steps), and the engine workspace sized to our largest calls (growth would sync the device). */
++  const int train_batch = (((record_cap_ + min(train_steps_, warmup_steps_) - 1) /
++                            min(train_steps_, warmup_steps_)) +
++                           255) &
++                          ~255;
++  string config = string_printf(
++      "{\"optimizer\": {\"otype\": \"EMA\", \"decay\": 0.95, \"nested\": {\"otype\": \"Adam\", "
++      "\"learning_rate\": 1e-2, \"beta1\": 0.9, \"beta2\": 0.99, \"epsilon\": 1e-15, \"l2_reg\": 1e-6}}, "
++      "\"nrc\": {\"warmup_infer_batch\": %d, \"warmup_train_batch\": %d}}",
++      infer_chunk_,
++      train_batch);
++  if (const char *path = getenv("CYCLES_NRC_CONFIG")) {
++    std::ifstream f(path);
++    if (f) {
++      std::stringstream ss;
++      ss << f.rdbuf();
++      config = ss.str();
++    }
++    else {
++      LOG_ERROR << "NRC: cannot read CYCLES_NRC_CONFIG " << path;
++    }
++  }
++  queue_->run_in_context([&]() { engine_ = api_.create(config.c_str(), stream); });
++  if (!engine_) {
++    LOG_ERROR << "NRC: nrc_create failed";
++    return false;
++  }
++  return true;
++}
++
++bool PathTraceNRC::alloc(const int max_num_paths)
++{
++  if (allocated_ && max_num_paths == max_num_paths_) {
++    return true;
++  }
++  if (!queue_->has_named_kernel("kernel_gpu_nrc_resolve") || !queue_->nrc_stream()) {
++    LOG_ERROR << "NRC: CYCLES_NRC=1 but the cubin has no NRC kernels (build it with -DCYCLES_NRC) or the "
++                 "device is not CUDA; NRC off";
++    return false;
++  }
++  if (!allocated_ && !load_engine()) {
++    return false;
++  }
++  max_num_paths_ = max_num_paths;
++  query_cap_ = env_int("CYCLES_NRC_QUERY_CAP", max(2 * max_num_paths, 1 << 20));
++  query_cap_ = max(query_cap_, max_num_paths + 1024);
++  query_cap_ = (query_cap_ + 255) & ~255;
++  flush_at_ = query_cap_ - max_num_paths;
++
++  const size_t nv = CYCLES_NRC_NV;
++  ctrl_.alloc(12);
++  main_slot_.alloc_to_device(max_num_paths);
++  main_spread_.alloc_to_device(size_t(max_num_paths) * 2);
++  shadow_slot_.alloc_to_device(max_num_paths);
++  query_in_.alloc_to_device(size_t(query_cap_) * NRC_IN_FEATURES);
++  query_meta_.alloc_to_device(size_t(query_cap_) * 4);
++  query_out_.alloc_to_device(size_t(query_cap_) * 3);
++  slots_.alloc_to_device(size_t(num_slots_) * 4);
++  slot_feat_.alloc_to_device(size_t(num_slots_) * nv * NRC_IN_FEATURES);
++  slot_T_.alloc_to_device(size_t(num_slots_) * nv * 3);
++  slot_bins_.alloc_to_device(size_t(num_slots_) * nv * 3);
++  done_list_.alloc_to_device(num_slots_);
++  rec_in_.alloc_to_device(size_t(record_cap_) * NRC_IN_FEATURES);
++  rec_target_.alloc_to_device(size_t(record_cap_) * 3);
++  rec_T_.alloc_to_device(size_t(record_cap_) * 3);
++  if (stub_mode_ == 1) {
++    stub_table_.alloc_to_device(size_t(8) << env_int("CYCLES_NRC_STUB_LOG2", 22));
++    queue_->zero_to_device(stub_table_);
++  }
++  queue_->zero_to_device(slots_);
++  memset(ctrl_.data(), 0, sizeof(NRCControl));
++  ctrl()->train = 1;
++  ctrl()->terminate = (terminate_enabled_ && warmup_ == 0) ? 1 : 0;
++  queue_->copy_to_device(ctrl_);
++  queue_->synchronize();
++  allocated_ = true;
++
++  LOG_INFO << "NRC: on, engine " << engine_name_ << ", " << max_num_paths << " states, query cap "
++           << query_cap_ << ", slots " << num_slots_ << ", c " << c_ << ", train frac " << train_frac_;
++  if (stats_) {
++    fprintf(stderr,
++            "NRC: on, engine %s, states %d, query cap %d (flush at %d), slots %d, records %d, c %g, "
++            "min bounce %d, term %d, train frac %g, steps %d, train slots %d, warmup %d\n",
++            engine_name_.c_str(),
++            max_num_paths,
++            query_cap_,
++            flush_at_,
++            num_slots_,
++            record_cap_,
++            c_,
++            min_bounce_,
++            terminate_enabled_,
++            train_frac_,
++            train_steps_,
++            train_slots_,
++            warmup_);
++  }
++  return true;
++}
++
++void PathTraceNRC::upload(const float bounds[6])
++{
++  if (!allocated_) {
++    return;
++  }
++  KernelNRC k;
++  memset(&k, 0, sizeof(k));
++  k.enabled = 1;
++  k.min_bounce = min_bounce_;
++  k.c = c_;
++  k.skip_singular = skip_singular_;
++  k.train_threshold = (uint)min(double(train_frac_) * 4294967296.0, 4294967295.0);
++  k.num_slots = num_slots_;
++  k.query_cap = query_cap_;
++  k.record_cap = record_cap_;
++  float lo[3] = {bounds[0], bounds[1], bounds[2]}, hi[3] = {bounds[3], bounds[4], bounds[5]};
++  if (const char *b = getenv("CYCLES_NRC_BOUNDS")) {
++    sscanf(b, "%f,%f,%f,%f,%f,%f", &lo[0], &lo[1], &lo[2], &hi[0], &hi[1], &hi[2]);
++  }
++  for (int i = 0; i < 3; i++) {
++    float ext = hi[i] - lo[i];
++    if (!(ext > 1e-6f)) {
++      ext = 1.0f;
++    }
++    k.box_lo[i] = lo[i] - 0.01f * ext;
++    k.box_scale[i] = 1.0f / (1.02f * ext);
++  }
++  k.stub_log2 = env_int("CYCLES_NRC_STUB_LOG2", 22);
++  k.stub_res = env_int("CYCLES_NRC_STUB_RES", 32);
++  k.stub_dir = env_int("CYCLES_NRC_STUB_DIR", 0);
++  k.budget_feature = env_int("CYCLES_NRC_BUDGET", 1);
++  k.train_match = env_int("CYCLES_NRC_TRAIN_MATCH", 0);
++  k.train_weight = env_int("CYCLES_NRC_TRAIN_WEIGHT", 1);
++  k.diffuse_only = env_int("CYCLES_NRC_DIFFUSE_ONLY", 0);
++#define NRC_PTR(field, mem) k.field = reinterpret_cast<decltype(k.field)>(mem.device_pointer)
++  NRC_PTR(ctrl, ctrl_);
++  NRC_PTR(main_slot, main_slot_);
++  NRC_PTR(main_spread, main_spread_);
++  NRC_PTR(shadow_slot, shadow_slot_);
++  NRC_PTR(query_in, query_in_);
++  NRC_PTR(query_meta, query_meta_);
++  NRC_PTR(query_out, query_out_);
++  NRC_PTR(slots, slots_);
++  NRC_PTR(slot_feat, slot_feat_);
++  NRC_PTR(slot_T, slot_T_);
++  NRC_PTR(slot_bins, slot_bins_);
++  NRC_PTR(done_list, done_list_);
++  NRC_PTR(rec_in, rec_in_);
++  NRC_PTR(rec_target, rec_target_);
++  NRC_PTR(rec_T, rec_T_);
++  NRC_PTR(stub_table, stub_table_);
++#undef NRC_PTR
++  queue_->synchronize();
++  device_->const_copy_to("kernel_nrc", &k, sizeof(k));
++  if (stats_) {
++    fprintf(stderr,
++            "NRC: box lo %g %g %g extent %g %g %g\n",
++            k.box_lo[0],
++            k.box_lo[1],
++            k.box_lo[2],
++            1.0f / k.box_scale[0],
++            1.0f / k.box_scale[1],
++            1.0f / k.box_scale[2]);
++  }
++}
++
++void PathTraceNRC::begin_pass()
++{
++  if (!allocated_) {
++    return;
++  }
++  /* Every path of the previous pass has ended (or the pass was cancelled): free every slot. */
++  queue_->zero_to_device(slots_);
++  NRCControlHost *c = ctrl();
++  c->query_count = 0;
++  c->done_count = 0;
++  c->record_count = 0;
++  c->train = (train_frac_ > 0.0f) ? 1 : 0;
++  queue_->copy_to_device(ctrl_);
++}
++
++void PathTraceNRC::enqueue_readback()
++{
++  if (allocated_) {
++    queue_->copy_from_device(ctrl_);
++  }
++}
++
++void PathTraceNRC::poll(const device_ptr render_buffer)
++{
++  if (!allocated_) {
++    return;
++  }
++  if (ctrl()->done_count >= uint(train_slots_)) {
++    train();
++  }
++  if (ctrl()->query_count >= uint(flush_at_)) {
++    infer(render_buffer);
++  }
++}
++
++void PathTraceNRC::end_pass(const device_ptr render_buffer)
++{
++  if (!allocated_) {
++    return;
++  }
++  queue_->copy_from_device(ctrl_);
++  queue_->synchronize();
++  if (ctrl()->done_count > 0) {
++    train();
++  }
++  if (ctrl()->query_count > 0) {
++    infer(render_buffer);
++  }
++  if (stats_) {
++    fprintf(stderr,
++            "NRC pass: tagged %u, train calls %lld, steps %lld, records %lld, infer calls %lld, "
++            "queries %lld, dropped %u, terminate %d\n",
++            ctrl()->tagged,
++            (long long)n_train_calls_,
++            (long long)n_steps_,
++            (long long)n_records_,
++            (long long)n_infer_calls_,
++            (long long)n_queries_,
++            ctrl()->dropped_queries,
++            ctrl()->terminate);
++  }
++  n_tagged_ += ctrl()->tagged;
++  n_dropped_ += ctrl()->dropped_queries;
++  ctrl()->tagged = 0;
++  ctrl()->dropped_queries = 0;
++  queue_->copy_to_device(ctrl_);
++}
++
++void PathTraceNRC::train()
++{
++  NRCControlHost *c = ctrl();
++  int n_done = int(c->done_count);
++  queue_->enqueue_named("kernel_gpu_nrc_collect", n_done, DeviceKernelArguments(&n_done));
++  queue_->copy_from_device(ctrl_);
++  queue_->synchronize();
++  int n = int(min(c->record_count, uint(record_cap_)));
++  if (c->T_count > 0) {
++    /* Running mean throughput for the next collect's record weighting. */
++    const float mean_T = c->T_sum / float(c->T_count);
++    c->tau = (c->tau > 0.0f) ? 0.8f * c->tau + 0.2f * mean_T : mean_T;
++  }
++  c->T_sum = 0.0f;
++  c->T_count = 0;
++  const int steps = (n_steps_ < warmup_) ? warmup_steps_ : train_steps_;
++  if (n > 0) {
++    device_ptr in = rec_in_.device_pointer, target = rec_target_.device_pointer;
++    if (stub_mode_ == 1) {
++      queue_->enqueue_named(
++          "kernel_gpu_nrc_stub_train", n, DeviceKernelArguments(&in, &target, &n));
++    }
++    else if (stub_mode_ == -1) {
++      int rc = 0;
++      void *stream = queue_->nrc_stream();
++      queue_->run_in_context([&]() {
++        rc = api_.train(engine_, n, (const void *)in, (const float *)target, steps, stream);
++      });
++      if (rc != 0) {
++        LOG_ERROR << "NRC: nrc_train returned " << rc;
++      }
++    }
++    n_train_calls_++;
++    n_steps_ += steps;
++    n_records_ += n;
++  }
++  c->done_count = 0;
++  c->record_count = 0;
++  if (!c->terminate && terminate_enabled_ && n_steps_ >= warmup_) {
++    c->terminate = 1;
++  }
++  queue_->copy_to_device(ctrl_);
++}
++
++void PathTraceNRC::infer(const device_ptr render_buffer)
++{
++  NRCControlHost *c = ctrl();
++  int n = int(min(c->query_count, uint(query_cap_)));
++  if (n > 0) {
++    int n_pad = (n + 255) & ~255;
++    int n_extra = n_pad - n;
++    if (n_extra > 0) {
++      queue_->enqueue_named("kernel_gpu_nrc_pad", n_extra, DeviceKernelArguments(&n, &n_extra));
++    }
++    device_ptr in = query_in_.device_pointer, out = query_out_.device_pointer;
++    if (stub_mode_ == 1) {
++      queue_->enqueue_named("kernel_gpu_nrc_stub_infer", n_pad, DeviceKernelArguments(&in, &out, &n_pad));
++    }
++    else if (stub_mode_ == 0) {
++      queue_->zero_to_device(query_out_);
++    }
++    else {
++      int rc = 0;
++      void *stream = queue_->nrc_stream();
++      queue_->run_in_context([&]() {
++        for (int off = 0; off < n_pad && rc == 0; off += infer_chunk_) {
++          const int m = min(infer_chunk_, n_pad - off);
++          rc = api_.infer(engine_,
++                          m,
++                          (const void *)(in + size_t(off) * NRC_IN_FEATURES * sizeof(uint16_t)),
++                          (float *)(out + size_t(off) * 3 * sizeof(float)),
++                          stream);
++        }
++      });
++      if (rc != 0) {
++        LOG_ERROR << "NRC: nrc_infer returned " << rc;
++      }
++    }
++    device_ptr rb = render_buffer;
++    queue_->enqueue_named("kernel_gpu_nrc_resolve", n, DeviceKernelArguments(&rb, &n));
++    n_infer_calls_++;
++    n_queries_ += n;
++  }
++  c->query_count = 0;
++  queue_->copy_to_device(ctrl_);
++}
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/integrator/nrc.h b/intern/cycles/integrator/nrc.h
+new file mode 100644
+index 0000000..2c43636
+--- /dev/null
++++ b/intern/cycles/integrator/nrc.h
+@@ -0,0 +1,115 @@
++/* SPDX-FileCopyrightText: 2026 cycles-h100
++ *
++ * SPDX-License-Identifier: Apache-2.0 */
++
++/* Ours: host side of the neural radiance cache (CYCLES_NRC=1, CUDA, cubins built with -DCYCLES_NRC).
++ * Owns the NRC device buffers, uploads kernel_nrc, and runs collect / train / infer / resolve inside
++ * PathTraceWorkGPU::render_samples (see analysis/nrc_integration.md). */
++
++#pragma once
++
++#include "device/memory.h"
++#include "device/queue.h"
++
++#include "util/string.h"
++#include "util/unique_ptr.h"
++
++CCL_NAMESPACE_BEGIN
++
++class Device;
++struct NrcEngine;
++
++/* The engine's plain C interface (nrc/include/cycles_nrc.h). */
++struct NRCEngineAPI {
++  NrcEngine *(*create)(const char *json_config, void *cu_stream) = nullptr;
++  int (*infer)(NrcEngine *, int n, const void *d_inputs, float *d_rgb, void *cu_stream) = nullptr;
++  int (*train)(NrcEngine *,
++               int n,
++               const void *d_inputs,
++               const float *d_target_rgb,
++               int steps,
++               void *cu_stream) = nullptr;
++  void (*destroy)(NrcEngine *) = nullptr;
++};
++
++class PathTraceNRC {
++ public:
++  /* CYCLES_NRC=1. */
++  static bool requested();
++
++  PathTraceNRC(Device *device, DeviceQueue *queue);
++  ~PathTraceNRC();
++
++  /* Allocate for max_num_paths states. False: NRC stays off (cubin without the kernels, engine missing). */
++  bool alloc(int max_num_paths);
++  /* Fill and copy the kernel_nrc constant (scene box from DeviceScene). */
++  void upload(const float bounds[6]);
++
++  void begin_pass();
++  /* Queue the counter read-back; call before the queue synchronizes. */
++  void enqueue_readback();
++  /* After a synchronize: train when enough training paths are done, infer + resolve when the query buffer
++   * is nearly full. */
++  void poll(device_ptr render_buffer);
++  /* After the last path of render_samples: train on what is left, then infer + resolve every query. */
++  void end_pass(device_ptr render_buffer);
++
++ private:
++  void train();
++  void infer(device_ptr render_buffer);
++  bool load_engine();
++  struct NRCControlHost *ctrl();
++
++  Device *device_;
++  DeviceQueue *queue_;
++  bool allocated_ = false;
++  int max_num_paths_ = 0;
++
++  /* Settings (env). */
++  float c_ = 0.01f;
++  int min_bounce_ = 1;
++  int terminate_enabled_ = 1;
++  int skip_singular_ = 1;
++  float train_frac_ = 0.01f;
++  int train_steps_ = 4;
++  int train_slots_ = 65536;
++  int warmup_ = 256;
++  int warmup_steps_ = 16;
++  int num_slots_ = 1 << 18;
++  int record_cap_ = 1 << 18;
++  int query_cap_ = 0;
++  int infer_chunk_ = 1 << 21;
++  int flush_at_ = 0;
++  int stats_ = 0;
++  string engine_name_;
++
++  /* Engine. */
++  NRCEngineAPI api_;
++  NrcEngine *engine_ = nullptr;
++  void *engine_lib_ = nullptr;
++  int stub_mode_ = 1; /* 0: zero cache, 1: hash-grid mean, -1: external engine */
++
++  /* Stats. */
++  int64_t n_train_calls_ = 0, n_steps_ = 0, n_records_ = 0, n_queries_ = 0, n_infer_calls_ = 0;
++  int64_t n_tagged_ = 0, n_dropped_ = 0;
++
++  /* Device memory. */
++  device_vector<uint> ctrl_;
++  device_only_memory<int> main_slot_;
++  device_only_memory<float> main_spread_;
++  device_only_memory<int> shadow_slot_;
++  device_only_memory<uint16_t> query_in_;
++  device_only_memory<uint> query_meta_;
++  device_only_memory<float> query_out_;
++  device_only_memory<int> slots_;
++  device_only_memory<uint16_t> slot_feat_;
++  device_only_memory<float> slot_T_;
++  device_only_memory<float> slot_bins_;
++  device_only_memory<int> done_list_;
++  device_only_memory<uint16_t> rec_in_;
++  device_only_memory<float> rec_target_;
++  device_only_memory<float> rec_T_;
++  device_only_memory<float> stub_table_;
++};
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/integrator/path_trace_work_gpu.cpp b/intern/cycles/integrator/path_trace_work_gpu.cpp
+index 5aaad3e..107584b 100644
+--- a/intern/cycles/integrator/path_trace_work_gpu.cpp
++++ b/intern/cycles/integrator/path_trace_work_gpu.cpp
+@@ -146,6 +146,14 @@ void PathTraceWorkGPU::alloc_integrator_soa()
+    * with work without losing performance. The renderer will add more work (when
+    * available) when the number of active paths falls below this value. */
+   min_num_active_main_paths_ = max_num_paths_ / 4;
++  /* Ours: CYCLES_MIN_ACTIVE_PATHS_FRACTION=<f> adds camera work when fewer than f * states are active
++   * (stock 0.25). */
++  if (const char *value = getenv("CYCLES_MIN_ACTIVE_PATHS_FRACTION")) {
++    const double fraction = atof(value);
++    if (fraction > 0.0 && fraction <= 1.0) {
++      min_num_active_main_paths_ = max(int(double(max_num_paths_) * fraction), 1);
++    }
++  }
+ 
+   /* Allocate a device only memory buffer before for each struct member, and then
+    * write the pointers into a struct that resides in constant memory.
+@@ -325,6 +333,17 @@ void PathTraceWorkGPU::alloc_work_memory()
+   alloc_integrator_queue();
+   alloc_integrator_sorting();
+   alloc_integrator_path_split();
++
++  /* Ours: neural radiance cache. */
++  if (!nrc_failed_ && PathTraceNRC::requested()) {
++    if (!nrc_) {
++      nrc_ = make_unique<PathTraceNRC>(device_, queue_.get());
++    }
++    if (!nrc_->alloc(max_num_paths_)) {
++      nrc_.reset();
++      nrc_failed_ = true;
++    }
++  }
+ }
+ 
+ void PathTraceWorkGPU::init_execution()
+@@ -334,12 +353,19 @@ void PathTraceWorkGPU::init_execution()
+   /* Copy to device side struct in constant memory. */
+   device_->const_copy_to(
+       "integrator_state", &integrator_state_gpu_, sizeof(integrator_state_gpu_));
++
++  if (nrc_) {
++    nrc_->upload(device_scene_->nrc_bounds);
++  }
+ }
+ 
+ bool PathTraceWorkGPU::update_queue_counter_and_cache()
+ {
+   /* Copy stats from the device. */
+   queue_->copy_from_device(integrator_queue_counter_);
++  if (nrc_) {
++    nrc_->enqueue_readback();
++  }
+ 
+   if (!queue_->synchronize()) {
+     return false;
+@@ -379,6 +405,9 @@ void PathTraceWorkGPU::render_samples(RenderStatistics &statistics,
+                              device_scene_->data.integrator.scrambling_distance);
+ 
+   enqueue_reset();
++  if (nrc_) {
++    nrc_->begin_pass();
++  }
+ 
+   int num_iterations = 0;
+   uint64_t num_busy_accum = 0;
+@@ -392,6 +421,9 @@ void PathTraceWorkGPU::render_samples(RenderStatistics &statistics,
+       if (!update_queue_counter_and_cache()) {
+         break; /* Stop on error. */
+       }
++      if (nrc_) {
++        nrc_->poll(buffers_->buffer.device_pointer);
++      }
+     }
+ 
+     if (is_cancel_requested()) {
+@@ -408,6 +440,9 @@ void PathTraceWorkGPU::render_samples(RenderStatistics &statistics,
+       if (!update_queue_counter_and_cache()) {
+         break; /* Stop on error. */
+       }
++      if (nrc_) {
++        nrc_->poll(buffers_->buffer.device_pointer);
++      }
+     }
+ 
+     if (is_cancel_requested()) {
+@@ -418,6 +453,11 @@ void PathTraceWorkGPU::render_samples(RenderStatistics &statistics,
+     ++num_iterations;
+   }
+ 
++  /* Ours (NRC): train on the last training paths, then answer every query before the film is read. */
++  if (nrc_) {
++    nrc_->end_pass(buffers_->buffer.device_pointer);
++  }
++
+   if (num_iterations) {
+     statistics.occupancy = float(num_busy_accum) / num_iterations / max_num_paths_;
+   }
+diff --git a/intern/cycles/integrator/path_trace_work_gpu.h b/intern/cycles/integrator/path_trace_work_gpu.h
+index 58dd82a..591162b 100644
+--- a/intern/cycles/integrator/path_trace_work_gpu.h
++++ b/intern/cycles/integrator/path_trace_work_gpu.h
+@@ -10,6 +10,7 @@
+ #include "device/memory.h"
+ #include "device/queue.h"
+ 
++#include "integrator/nrc.h"
+ #include "integrator/path_trace_work.h"
+ #include "integrator/work_tile_scheduler.h"
+ 
+@@ -166,6 +167,10 @@ class PathTraceWorkGPU : public PathTraceWork {
+   /* Maximum number of concurrent integrator states. */
+   int max_num_paths_;
+ 
++  /* Ours: neural radiance cache (CYCLES_NRC=1), nullptr when off. */
++  unique_ptr<PathTraceNRC> nrc_;
++  bool nrc_failed_ = false;
++
+   /* Minimum number of paths which keeps the device bust. If the actual number of paths falls below
+    * this value more work will be scheduled. */
+   int min_num_active_main_paths_;
+diff --git a/intern/cycles/integrator/render_scheduler.cpp b/intern/cycles/integrator/render_scheduler.cpp
+index 8085ea9..71e9d67 100644
+--- a/intern/cycles/integrator/render_scheduler.cpp
++++ b/intern/cycles/integrator/render_scheduler.cpp
+@@ -4,6 +4,9 @@
+ 
+ #include "integrator/render_scheduler.h"
+ 
++#include <cstdio>
++#include <cstdlib>
++
+ #include "scene/integrator.h"
+ 
+ #include "session/session.h"
+@@ -322,6 +325,13 @@ RenderWork RenderScheduler::get_render_work()
+ 
+     if (!render_work) {
+       state_.end_render_time = time_now;
++      /* nrc-bake: the benchmark's timed phase (report_work_begin to the end of the last work). */
++      if (getenv("CYCLES_TIMER_REPORT") && state_.start_render_time != 0.0) {
++        fprintf(stderr,
++                "CYCLES_TIMER wall %.4f s samples %d\n",
++                state_.end_render_time - state_.start_render_time,
++                get_total_rendered_samples());
++      }
+     }
+ 
+     update_state_for_render_work(render_work);
+diff --git a/intern/cycles/kernel/integrator/nrc_types.h b/intern/cycles/kernel/integrator/nrc_types.h
+new file mode 100644
+index 0000000..ff7065b
+--- /dev/null
++++ b/intern/cycles/kernel/integrator/nrc_types.h
+@@ -0,0 +1,96 @@
++/* SPDX-FileCopyrightText: 2026 cycles-h100
++ *
++ * SPDX-License-Identifier: Apache-2.0 */
++
++/* Ours: neural radiance cache (NRC) shared layout. Included by the kernel (only with -DCYCLES_NRC) and by the
++ * host (integrator/nrc.cpp); the two copies of this file (tree53-nrc and blender-src-v5.3.0-svm) must stay
++ * identical. Every pointer is a device pointer; the host fills the struct and copies it to the cubin's
++ * __constant__ kernel_nrc symbol. */
++
++#pragma once
++
++#ifndef CYCLES_NRC_NV
++/* Vertices per training path: bins 1 .. NV-1 hold radiance by bounce, contributions at bounce >= NV-1 go to the
++ * last bin, vertices 1 .. NV-1 are stashed. */
++#  define CYCLES_NRC_NV 8
++#endif
++
++#define NRC_IN_FEATURES 16 /* = NRC_IN of nrc/include/cycles_nrc.h */
++#define NRC_SLOT_FREE 0
++#define NRC_SLOT_ACTIVE 1
++#define NRC_SLOT_DONE 2
++
++CCL_NAMESPACE_BEGIN
++
++/* Dynamic counters and flags, in device memory (written by kernels, read and reset by the host between
++ * kernel launches, stream-ordered). */
++struct NRCControl {
++  unsigned int query_count;  /* queries written (may exceed query_cap: extra ones are not written) */
++  unsigned int done_count;   /* entries in done_list */
++  unsigned int record_count; /* training records written by nrc_collect */
++  unsigned int slot_head;    /* ring allocator for training slots */
++  int terminate;             /* 1: non-training paths may end in the cache (0 during warm-up) */
++  int train;                 /* 1: tag training paths */
++  unsigned int dropped_queries;
++  unsigned int tagged;       /* training paths tagged (stats) */
++  float tau;                 /* record weighting: mean throughput of earlier records (0: no weighting yet) */
++  float T_sum;               /* sum of mean(T) over the records of this collect */
++  unsigned int T_count;
++  unsigned int pad;
++};
++
++/* Per training path (slot). */
++struct NRCSlot {
++  int status;    /* NRC_SLOT_* */
++  int ref;       /* main path + live shadow paths */
++  unsigned int mask; /* bit k: vertex k stashed */
++  int pad;
++};
++
++/* Query record metadata (inputs are a separate n x 16 fp16 array, outputs n x 3 fp32). */
++struct NRCQueryMeta {
++  unsigned int pixel; /* render_pixel_index */
++  float r, g, b;      /* path throughput after the bounce at the query vertex */
++};
++
++struct KernelNRC {
++  /* Static parameters. */
++  int enabled;
++  int min_bounce;           /* smallest bounce index (after the bounce) where a path may end */
++  float c;                  /* area-spread constant: end when spread^2 >= c * a0 */
++  int skip_singular;        /* never end after a singular (mirror/glass) bounce */
++  unsigned int train_threshold; /* tag when hash(pixel, sample) < threshold */
++  int num_slots;
++  int query_cap;
++  int record_cap;
++  float box_lo[4];
++  float box_scale[4]; /* 1 / extent */
++  int stub_log2;      /* stub hash table size log2 */
++  int stub_res;       /* stub grid resolution per axis */
++  int stub_dir;       /* stub: also key cells on the scattered direction (4 x 8 bins) */
++  int budget_feature; /* 1: features 14, 15 = remaining diffuse / glossy bounces (min with total) / 8 */
++  int train_match;    /* 1: a training path stashes only the vertex where a normal path would have ended */
++  int train_weight;   /* 1: write each record floor(mean(T) / tau + u) times (throughput-weighted regression) */
++  int diffuse_only;   /* nrc-bake: 1 = a path may end only after a diffuse bounce (label & LABEL_DIFFUSE) */
++  int pad[1];
++
++  /* Device arrays. */
++  ccl_global NRCControl *ctrl;
++  ccl_global int *main_slot;          /* [max_num_paths], -1 = not a training path */
++  ccl_global float *main_spread;      /* [max_num_paths * 2]: sqrt-sum S, a0 */
++  ccl_global int *shadow_slot;        /* [max_num_paths] */
++  ccl_global unsigned short *query_in; /* [query_cap * 16] fp16 */
++  ccl_global NRCQueryMeta *query_meta; /* [query_cap] */
++  ccl_global float *query_out;        /* [query_cap * 3] */
++  ccl_global NRCSlot *slots;          /* [num_slots] */
++  ccl_global unsigned short *slot_feat; /* [num_slots * NV * 16] fp16 */
++  ccl_global float *slot_T;           /* [num_slots * NV * 3] throughput after the bounce at vertex k */
++  ccl_global float *slot_bins;        /* [num_slots * NV * 3] radiance written with bounce k */
++  ccl_global int *done_list;          /* [num_slots] */
++  ccl_global unsigned short *rec_in;  /* [record_cap * 16] fp16 */
++  ccl_global float *rec_target;       /* [record_cap * 3] */
++  ccl_global float *rec_T;            /* [record_cap * 3] throughput of the record (stub weights) */
++  ccl_global float *stub_table;       /* [2^stub_log2 * 8]: sum T*target rgb, sum T rgb, count, 0 */
++};
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/kernel/integrator/permat_prof.h b/intern/cycles/kernel/integrator/permat_prof.h
+new file mode 100644
+index 0000000..f341ac5
+--- /dev/null
++++ b/intern/cycles/kernel/integrator/permat_prof.h
+@@ -0,0 +1,131 @@
++/* SPDX-FileCopyrightText: 2026 cycles-h100
++ *
++ * SPDX-License-Identifier: Apache-2.0 */
++
++/* Per-shader profile of shade_surface (analysis/v53_permat.md).
++ *
++ * GPU: active only with -DCYCLES_PERMAT_PROFILE. Each thread measures clock64() deltas inside
++ * integrate_surface and adds them, with path and closure counts, to the __device__ array
++ * permat_prof[shader][field]. The host (blender-src-v5.3.0-svm, CYCLES_PERMAT_PROFILE=1) reads the array with
++ * cuModuleGetGlobal("permat_prof") before it unloads the module and prints it.
++ * CPU: active when the host sets ccl_permat_prof_cpu (env CYCLES_PERMAT_PROFILE=1); the same fields, rdtsc deltas.
++ * Without the macro (GPU) or the env (CPU) nothing is recorded and the GPU code is unchanged. */
++
++#pragma once
++
++#define PERMAT_MAX_SHADERS 256
++#define PERMAT_FIELDS 64
++#define PERMAT_F_COUNT 0
++#define PERMAT_F_CYC_EVAL 1   /* setup + SVM evaluation */
++#define PERMAT_F_CYC_LIGHT 2  /* closure prepare, holdout, emission, passes, direct light */
++#define PERMAT_F_CYC_BOUNCE 3 /* AO, BSDF/BSSRDF bounce, volume stack, exit */
++#define PERMAT_F_CYC_TOTAL 4
++#define PERMAT_F_CL_SUM 5
++#define PERMAT_F_CL_MIN 6 /* stored as ~min */
++#define PERMAT_F_CL_MAX 7
++#define PERMAT_F_SSS_EXIT 8
++#define PERMAT_F_CL_SQ 9
++#define PERMAT_F_TYPE0 16 /* 16 + ClosureType (< 48) */
++
++#if defined(__KERNEL_GPU__) && defined(CYCLES_PERMAT_PROFILE)
++#  define PERMAT_ACTIVE 1
++extern "C" {
++__device__ unsigned long long permat_prof[PERMAT_MAX_SHADERS * PERMAT_FIELDS];
++}
++#  define PERMAT_TABLE (permat_prof)
++#  define PERMAT_NOW() ((unsigned long long)clock64())
++#  define PERMAT_ADD(p, v) atomicAdd((p), (unsigned long long)(v))
++#  define PERMAT_MAX(p, v) atomicMax((p), (unsigned long long)(v))
++#elif !defined(__KERNEL_GPU__)
++#  define PERMAT_ACTIVE 1
++extern "C" unsigned long long *ccl_permat_prof_cpu;
++#  define PERMAT_TABLE (ccl_permat_prof_cpu)
++#  define PERMAT_NOW() ((unsigned long long)__builtin_ia32_rdtsc())
++#  define PERMAT_ADD(p, v) __atomic_fetch_add((p), (unsigned long long)(v), __ATOMIC_RELAXED)
++#  define PERMAT_MAX(p, v) \
++    { \
++      unsigned long long _v = (v), _o = __atomic_load_n((p), __ATOMIC_RELAXED); \
++      while (_o < _v && \
++             !__atomic_compare_exchange_n((p), &_o, _v, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) \
++      { \
++      } \
++    }
++#endif
++
++#ifdef PERMAT_ACTIVE
++CCL_NAMESPACE_BEGIN
++
++struct PermatScope {
++  unsigned long long t0, t1, t2;
++  int shader, ncl, sss_exit;
++  unsigned long long types[2]; /* bit set per closure type seen (one count per evaluation and type) */
++
++  ccl_device_inline_method PermatScope() : t0(PERMAT_NOW()), t1(0), t2(0), shader(-1), ncl(-1), sss_exit(0)
++  {
++    types[0] = types[1] = 0;
++  }
++  ccl_device_inline_method void set_shader(const int s)
++  {
++    shader = s;
++  }
++  /* Right after surface_shader_eval (num_closure is only valid there). */
++  ccl_device_inline_method void mark_closures(const ccl_private ShaderData *sd)
++  {
++    ncl = sd->num_closure;
++    for (int i = 0; i < sd->num_closure; i++) {
++      const int t = int(sd->closure[i].type) & 63;
++      types[t >> 5] |= 1ull << (t & 31);
++    }
++  }
++  ccl_device_inline_method void mark_eval(const uint32_t path_flag)
++  {
++    t1 = PERMAT_NOW();
++    sss_exit = (path_flag & PATH_RAY_SUBSURFACE) ? 1 : 0;
++  }
++  ccl_device_inline_method void mark_light()
++  {
++    t2 = PERMAT_NOW();
++  }
++  ccl_device_inline_method ~PermatScope()
++  {
++    unsigned long long *table = PERMAT_TABLE;
++    if (table == nullptr || shader < 0 || shader >= PERMAT_MAX_SHADERS) {
++      return;
++    }
++    const unsigned long long t3 = PERMAT_NOW();
++    const unsigned long long e = t1 ? t1 : t3;
++    const unsigned long long l = t2 ? t2 : e;
++    unsigned long long *row = table + shader * PERMAT_FIELDS;
++    PERMAT_ADD(row + PERMAT_F_COUNT, 1);
++    PERMAT_ADD(row + PERMAT_F_CYC_EVAL, e - t0);
++    PERMAT_ADD(row + PERMAT_F_CYC_LIGHT, l - e);
++    PERMAT_ADD(row + PERMAT_F_CYC_BOUNCE, t3 - l);
++    PERMAT_ADD(row + PERMAT_F_CYC_TOTAL, t3 - t0);
++    if (ncl >= 0) {
++      PERMAT_ADD(row + PERMAT_F_CL_SUM, ncl);
++      PERMAT_ADD(row + PERMAT_F_CL_SQ, ncl * ncl);
++      PERMAT_MAX(row + PERMAT_F_CL_MIN, ~(unsigned long long)ncl);
++      PERMAT_MAX(row + PERMAT_F_CL_MAX, ncl);
++      PERMAT_ADD(row + PERMAT_F_SSS_EXIT, sss_exit);
++      for (int t = 0; t < 48; t++) {
++        if (types[t >> 5] & (1ull << (t & 31))) {
++          PERMAT_ADD(row + PERMAT_F_TYPE0 + t, 1);
++        }
++      }
++    }
++  }
++};
++
++CCL_NAMESPACE_END
++#  define PERMAT_SCOPE() PermatScope permat_scope
++#  define PERMAT_SET_SHADER(s) permat_scope.set_shader(s)
++#  define PERMAT_MARK_CLOSURES(sd) permat_scope.mark_closures(sd)
++#  define PERMAT_MARK_EVAL(pf) permat_scope.mark_eval(pf)
++#  define PERMAT_MARK_LIGHT() permat_scope.mark_light()
++#else
++#  define PERMAT_SCOPE()
++#  define PERMAT_SET_SHADER(s)
++#  define PERMAT_MARK_CLOSURES(sd)
++#  define PERMAT_MARK_EVAL(pf)
++#  define PERMAT_MARK_LIGHT()
++#endif
+diff --git a/intern/cycles/kernel/integrator/shade_surface.h b/intern/cycles/kernel/integrator/shade_surface.h
+index f260790..bfab0ae 100644
+--- a/intern/cycles/kernel/integrator/shade_surface.h
++++ b/intern/cycles/kernel/integrator/shade_surface.h
+@@ -20,6 +20,7 @@
+ #include "kernel/integrator/shadow_linking.h"
+ #include "kernel/integrator/subsurface.h"
+ #include "kernel/integrator/volume_stack.h"
++#include "kernel/integrator/permat_prof.h"
+ 
+ #include "kernel/types.h"
+ #include "util/math_intersect.h"
+@@ -771,10 +772,12 @@ ccl_device int integrate_surface(KernelGlobals kg,
+ {
+   PROFILING_INIT_FOR_SHADER(kg, PROFILING_SHADE_SURFACE_SETUP);
+ 
++  PERMAT_SCOPE();
+   /* Setup shader data. */
+   ShaderData sd;
+   integrate_surface_shader_setup(kg, state, &sd);
+   PROFILING_SHADER(sd.object, sd.shader);
++  PERMAT_SET_SHADER(sd.shader & SHADER_MASK);
+ 
+   int continue_path_label = 0;
+ 
+@@ -794,11 +797,13 @@ ccl_device int integrate_surface(KernelGlobals kg,
+       PROFILING_EVENT(PROFILING_SHADE_SURFACE_EVAL);
+       surface_shader_eval<node_feature_mask>(
+           kg, state, &sd, render_buffer, path_visibility, path_flag);
++      PERMAT_MARK_CLOSURES(&sd);
+     }
+ 
+     if (sd.runtime_flag & SR_CACHE_MISS) {
+       return LABEL_CACHE_MISS;
+     }
++    PERMAT_MARK_EVAL(path_flag);
+ 
+ #ifdef __SPECTRAL__
+     if (sd.runtime_flag & SR_BSDF_HAS_DISPERSION) {
+@@ -869,6 +874,7 @@ ccl_device int integrate_surface(KernelGlobals kg,
+     if (result == SHADER_EVAL_CACHE_MISS) {
+       return LABEL_CACHE_MISS;
+     }
++    PERMAT_MARK_LIGHT();
+ 
+ #if defined(__AO__)
+     /* Ambient occlusion pass. */
+diff --git a/intern/cycles/kernel/integrator/subsurface_random_walk.h b/intern/cycles/kernel/integrator/subsurface_random_walk.h
+index fba906a..f7da85a 100644
+--- a/intern/cycles/kernel/integrator/subsurface_random_walk.h
++++ b/intern/cycles/kernel/integrator/subsurface_random_walk.h
+@@ -11,6 +11,18 @@
+ 
+ #include "util/color.h"
+ 
++#if !defined(__KERNEL_GPU__)
++#  include <cstdio>
++#  include <cstdlib>
++#  include <cstdint>
++#  include <mutex>
++#  include <unistd.h>
++#  include <sys/syscall.h>
++#  if defined(__x86_64__)
++#    include <x86intrin.h>
++#  endif
++#endif
++
+ CCL_NAMESPACE_BEGIN
+ 
+ #ifdef __SUBSURFACE__
+@@ -195,6 +207,135 @@ ccl_device_forceinline Spectrum subsurface_random_walk_pdf(Spectrum sigma_t,
+   return hit ? T : sigma_t * T;
+ }
+ 
++
++#if !defined(__KERNEL_GPU__)
++/* SSS step logger (analysis only). Active only when env CYCLES_SSS_LOG=<dir> is set; then one walk in
++ * CYCLES_SSS_LOG_K (default 64, counted per thread) logs all its steps to <dir>/steps_<tid>_<tag>.bin, and
++ * the triangles of each walk object are dumped once to <dir>/tris_obj<object>.bin. Unset = stock behaviour. */
++struct SSSLogRec {
++  float P[3];
++  float D[3];
++  float t;     /* sampled distance */
++  float tmax;  /* traced segment length */
++  float thit;  /* nearest local hit distance, -1 if none */
++  int object;
++  int walk;    /* per-thread sampled-walk counter */
++  unsigned int cycles; /* rdtsc ticks spent in scene_intersect_local */
++  short bounce;
++  short flags; /* bit0 = hit (final, as used by the walk), bit1 = traversal found a hit */
++};
++struct SSSLogThread {
++  FILE *f = nullptr;
++  long long nwalk = 0;
++  int nsampled = 0;
++  int n = 0;
++  bool cur = false;
++  SSSLogRec buf[BSSRDF_MAX_BOUNCES];
++};
++static const char *sss_log_dir()
++{
++  static const char *d = getenv("CYCLES_SSS_LOG");
++  return d;
++}
++static int sss_log_k()
++{
++  static const int k = getenv("CYCLES_SSS_LOG_K") ? atoi(getenv("CYCLES_SSS_LOG_K")) : 64;
++  return k;
++}
++static SSSLogThread &sss_log_thread()
++{
++  static thread_local SSSLogThread th;
++  return th;
++}
++static void sss_log_dump_object(KernelGlobals kg, const int object)
++{
++  static std::mutex mtx;
++  static bool done[65536] = {false};
++  if (object < 0 || object >= 65536) {
++    return;
++  }
++  std::lock_guard<std::mutex> lock(mtx);
++  if (done[object]) {
++    return;
++  }
++  done[object] = true;
++  char name[1024];
++  snprintf(name, sizeof(name), "%s/tris_obj%d.bin", sss_log_dir(), object);
++  FILE *f = fopen(name, "wb");
++  if (!f) {
++    return;
++  }
++  const int prim_offset = (int)kernel_data_fetch(object_prim_offset, object);
++  const int num_prims = kernel_data_fetch(objects, object).mesh_volume.num_prims;
++  const int flag = (int)kernel_data_fetch(object_flag, object);
++  const Transform tfm = kernel_data_fetch(objects, object).tfm;
++  const int header[4] = {object, flag, prim_offset, num_prims};
++  fwrite(header, sizeof(int), 4, f);
++  fwrite(&tfm, sizeof(float), 12, f);
++  for (int i = 0; i < num_prims; i++) {
++    float3 V[3];
++    triangle_vertices(kg, object, prim_offset + i, V);
++    const float v[9] = {V[0].x, V[0].y, V[0].z, V[1].x, V[1].y, V[1].z, V[2].x, V[2].y, V[2].z};
++    fwrite(v, sizeof(float), 9, f);
++  }
++  fclose(f);
++}
++static void sss_log_walk_begin(KernelGlobals kg, const int object)
++{
++  SSSLogThread &th = sss_log_thread();
++  th.n = 0;
++  th.cur = (th.nwalk++ % sss_log_k()) == 0;
++  if (th.cur) {
++    sss_log_dump_object(kg, object);
++  }
++}
++static void sss_log_step(const float3 P, const float3 D, const float t, const float tmax,
++                         const float thit, const int object, const int bounce, const int flags,
++                         const unsigned int cycles)
++{
++  SSSLogThread &th = sss_log_thread();
++  if (!th.cur || th.n >= BSSRDF_MAX_BOUNCES) {
++    return;
++  }
++  SSSLogRec &r = th.buf[th.n++];
++  r.P[0] = P.x; r.P[1] = P.y; r.P[2] = P.z;
++  r.D[0] = D.x; r.D[1] = D.y; r.D[2] = D.z;
++  r.t = t; r.tmax = tmax; r.thit = thit; r.object = object; r.walk = th.nsampled; r.cycles = cycles;
++  r.bounce = (short)bounce; r.flags = (short)flags;
++}
++static bool sss_log_cur()
++{
++  return sss_log_thread().cur;
++}
++static unsigned long long sss_log_ticks()
++{
++#  if defined(__x86_64__)
++  return __rdtsc();
++#  else
++  return 0;
++#  endif
++}
++static void sss_log_walk_end()
++{
++  SSSLogThread &th = sss_log_thread();
++  if (!th.cur) {
++    return;
++  }
++  th.cur = false;
++  if (!th.f) {
++    char name[1024];
++    snprintf(name, sizeof(name), "%s/steps_%ld_%p.bin", sss_log_dir(), (long)syscall(SYS_gettid),
++             (void *)&th);
++    th.f = fopen(name, "wb");
++  }
++  if (th.f && th.n > 0) {
++    fwrite(th.buf, sizeof(SSSLogRec), th.n, th.f);
++    fflush(th.f);
++  }
++  th.nsampled++;
++}
++#endif
++
+ /* Define the below variable to get the similarity code active,
+  * and the value represents the cutoff level */
+ #  define SUBSURFACE_RANDOM_WALK_SIMILARITY_LEVEL 9
+@@ -293,6 +434,12 @@ ccl_device_inline bool subsurface_random_walk(KernelGlobals kg,
+   const float guided_fraction_org = guided_fraction;
+ #  endif
+ 
++#if !defined(__KERNEL_GPU__)
++  const bool sss_log_on = sss_log_dir() != nullptr;
++  if (sss_log_on) {
++    sss_log_walk_begin(kg, object);
++  }
++#endif
+   for (int bounce = 0; bounce < BSSRDF_MAX_BOUNCES; bounce++) {
+     /* Advance random number offset. */
+     rng_state.rng_offset += PRNG_BOUNCE_NUM;
+@@ -413,8 +560,18 @@ ccl_device_inline bool subsurface_random_walk(KernelGlobals kg,
+       ray.self.object = OBJECT_NONE;
+       ray.self.prim = PRIM_NONE;
+     }
++#if !defined(__KERNEL_GPU__)
++    const unsigned long long sss_log_t0 = (sss_log_on && sss_log_cur()) ? sss_log_ticks() : 0;
++#endif
+     scene_intersect_local<true>(kg, &ray, &ss_isect, object, nullptr, 1);
+     hit = (ss_isect.num_hits > 0);
++#if !defined(__KERNEL_GPU__)
++    const unsigned int sss_log_cyc = sss_log_t0 ? (unsigned int)(sss_log_ticks() - sss_log_t0) : 0u;
++    const float3 sss_log_P = ray.P;
++    const float sss_log_tmax = ray.tmax;
++    const float sss_log_thit = hit ? ss_isect.hits[0].t : -1.0f;
++    const bool sss_log_anyhit = hit;
++#endif
+ 
+     if (hit) {
+       ray.tmax = ss_isect.hits[0].t;
+@@ -436,6 +593,12 @@ ccl_device_inline bool subsurface_random_walk(KernelGlobals kg,
+       t = ray.tmax;
+     }
+ 
++#if !defined(__KERNEL_GPU__)
++    if (sss_log_on) {
++      sss_log_step(sss_log_P, ray.D, t, sss_log_tmax, sss_log_thit, object, bounce,
++                   (hit ? 1 : 0) | (sss_log_anyhit ? 2 : 0), sss_log_cyc);
++    }
++#endif
+     /* Advance to new scatter location. */
+     ray.P += t * ray.D;
+ 
+@@ -478,6 +641,12 @@ ccl_device_inline bool subsurface_random_walk(KernelGlobals kg,
+     }
+   }
+ 
++#if !defined(__KERNEL_GPU__)
++  if (sss_log_on) {
++    sss_log_walk_end();
++  }
++#endif
++
+   if (hit) {
+     kernel_assert(isfinite_safe(throughput));
+ 
+diff --git a/intern/cycles/scene/CMakeLists.txt b/intern/cycles/scene/CMakeLists.txt
+index a4377db..ba4bc83 100644
+--- a/intern/cycles/scene/CMakeLists.txt
++++ b/intern/cycles/scene/CMakeLists.txt
+@@ -52,6 +52,7 @@ set(SRC
+   shader_nodes.cpp
+   stats.cpp
+   svm.cpp
++  svm_specialize.cpp
+   tables.cpp
+   tabulated_sobol.cpp
+   volume.cpp
+@@ -92,6 +93,7 @@ set(SRC_HEADERS
+   shader_nodes.h
+   stats.h
+   svm.h
++  svm_specialize.h
+   tables.h
+   tabulated_sobol.h
+   volume.h
+diff --git a/intern/cycles/scene/devicescene.h b/intern/cycles/scene/devicescene.h
+index 0979d02..96e2836 100644
+--- a/intern/cycles/scene/devicescene.h
++++ b/intern/cycles/scene/devicescene.h
+@@ -15,6 +15,9 @@ CCL_NAMESPACE_BEGIN
+ 
+ class DeviceScene {
+  public:
++  /* Ours (NRC): world bounds of all objects (min xyz, max xyz), set in Scene::device_update. */
++  float nrc_bounds[6] = {0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
++
+   /* BVH */
+   device_vector<int4> bvh_nodes;
+   device_vector<int4> bvh_leaf_nodes;
+diff --git a/intern/cycles/scene/scene.cpp b/intern/cycles/scene/scene.cpp
+index fe56ce4..9d21731 100644
+--- a/intern/cycles/scene/scene.cpp
++++ b/intern/cycles/scene/scene.cpp
+@@ -27,6 +27,7 @@
+ #include "scene/scene_attributes.h"
+ #include "scene/shader.h"
+ #include "scene/svm.h"
++#include "scene/svm_specialize.h"
+ #include "scene/tables.h"
+ #include "scene/volume.h"
+ 
+@@ -34,6 +35,7 @@
+ 
+ #include "util/guarded_allocator.h"
+ #include "util/log.h"
++#include "util/path.h"
+ #include "util/progress.h"
+ 
+ CCL_NAMESPACE_BEGIN
+@@ -314,6 +316,24 @@ void Scene::device_update(Device *device_, Progress &progress)
+     return;
+   }
+ 
++  /* Ours (NRC): scene box for the cache's position input. */
++  {
++    BoundBox nrc_box = BoundBox::empty;
++    for (Object *object : objects) {
++      if (object->bounds.valid()) {
++        nrc_box.grow(object->bounds);
++      }
++    }
++    if (nrc_box.valid()) {
++      dscene.nrc_bounds[0] = nrc_box.min.x;
++      dscene.nrc_bounds[1] = nrc_box.min.y;
++      dscene.nrc_bounds[2] = nrc_box.min.z;
++      dscene.nrc_bounds[3] = nrc_box.max.x;
++      dscene.nrc_bounds[4] = nrc_box.max.y;
++      dscene.nrc_bounds[5] = nrc_box.max.z;
++    }
++  }
++
+   /* Update object flags with final geometry. */
+   progress.set_status("Updating Objects Flags");
+   object_manager->device_update_flags(device, &dscene, this, progress);
+@@ -688,6 +708,8 @@ bool Scene::update_camera_resolution(Progress &progress, int width, int height)
+ static void log_kernel_features(const uint64_t features)
+ {
+   LOG_INFO << "Requested features:";
++  /* Ours (logging only): the numeric mask, to compile a per-scene kernel with -D__KERNEL_FEATURES__. */
++  LOG_INFO << "Kernel features mask " << features;
+   LOG_INFO << "Use BSDF " << string_from_bool(features & KERNEL_FEATURE_NODE_BSDF);
+   LOG_INFO << "Use Emission " << string_from_bool(features & KERNEL_FEATURE_NODE_EMISSION);
+   LOG_INFO << "Use Volume " << string_from_bool(features & KERNEL_FEATURE_NODE_VOLUME);
+@@ -719,6 +741,16 @@ bool Scene::load_kernels(Progress &progress)
+ 
+   const uint64_t kernel_features = dscene.data.kernel_features;
+   log_kernel_features(kernel_features);
++  /* Ours (SVM specialization): with CYCLES_SVM_SPECIALIZE=1 and CYCLES_SVM_DUMP=<dir>, write the nvcc flags of
++   * this scene's kernel next to the generated svm_specialized.h. Unset: stock. */
++  if (svm_specialization_enabled() && getenv("CYCLES_SVM_DUMP")) {
++    string flags = "-D__KERNEL_FEATURES__=" + to_string(kernel_features) +
++                   " -D__MAX_CLOSURE__=" + to_string(MAX_CLOSURE);
++#ifdef WITH_NANOVDB
++    flags += " -DWITH_NANOVDB";
++#endif
++    path_write_text(path_join(getenv("CYCLES_SVM_DUMP"), "cuda_flags.txt"), flags + "\n");
++  }
+   if (!device->load_kernels(kernel_features)) {
+     string message = device->error_message();
+     if (message.empty()) {
+diff --git a/intern/cycles/scene/svm.cpp b/intern/cycles/scene/svm.cpp
+index 6749c2e..fd045dc 100644
+--- a/intern/cycles/scene/svm.cpp
++++ b/intern/cycles/scene/svm.cpp
+@@ -17,6 +17,9 @@
+ #include "scene/stats.h"
+ #include "scene/svm.h"
+ 
++#include <cstdio>
++#include "scene/svm_specialize.h"
++
+ #include "kernel/svm/node_types.h"
+ 
+ #include "util/log.h"
+@@ -37,7 +40,8 @@ SVMShaderManager::~SVMShaderManager() = default;
+ void SVMShaderManager::device_update_shader(Scene *scene,
+                                             Shader *shader,
+                                             Progress &progress,
+-                                            array<int> *svm_nodes)
++                                            array<int> *svm_nodes,
++                                            vector<int> *instructions)
+ {
+   if (progress.get_cancel()) {
+     return;
+@@ -47,7 +51,7 @@ void SVMShaderManager::device_update_shader(Scene *scene,
+   SVMCompiler::Summary summary;
+   SVMCompiler compiler(scene, progress);
+   compiler.background = (shader == scene->background->get_shader(scene));
+-  compiler.compile(shader, *svm_nodes, 0, &summary);
++  compiler.compile(shader, *svm_nodes, 0, &summary, instructions);
+ 
+   LOG_DEBUG << "Compilation summary:\n"
+             << "Shader name: " << shader->name << "\n"
+@@ -72,6 +76,11 @@ void SVMShaderManager::device_update_specific(Device *device,
+   const int num_shaders = scene->shaders.size();
+ 
+   LOG_INFO << "Total " << num_shaders << " shaders.";
++  if (getenv("CYCLES_PERMAT_PROFILE")) { /* Ours (analysis/v53_permat.md): shader id -> name. */
++    for (int i = 0; i < num_shaders; i++) {
++      fprintf(stderr, "PERMAT_SHADER %d %s\n", i, scene->shaders[i]->name.c_str());
++    }
++  }
+ 
+   const double start_time = time_dt();
+ 
+@@ -81,7 +90,16 @@ void SVMShaderManager::device_update_specific(Device *device,
+   /* Build all shaders. */
+   TaskPool task_pool;
+   vector<array<int>> shader_svm_nodes(num_shaders);
++  /* Ours (SVM specialization, CYCLES_SVM_SPECIALIZE=1): record node offsets and compile in order, so image slots
++   * (allocated during compile) and with them svm_nodes are the same in every run. Unset: stock. */
++  const bool specialize = svm_specialization_enabled();
++  vector<vector<int>> shader_instructions(specialize ? num_shaders : 0);
+   for (int i = 0; i < num_shaders; i++) {
++    if (specialize) {
++      device_update_shader(
++          scene, scene->shaders[i], progress, &shader_svm_nodes[i], &shader_instructions[i]);
++      continue;
++    }
+     task_pool.push([this, scene, &progress, &shader_svm_nodes, i] {
+       device_update_shader(scene, scene->shaders[i], progress, &shader_svm_nodes[i]);
+     });
+@@ -104,8 +122,14 @@ void SVMShaderManager::device_update_specific(Device *device,
+   int *svm_nodes = dscene->svm_nodes.alloc(svm_nodes_size);
+ 
+   int node_offset = num_shaders * jump_node_size;
++  vector<int> instructions;
+   for (int i = 0; i < num_shaders; i++) {
+     Shader *shader = scene->shaders[i];
++    if (specialize) {
++      for (const int instruction : shader_instructions[i]) {
++        instructions.push_back(instruction - jump_node_size + node_offset);
++      }
++    }
+ 
+     shader->clear_modified();
+     if (shader->emission_sampling != EMISSION_SAMPLING_NONE) {
+@@ -137,6 +161,10 @@ void SVMShaderManager::device_update_specific(Device *device,
+     return;
+   }
+ 
++  if (specialize) {
++    svm_specialize(dscene, num_shaders, instructions);
++  }
++
+   device_update_common(device, dscene, scene, progress);
+ 
+   update_flags = UPDATE_NONE;
+@@ -434,6 +462,7 @@ void SVMCompiler::stack_clear_temporary(ShaderNode *node)
+ void SVMCompiler::add_node(ShaderNodeType type)
+ {
+   svm_node_types_used[type] = true;
++  current_instructions.push_back(current_svm_nodes.size());
+   current_svm_nodes.push_back_slow(type);
+ }
+ 
+@@ -1082,6 +1111,7 @@ void SVMCompiler::compile_type(Shader *shader, ShaderGraph *graph, ShaderType ty
+   /* clear all compiler state */
+   memset((void *)&active_stack, 0, sizeof(active_stack));
+   current_svm_nodes.clear();
++  current_instructions.clear();
+ 
+   for (ShaderNode *node : graph->nodes) {
+     node->added_to_svm = false;
+@@ -1164,6 +1194,7 @@ void SVMCompiler::compile_type(Shader *shader, ShaderGraph *graph, ShaderType ty
+   /* if compile failed, generate empty shader */
+   if (compile_failed) {
+     current_svm_nodes.clear();
++    current_instructions.clear();
+     compile_failed = false;
+   }
+ 
+@@ -1174,12 +1205,25 @@ void SVMCompiler::compile_type(Shader *shader, ShaderGraph *graph, ShaderType ty
+   }
+ }
+ 
+-void SVMCompiler::compile(Shader *shader, array<int> &svm_nodes, const int index, Summary *summary)
++void SVMCompiler::compile(Shader *shader,
++                          array<int> &svm_nodes,
++                          const int index,
++                          Summary *summary,
++                          vector<int> *instructions)
+ {
+   svm_node_types_used[NODE_SHADER_JUMP] = true;
+   add_node(nullptr, NODE_SHADER_JUMP, SVMNodeShaderJump{0, 0, 0});
+   svm_nodes.append(current_svm_nodes);
+   current_svm_nodes.clear();
++  current_instructions.clear();
++  /* Ours: offsets of the nodes about to be appended to svm_nodes. */
++  auto record_instructions = [&]() {
++    if (instructions) {
++      for (const int instruction : current_instructions) {
++        instructions->push_back(svm_nodes.size() + instruction);
++      }
++    }
++  };
+ 
+   /* copy graph for shader with bump mapping */
+   const int start_num_svm_nodes = svm_nodes.size();
+@@ -1195,6 +1239,7 @@ void SVMCompiler::compile(Shader *shader, array<int> &svm_nodes, const int index
+     const scoped_timer timer((summary != nullptr) ? &summary->time_generate_bump : nullptr);
+     compile_type(shader, shader->graph.get(), SHADER_TYPE_BUMP);
+     svm_nodes[index + 1] = svm_nodes.size();
++    record_instructions();
+     svm_nodes.append(current_svm_nodes);
+   }
+ 
+@@ -1207,6 +1252,7 @@ void SVMCompiler::compile(Shader *shader, array<int> &svm_nodes, const int index
+     if (!has_bump_from_displacement) {
+       svm_nodes[index + 1] = svm_nodes.size();
+     }
++    record_instructions();
+     svm_nodes.append(current_svm_nodes);
+   }
+ 
+@@ -1215,6 +1261,7 @@ void SVMCompiler::compile(Shader *shader, array<int> &svm_nodes, const int index
+     const scoped_timer timer((summary != nullptr) ? &summary->time_generate_volume : nullptr);
+     compile_type(shader, shader->graph.get(), SHADER_TYPE_VOLUME);
+     svm_nodes[index + 2] = svm_nodes.size();
++    record_instructions();
+     svm_nodes.append(current_svm_nodes);
+   }
+ 
+@@ -1224,6 +1271,7 @@ void SVMCompiler::compile(Shader *shader, array<int> &svm_nodes, const int index
+                                                     nullptr);
+     compile_type(shader, shader->graph.get(), SHADER_TYPE_DISPLACEMENT);
+     svm_nodes[index + 3] = svm_nodes.size();
++    record_instructions();
+     svm_nodes.append(current_svm_nodes);
+   }
+ 
+diff --git a/intern/cycles/scene/svm.h b/intern/cycles/scene/svm.h
+index b99e471..d6a388c 100644
+--- a/intern/cycles/scene/svm.h
++++ b/intern/cycles/scene/svm.h
+@@ -41,7 +41,8 @@ class SVMShaderManager : public ShaderManager {
+   void device_update_shader(Scene *scene,
+                             Shader *shader,
+                             Progress &progress,
+-                            array<int> *svm_nodes);
++                            array<int> *svm_nodes,
++                            vector<int> *instructions = nullptr);
+ };
+ 
+ /* Graph Compiler */
+@@ -77,7 +78,12 @@ class SVMCompiler {
+   };
+ 
+   SVMCompiler(Scene *scene, Progress &progress);
+-  void compile(Shader *shader, array<int> &svm_nodes, const int index, Summary *summary = nullptr);
++  /* Ours (SVM specialization): instructions, when given, receives the offset of every node type word. */
++  void compile(Shader *shader,
++               array<int> &svm_nodes,
++               const int index,
++               Summary *summary = nullptr,
++               vector<int> *instructions = nullptr);
+ 
+   /* Create input and output node parameters for struct T passed to add_node. */
+   SVMInputInt input_int(const char *name);
+@@ -100,6 +106,7 @@ class SVMCompiler {
+     requires(std::is_class_v<T> && sizeof(T) % sizeof(int) == 0 && alignof(T) <= sizeof(uint))
+   {
+     const ShaderNodeType resolved_type = node_type(shader_node, type, use_derivatives);
++    current_instructions.push_back(current_svm_nodes.size());
+     current_svm_nodes.push_back_slow(resolved_type);
+     const int *data = reinterpret_cast<const int *>(&node);
+     svm_node_types_used[resolved_type] = true;
+@@ -280,6 +287,7 @@ class SVMCompiler {
+ 
+   std::atomic_int *svm_node_types_used;
+   array<int> current_svm_nodes;
++  vector<int> current_instructions; /* Ours: node offsets in current_svm_nodes. */
+   ShaderType current_type;
+   Shader *current_shader;
+   Stack active_stack;
+diff --git a/intern/cycles/scene/svm_specialize.cpp b/intern/cycles/scene/svm_specialize.cpp
+new file mode 100644
+index 0000000..589cfff
+--- /dev/null
++++ b/intern/cycles/scene/svm_specialize.cpp
+@@ -0,0 +1,307 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++
++/* Ours: SVM specialization (port of the 4.5.0 final4 selective specialization to 5.3.0).
++ *
++ * The scene's SVM program (svm_nodes: a jump table of NODE_SHADER_JUMP entries, then each shader's nodes, each node
++ * a type word followed by its SVMNode* struct words) is cut into programs, one per entry offset of the jump table.
++ * A program is the list of instructions (node offsets recorded by SVMCompiler::add_node) from the entry to its
++ * NODE_END. For each supported program the generated header has one function that calls svm_eval_node<..., type>
++ * per instruction with an SVMStaticReader<pc>, whose words are constants, so the node handler folds; jumps become
++ * gotos. A node that leaves an offset other than the next instruction hands over to the interpreter at that
++ * offset. The kernel only runs the generated code when kernel_data.image.pad1..3 hold this program's key. */
++
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <set>
++#include <sstream>
++
++#include "scene/devicescene.h"
++#include "scene/svm_specialize.h"
++
++#include "kernel/svm/node_types.h"
++#include "kernel/svm/types.h"
++
++#include "util/md5.h"
++#include "util/path.h"
++
++CCL_NAMESPACE_BEGIN
++
++bool svm_specialization_enabled()
++{
++  const char *enabled = getenv("CYCLES_SVM_SPECIALIZE");
++  return enabled && string(enabled) == "1";
++}
++
++static const char *svm_node_type_name(const uint type)
++{
++  static const char *names[] = {
++#define SHADER_NODE_TYPE(name) #name,
++#define SHADER_NODE_TYPE_DERIVATIVE(name) #name, #name "_DERIVATIVE",
++#include "kernel/svm/node_types_template.h"
++  };
++  return type < sizeof(names) / sizeof(*names) ? names[type] : nullptr;
++}
++
++void svm_specialize(DeviceScene *dscene, const int num_shaders, const vector<int> &instructions)
++{
++  const int *nodes = reinterpret_cast<const int *>(dscene->svm_nodes.data());
++  const int size = dscene->svm_nodes.size();
++  const int jump_node_size = 1 + sizeof(SVMNodeShaderJump) / sizeof(int);
++  const int jump_if_size = 1 + sizeof(SVMNodeJumpIfZero) / sizeof(int);
++  static_assert(sizeof(SVMNodeJumpIfZero) == sizeof(SVMNodeJumpIfOne));
++
++  MD5Hash hash;
++  hash.append(reinterpret_cast<const uint8_t *>(nodes), size * sizeof(int));
++  hash.append(reinterpret_cast<const uint8_t *>(instructions.data()),
++              instructions.size() * sizeof(int));
++  const string digest = hash.get_hex();
++  uint key[3];
++  for (int i = 0; i < 3; i++) {
++    key[i] = uint(strtoul(digest.substr(8 * i, 8).c_str(), nullptr, 16));
++  }
++  /* KernelImage's padding (unused by stock 5.3.0) carries the key, so KernelData keeps its stock layout. */
++  dscene->data.image.pad1 = int(key[0]);
++  dscene->data.image.pad2 = int(key[1]);
++  dscene->data.image.pad3 = int(key[2]);
++
++  const char *dump = getenv("CYCLES_SVM_DUMP");
++  const char *selection = getenv("CYCLES_SVM_SELECTIVE");
++  const bool selective = selection && string(selection) == "1";
++
++  /* next[pc]: the offset of the instruction after pc (the end of pc's struct and data words). */
++  std::map<int, int> next;
++  for (size_t i = 0; i < instructions.size(); i++) {
++    next[instructions[i]] = i + 1 < instructions.size() ? instructions[i + 1] : size;
++  }
++  std::set<int> starts;
++  for (int i = 0; i < num_shaders; i++) {
++    const SVMNodeShaderJump &jump = *reinterpret_cast<const SVMNodeShaderJump *>(
++        &nodes[i * jump_node_size + 1]);
++    starts.insert(jump.offset_surface);
++    starts.insert(jump.offset_volume);
++    starts.insert(jump.offset_displacement);
++  }
++
++  std::map<int, vector<int>> programs;
++  std::ostringstream costs;
++  costs << "start,instructions,image_2d,image_box,procedural,bump,closures,selected,reason\n";
++  int covered = 0, fallbacks = 0, policy_fallbacks = 0;
++  for (const int start : starts) {
++    vector<int> program;
++    const char *reason = nullptr;
++    if (!next.count(start)) {
++      reason = "not_an_instruction";
++    }
++    for (auto it = next.find(start); !reason && it != next.end(); ++it) {
++      const int pc = it->first;
++      const uint type = uint(nodes[pc]);
++      program.push_back(pc);
++      if (type >= NODE_NONE || type == NODE_SHADER_JUMP) {
++        reason = "unsupported_node";
++      }
++      else if (type == NODE_RAYCAST) {
++        /* Reads the NODE_ATTR instructions after it as its own data. */
++        reason = "raycast";
++      }
++      else if (type == NODE_JUMP_IF_ZERO || type == NODE_JUMP_IF_ONE) {
++        const int target = pc + jump_if_size + nodes[pc + 1];
++        if (it->second != pc + jump_if_size || target <= pc || !next.count(target)) {
++          reason = "jump";
++        }
++      }
++      else if (type == NODE_END) {
++        break;
++      }
++    }
++    if (!reason && (program.empty() || nodes[program.back()] != NODE_END)) {
++      reason = "no_end";
++    }
++    if (!reason) {
++      /* Every jump must land inside this program. */
++      const std::set<int> in_program(program.begin(), program.end());
++      for (const int pc : program) {
++        if ((nodes[pc] == NODE_JUMP_IF_ZERO || nodes[pc] == NODE_JUMP_IF_ONE) &&
++            !in_program.count(pc + jump_if_size + nodes[pc + 1]))
++        {
++          reason = "jump";
++        }
++      }
++    }
++    if (reason) {
++      ++fallbacks;
++      costs << start << ',' << program.size() << ",,,,,,0," << reason << '\n';
++      continue;
++    }
++    int images = 0, boxes = 0, procedural = 0, bump = 0, closures = 0;
++    for (const int pc : program) {
++      switch (nodes[pc]) {
++        case NODE_TEX_IMAGE:
++        case NODE_TEX_IMAGE_DERIVATIVE:
++          ++images;
++          break;
++        case NODE_TEX_IMAGE_BOX:
++        case NODE_TEX_IMAGE_BOX_DERIVATIVE:
++          ++boxes;
++          break;
++        case NODE_SET_BUMP:
++          ++bump;
++          break;
++        case NODE_CLOSURE_BSDF:
++          ++closures;
++          break;
++        case NODE_TEX_NOISE:
++        case NODE_TEX_VORONOI:
++        case NODE_TEX_GABOR:
++        case NODE_TEX_WAVE:
++        case NODE_TEX_MAGIC:
++        case NODE_TEX_BRICK:
++        case NODE_TEX_CHECKER:
++        case NODE_TEX_WHITE_NOISE:
++          ++procedural;
++          break;
++        default:
++          break;
++      }
++    }
++    /* 4.5.0 policy: image-textured programs with at most one BSDF stay on the interpreter. */
++    const bool texture_chain = images > 0 && boxes == 0 && procedural == 0 && bump == 0 &&
++                               closures <= 1;
++    const bool selected = !selective || !texture_chain;
++    costs << start << ',' << program.size() << ',' << images << ',' << boxes << ',' << procedural
++          << ',' << bump << ',' << closures << ',' << int(selected) << ','
++          << (selected ? "selected" : "image_single_bsdf") << '\n';
++    if (!selected) {
++      ++policy_fallbacks;
++      continue;
++    }
++    covered += program.size();
++    programs[start] = std::move(program);
++  }
++
++  printf(
++      "SVM_SPECIALIZE shaders=%d programs=%zu instructions=%zu words=%d covered=%d fallbacks=%d "
++      "policy_fallbacks=%d selective=%d key=%08x%08x%08x\n",
++      num_shaders,
++      programs.size(),
++      instructions.size(),
++      size,
++      covered,
++      fallbacks,
++      policy_fallbacks,
++      int(selective),
++      key[0],
++      key[1],
++      key[2]);
++  fflush(stdout);
++  if (!dump) {
++    return;
++  }
++
++  std::ostringstream out;
++  out << "/* Generated by Cycles scene/svm_specialize.cpp (CYCLES_SVM_DUMP). */\n#pragma once\n";
++  out << "#define CYCLES_SVM_SPECIALIZATION_KEY_0 " << key[0] << "u\n"
++      << "#define CYCLES_SVM_SPECIALIZATION_KEY_1 " << key[1] << "u\n"
++      << "#define CYCLES_SVM_SPECIALIZATION_KEY_2 " << key[2] << "u\n";
++  /* Node words of every instruction of a generated program. */
++  for (const auto &[start, program] : programs) {
++    for (const int pc : program) {
++      const uint type = uint(nodes[pc]);
++      if (type == NODE_END || type == NODE_JUMP_IF_ZERO || type == NODE_JUMP_IF_ONE) {
++        continue;
++      }
++      out << "template<> ccl_device_forceinline uint SVMStaticReader<" << pc
++          << ">::word(const int i)\n{\n  switch (i) {\n";
++      for (int j = pc + 1; j < next[pc]; j++) {
++        out << "    case " << j << ": return " << uint(nodes[j]) << "u;\n";
++      }
++      out << "    default: return kernel_data_fetch(svm_nodes, i);\n  }\n}\n";
++    }
++  }
++  const char *parameters =
++      "KernelGlobals kg, ConstIntegratorGenericState state, ccl_private ShaderData *sd, "
++      "ccl_global float *render_buffer, const PathRayVisibility path_visibility, "
++      "const uint32_t path_flag";
++  const char *arguments = "kg, state, sd, render_buffer, path_visibility, path_flag";
++  for (const auto &[start, program] : programs) {
++    out << "template<uint64_t node_feature_mask, ShaderType type, typename "
++           "ConstIntegratorGenericState>\nccl_device_noinline void svm_specialized_"
++        << start << "(" << parameters << ")\n{\n";
++    if (program.size() == 1) {
++      out << "  return;\n}\n";
++      continue;
++    }
++    out << "  float stack[SVM_STACK_SIZE];\n  Spectrum closure_weight = zero_spectrum();\n";
++    std::set<int> labels;
++    for (const int pc : program) {
++      if (nodes[pc] == NODE_JUMP_IF_ZERO || nodes[pc] == NODE_JUMP_IF_ONE) {
++        labels.insert(pc + jump_if_size + nodes[pc + 1]);
++      }
++    }
++    for (const int pc : program) {
++      const uint type = uint(nodes[pc]);
++      if (labels.count(pc)) {
++        out << "L" << pc << ":\n";
++      }
++      if (type == NODE_END) {
++        out << "  return;\n";
++        continue;
++      }
++      if (type == NODE_JUMP_IF_ZERO || type == NODE_JUMP_IF_ONE) {
++        const SVMNodeJumpIfZero &jump = *reinterpret_cast<const SVMNodeJumpIfZero *>(
++            &nodes[pc + 1]);
++        out << "  if (stack_load_float(stack, " << uint(jump.stack_offset) << ") "
++            << (type == NODE_JUMP_IF_ZERO ? "<= 0.0f" : ">= 1.0f") << ") {\n    goto L"
++            << pc + jump_if_size + jump.jump_offset << ";\n  }\n";
++        continue;
++      }
++      out << "  {\n    int offset = " << pc + 1 << ";\n"
++          << "    if (svm_eval_node<node_feature_mask, type, " << svm_node_type_name(type)
++          << ">(SVMStaticReader<" << pc << ">{kg}, state, sd, render_buffer, path_visibility, "
++          << "path_flag, stack, closure_weight, " << svm_node_type_name(type) << ", offset)) {\n"
++          << "      return;\n    }\n"
++          << "    if (offset != " << next[pc] << ") {\n"
++          << "      svm_eval_nodes_generic<node_feature_mask, type>(kg, state, sd, render_buffer, "
++             "path_visibility, path_flag, stack, closure_weight, offset);\n"
++          << "      return;\n    }\n  }\n";
++    }
++    out << "}\n";
++  }
++  out << "template<uint64_t node_feature_mask, ShaderType type, typename "
++         "ConstIntegratorGenericState>\nccl_device_forceinline bool svm_try_specialized("
++      << parameters << ")\n{\n"
++      << "  if (uint(kernel_data.image.pad1) != CYCLES_SVM_SPECIALIZATION_KEY_0 ||\n"
++         "      uint(kernel_data.image.pad2) != CYCLES_SVM_SPECIALIZATION_KEY_1 ||\n"
++         "      uint(kernel_data.image.pad3) != CYCLES_SVM_SPECIALIZATION_KEY_2)\n  {\n"
++         "    return false;\n  }\n";
++  const char *types[] = {"SHADER_TYPE_SURFACE", "SHADER_TYPE_VOLUME", "SHADER_TYPE_DISPLACEMENT"};
++  for (int kind = 0; kind < 3; kind++) {
++    out << "  " << (kind ? "else " : "") << "if constexpr (type == " << types[kind]
++        << ") {\n    switch (sd->shader & SHADER_MASK) {\n";
++    for (int shader = 0; shader < num_shaders; shader++) {
++      const SVMNodeShaderJump &jump = *reinterpret_cast<const SVMNodeShaderJump *>(
++          &nodes[shader * jump_node_size + 1]);
++      const int start = kind == 0 ? jump.offset_surface :
++                        kind == 1 ? jump.offset_volume :
++                                    jump.offset_displacement;
++      if (programs.count(start)) {
++        out << "      case " << shader << ":\n        svm_specialized_" << start
++            << "<node_feature_mask, type>(" << arguments << ");\n        return true;\n";
++      }
++    }
++    out << "      default:\n        return false;\n    }\n  }\n";
++  }
++  out << "  return false;\n}\n";
++
++  path_create_directories(path_join(dump, "svm_specialized.h"));
++  path_write_text(path_join(dump, "svm_specialized.h"), out.str());
++  std::ostringstream manifest;
++  manifest << "shaders " << num_shaders << "\nprograms " << programs.size() << "\ninstructions "
++           << instructions.size() << "\nwords " << size << "\ncovered " << covered
++           << "\nfallbacks " << fallbacks << "\npolicy_fallbacks " << policy_fallbacks
++           << "\nselective " << int(selective) << "\nkey " << digest.substr(0, 24) << "\n";
++  path_write_text(path_join(dump, "manifest.txt"), manifest.str());
++  path_write_text(path_join(dump, "program_costs.csv"), costs.str());
++}
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/scene/svm_specialize.h b/intern/cycles/scene/svm_specialize.h
+new file mode 100644
+index 0000000..307dfb5
+--- /dev/null
++++ b/intern/cycles/scene/svm_specialize.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++
++/* Ours: SVM specialization (port of the 4.5.0 final4 selective specialization to 5.3.0). Unset env = stock. */
++
++#pragma once
++
++#include "util/vector.h"
++
++CCL_NAMESPACE_BEGIN
++
++class DeviceScene;
++
++/* CYCLES_SVM_SPECIALIZE=1. */
++bool svm_specialization_enabled();
++
++/* Hash the scene's SVM program into dscene->data.image.pad1..3 (the key the generated kernel checks) and, with
++ * CYCLES_SVM_DUMP=<dir>, write <dir>/svm_specialized.h, manifest.txt and program_costs.csv. CYCLES_SVM_SELECTIVE=1
++ * leaves image-texture programs with at most one BSDF to the interpreter (the 4.5.0 policy). */
++void svm_specialize(DeviceScene *dscene, int num_shaders, const vector<int> &instructions);
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/test/svm_specialize_scene.py b/intern/cycles/test/svm_specialize_scene.py
+new file mode 100644
+index 0000000..0f429f2
+--- /dev/null
++++ b/intern/cycles/test/svm_specialize_scene.py
+@@ -0,0 +1,14 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import bpy
++
++scene = bpy.context.scene
++scene.render.engine = 'CYCLES'
++scene.cycles.device = 'CPU'
++scene.cycles.samples = 1
++scene.cycles.use_adaptive_sampling = False
++scene.cycles.use_denoising = False
++scene.render.resolution_percentage = 5
++scene.render.threads_mode = 'FIXED'
++scene.render.threads = 8
++bpy.ops.render.render()

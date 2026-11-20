@@ -1,0 +1,1341 @@
+diff --git a/intern/cycles/kernel/bvh/bvh_wide_dynamic.h b/intern/cycles/kernel/bvh/bvh_wide_dynamic.h
+new file mode 100644
+index 0000000..e69f3a0
+--- /dev/null
++++ b/intern/cycles/kernel/bvh/bvh_wide_dynamic.h
+@@ -0,0 +1,534 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++
++#pragma once
++
++/* Variant inner loops for the dynamic-fetch (DF) closest and shadow kernels (bvh2_dynamic.h):
++ * a BVH4 side structure, DPX slab max/min and cull-on-pop. Port of replay53-bvh4/wide_df.h, the
++ * code the H100 replay (E62, results/replay53-bvh4-w3168) timed and checked. Leaves, instance
++ * push/pop, the integrator Work types and the fetch loop are the bvh2_dynamic.h ones; only the
++ * inner-node loop, the stack entry and the pop change. Every other kernel (local, volume, SSS)
++ * keeps the BVH2 arrays.
++ *
++ * Compile flags (each kernel picks its own; nothing changes without them):
++ *   CYCLES_BVH4_CLOSEST        intersect_closest traverses the BVH4 (cull-on-pop)
++ *   CYCLES_BVH4_CLOSEST_DPX    ... with the DPX slab test (bvh4_dpx; without: bvh4_f)
++ *   CYCLES_BVH4_SHADOW         intersect_shadow traverses the BVH4 (cull-on-pop in the opaque loop)
++ *   CYCLES_BVH4_SHADOW_DPX     ... with the DPX slab test
++ *   CYCLES_BVH2_SHADOW_DPX     intersect_shadow stays BVH2, DPX slab test (bvh2_dpx)
++ *   CYCLES_BVH2_SHADOW_CULL    intersect_shadow stays BVH2, cull-on-pop in the opaque loop (bvh2_cull)
++ * They need the bhotB DF knobs (STEP=1, STACK=1, POLICY=1, DEFER=1, SPLITSTACK=1, FETCH=0, CHUNK=0).
++ *
++ * BVH4 layout (built on the host from the packed BVH2, bvh4int/bvh4_collapse.h; uploaded only when
++ * CYCLES_BVH4=1 and the cubin defines cycles_bvh4): node i is 8 float4 at nodes[8i]:
++ *   [0..5] lo_x hi_x lo_y hi_y lo_z hi_z of the 4 children, [6] child refs, [7] child visibility.
++ * A child ref is a BVH4 node index (>= 0, < BVH4_BVH2_TAG), a BVH2 leaf address (< 0, into
++ * bvh_leaf_nodes, as in the BVH2), or BVH4_BVH2_TAG + a BVH2 inner-node address: the subtree under
++ * an unaligned (hair) BVH2 node, which stays BVH2 and is traversed with bvh_node_intersect. Empty
++ * slots have lo = +inf, hi = -inf and visibility 0. Every box is the BVH2 box of the same subtree,
++ * and the FMA slab test is the BVH2 one, so a child box passes whenever BVH2 would reach it at the
++ * same tmax: the visited leaves are the same, only their order differs.
++ *
++ * DPX: the 4-way max/min of the slab test as __vimax3_s32/__vimin3_s32 on the float bits. It
++ * equals the float max/min whenever the box is hit (tmin >= 0 is an operand of the max, a hit needs
++ * every far distance >= tmin >= 0), so the same boxes pass. sm_90 has DPX in hardware; older GPUs
++ * emulate it (slow, same results).
++ *
++ * Cull (closest-hit and opaque-shadow loops, Mode 0): stack entries carry the child's entry
++ * distance; a pop drops entries farther than the current hit, which the BVH2 box test would also
++ * reject at that tmax. The transparent-shadow loop (Mode 1) keeps int entries: its bound is the
++ * constant ray.tmax. */
++
++#if CYCLES_BVH2DF_STEP != 1 || CYCLES_BVH2DF_STACK != 1 || CYCLES_BVH2DF_POLICY != 1 || \
++    !CYCLES_BVH2DF_DEFER || !CYCLES_BVH2DF_SPLITSTACK || CYCLES_BVH2DF_FETCH != 0 || \
++    CYCLES_BVH2DF_CHUNK != 0
++#  error "bvh_wide_dynamic.h needs the bhotB DF knobs (STEP=1 STACK=1 POLICY=1 DEFER=1 SPLITSTACK=1)"
++#endif
++#if defined(CYCLES_BVH4_CLOSEST) && !defined(CYCLES_BVH2DF_CLOSEST)
++#  error "CYCLES_BVH4_CLOSEST needs CYCLES_BVH2DF_CLOSEST"
++#endif
++#if (defined(CYCLES_BVH4_SHADOW) || defined(CYCLES_BVH2_SHADOW_DPX) || \
++     defined(CYCLES_BVH2_SHADOW_CULL)) && \
++    !defined(CYCLES_BVH2DF_SHADOW)
++#  error "the shadow variants need CYCLES_BVH2DF_SHADOW"
++#endif
++#if defined(CYCLES_BVH4_SHADOW) && (defined(CYCLES_BVH2_SHADOW_DPX) || defined(CYCLES_BVH2_SHADOW_CULL))
++#  error "CYCLES_BVH4_SHADOW and CYCLES_BVH2_SHADOW_* exclude each other"
++#endif
++
++/* Per-kernel configuration: width, DPX, cull. */
++#ifdef CYCLES_BVH4_CLOSEST
++#  define WDF_CLOSEST 1
++#  define WDF_CLOSEST_W 4
++#  ifdef CYCLES_BVH4_CLOSEST_DPX
++#    define WDF_CLOSEST_DPX true
++#  else
++#    define WDF_CLOSEST_DPX false
++#  endif
++#endif
++#if defined(CYCLES_BVH4_SHADOW)
++#  define WDF_SHADOW 1
++#  define WDF_SHADOW_W 4
++#  define WDF_SHADOW_CULL true
++#  ifdef CYCLES_BVH4_SHADOW_DPX
++#    define WDF_SHADOW_DPX true
++#  else
++#    define WDF_SHADOW_DPX false
++#  endif
++#elif defined(CYCLES_BVH2_SHADOW_DPX) || defined(CYCLES_BVH2_SHADOW_CULL)
++#  define WDF_SHADOW 1
++#  define WDF_SHADOW_W 2
++#  ifdef CYCLES_BVH2_SHADOW_DPX
++#    define WDF_SHADOW_DPX true
++#  else
++#    define WDF_SHADOW_DPX false
++#  endif
++#  ifdef CYCLES_BVH2_SHADOW_CULL
++#    define WDF_SHADOW_CULL true
++#  else
++#    define WDF_SHADOW_CULL false
++#  endif
++#endif
++
++CCL_NAMESPACE_BEGIN
++
++#if defined(CYCLES_BVH4_CLOSEST) || defined(CYCLES_BVH4_SHADOW)
++#  define WDF_HAS_BVH4 1
++/* The BVH4 side structure. The host looks this symbol up: its presence means the cubin needs
++ * CYCLES_BVH4=1 (device/cuda/device_impl.cpp); offsets 0, 8, 16 (const_copy_to "bvh4_nodes",
++ * "bvh4_object_root", "bvh4_root"). */
++struct KernelBVH4 {
++  const float4 *nodes;
++  const int *object_root;
++  int root;
++  int pad;
++};
++extern "C" __constant__ KernelBVH4 cycles_bvh4;
++__constant__ KernelBVH4 cycles_bvh4;
++#endif
++
++#define BVH4_BVH2_TAG 0x40000000
++
++/* Stack entry: int (address) or int2 (address, entry distance) for cull. */
++template<bool Cull> struct WdfEntrySel {
++  using T = int;
++};
++template<> struct WdfEntrySel<true> {
++  using T = int2;
++};
++
++ccl_device_forceinline void wdf_set(int &e, const int a, const float /*d*/)
++{
++  e = a;
++}
++ccl_device_forceinline void wdf_set(int2 &e, const int a, const float d)
++{
++  e = make_int2(a, __float_as_int(d));
++}
++template<class E>
++ccl_device_forceinline void wdf_push(BVH2DFRay &s, E *stack, const int a, const float d)
++{
++  ++s.stack_ptr;
++  kernel_assert(s.stack_ptr < BVH_STACK_SIZE);
++  wdf_set(stack[s.stack_ptr], a, d);
++}
++ccl_device_forceinline void wdf_pop(BVH2DFRay &s, int *stack)
++{
++  s.node_addr = stack[s.stack_ptr];
++  --s.stack_ptr;
++}
++ccl_device_forceinline void wdf_pop(BVH2DFRay &s, int2 *stack)
++{
++  /* Entries farther than the current hit are stale; sentinels carry -inf and always stop. */
++  const float t = s.isect.t;
++  int2 e;
++  do {
++    e = stack[s.stack_ptr];
++    --s.stack_ptr;
++  } while (__int_as_float(e.y) > t);
++  s.node_addr = e.x;
++}
++
++/* bvh2df_begin with the variant's entry type and root. */
++template<int W, class E> ccl_device_forceinline void wdf_begin(BVH2DFRay &s, E *stack)
++{
++  wdf_set(stack[0], ENTRYPOINT_SENTINEL, -INFINITY);
++  s.stack_ptr = 0;
++#ifdef WDF_HAS_BVH4
++  s.node_addr = (W == 4) ? cycles_bvh4.root : kernel_data.bvh.root;
++#else
++  s.node_addr = kernel_data.bvh.root;
++#endif
++  s.P = s.ray.P;
++  s.dir = bvh_clamp_direction(s.ray.D);
++  s.idir = bvh_inverse_direction(s.dir);
++  s.object = OBJECT_NONE;
++  s.isect.t = s.ray.tmax;
++  s.isect.u = 0.0f;
++  s.isect.v = 0.0f;
++  s.isect.prim = PRIM_NONE;
++  s.isect.object = OBJECT_NONE;
++  s.hit = false;
++}
++
++ccl_device_forceinline float wdf_max4i(const float a, const float b, const float c, const float lo)
++{
++  return __int_as_float(__vimax3_s32(
++      __float_as_int(a), __float_as_int(b), max(__float_as_int(c), __float_as_int(lo))));
++}
++ccl_device_forceinline float wdf_min4i(const float a, const float b, const float c, const float hi)
++{
++  return __int_as_float(__vimin3_s32(
++      __float_as_int(a), __float_as_int(b), min(__float_as_int(c), __float_as_int(hi))));
++}
++
++/* nodes.h bvh_aligned_node_intersect (CYCLES_BVH_FMA form) with the DPX 4-way max/min. */
++ccl_device_forceinline int wdf2_aligned_dpx(const float4 cnodes,
++                                            const float3 P,
++                                            const float3 idir,
++                                            const float tmin,
++                                            const float tmax,
++                                            const int node_addr,
++                                            const uint visibility,
++                                            float dist[2])
++{
++  const float4 node0 = kernel_data_fetch(bvh_nodes, node_addr + 1);
++  const float4 node1 = kernel_data_fetch(bvh_nodes, node_addr + 2);
++  const float4 node2 = kernel_data_fetch(bvh_nodes, node_addr + 3);
++  const float pidx = P.x * idir.x, pidy = P.y * idir.y, pidz = P.z * idir.z;
++  const float c0lox = fmaf(node0.x, idir.x, -pidx), c0hix = fmaf(node0.z, idir.x, -pidx);
++  const float c0loy = fmaf(node1.x, idir.y, -pidy), c0hiy = fmaf(node1.z, idir.y, -pidy);
++  const float c0loz = fmaf(node2.x, idir.z, -pidz), c0hiz = fmaf(node2.z, idir.z, -pidz);
++  const float c0min = wdf_max4i(
++      fminf(c0lox, c0hix), fminf(c0loy, c0hiy), fminf(c0loz, c0hiz), tmin);
++  const float c0max = wdf_min4i(
++      fmaxf(c0lox, c0hix), fmaxf(c0loy, c0hiy), fmaxf(c0loz, c0hiz), tmax);
++  const float c1lox = fmaf(node0.y, idir.x, -pidx), c1hix = fmaf(node0.w, idir.x, -pidx);
++  const float c1loy = fmaf(node1.y, idir.y, -pidy), c1hiy = fmaf(node1.w, idir.y, -pidy);
++  const float c1loz = fmaf(node2.y, idir.z, -pidz), c1hiz = fmaf(node2.w, idir.z, -pidz);
++  const float c1min = wdf_max4i(
++      fminf(c1lox, c1hix), fminf(c1loy, c1hiy), fminf(c1loz, c1hiz), tmin);
++  const float c1max = wdf_min4i(
++      fmaxf(c1lox, c1hix), fmaxf(c1loy, c1hiy), fmaxf(c1loz, c1hiz), tmax);
++  dist[0] = c0min;
++  dist[1] = c1min;
++#ifdef __VISIBILITY_FLAG__
++  return (((c0max >= c0min) && (__float_as_uint(cnodes.x) & visibility)) ? 1 : 0) |
++         (((c1max >= c1min) && (__float_as_uint(cnodes.y) & visibility)) ? 2 : 0);
++#else
++  return ((c0max >= c0min) ? 1 : 0) | ((c1max >= c1min) ? 2 : 0);
++#endif
++}
++
++/* One BVH2 inner node at addr: bvh2df_node with the variant's slab test and stack. Child inner
++ * addresses get + tag (BVH4_BVH2_TAG inside a BVH4 traversal, 0 in a BVH2 one). */
++template<bool Dpx, class E>
++ccl_device_forceinline void wdf2_node(
++    BVH2DFRay &s, E *stack, const float tmax, const int addr, const int tag)
++{
++  const float4 cnodes = kernel_data_fetch(bvh_nodes, addr + 0);
++  float dist[2];
++  int mask;
++  if constexpr (Dpx) {
++#ifdef __HAIR__
++    if (kernel_data.bvh.have_curves &&
++        (__float_as_uint(cnodes.x) & PATH_RAY_VISIBILITY_NODE_UNALIGNED))
++    {
++      mask = bvh_unaligned_node_intersect(
++          nullptr, s.P, s.dir, s.ray.tmin, tmax, addr, s.visibility, dist);
++    }
++    else
++#endif
++    {
++      mask = wdf2_aligned_dpx(cnodes, s.P, s.idir, s.ray.tmin, tmax, addr, s.visibility, dist);
++    }
++  }
++  else {
++    /* bvh2df_node's test. */
++#ifdef __HAIR__
++    mask = kernel_data.bvh.have_curves ?
++               bvh_node_intersect(
++                   nullptr, s.P, s.dir, s.idir, s.ray.tmin, tmax, addr, s.visibility, dist) :
++               bvh_aligned_node_intersect(
++                   nullptr, s.P, s.idir, s.ray.tmin, tmax, addr, s.visibility, dist);
++#else
++    mask = bvh_aligned_node_intersect(
++        nullptr, s.P, s.idir, s.ray.tmin, tmax, addr, s.visibility, dist);
++#endif
++  }
++  int child0 = __float_as_int(cnodes.z);
++  int child1 = __float_as_int(cnodes.w);
++  if (tag) {
++    child0 = (child0 >= 0) ? child0 + tag : child0;
++    child1 = (child1 >= 0) ? child1 + tag : child1;
++  }
++  if (mask == 3) {
++    float dfar = dist[1];
++    if (dist[1] < dist[0]) {
++      const int tmp = child0;
++      child0 = child1;
++      child1 = tmp;
++      dfar = dist[0];
++    }
++    wdf_push(s, stack, child1, dfar);
++    s.node_addr = child0;
++  }
++  else if (mask == 2) {
++    s.node_addr = child1;
++  }
++  else if (mask == 1) {
++    s.node_addr = child0;
++  }
++  else {
++    wdf_pop(s, stack);
++  }
++}
++
++#ifdef WDF_HAS_BVH4
++ccl_device_forceinline unsigned long long wdf_pin64(const unsigned long long x)
++{
++  unsigned long long y;
++  asm volatile("mov.b64 %0, %1;" : "=l"(y) : "l"(x));
++  return y;
++}
++
++/* All inner nodes (BVH4, and tagged BVH2 under unaligned nodes) down to the next leaf or
++ * sentinel. */
++template<bool Dpx, class E>
++ccl_device_forceinline void wdf4_inner(BVH2DFRay &s, E *stack, const float tmax)
++{
++  const float3 idir = s.idir;
++  const float tmin = s.ray.tmin;
++  const uint vis = s.visibility;
++  const float pidx = s.P.x * idir.x, pidy = s.P.y * idir.y, pidz = s.P.z * idir.z;
++  /* Per ray: the address of each axis's near-plane vector in node 0, from the ray octant (lo at
++   * +0, hi at +16 within the axis's 32-byte pair). The far plane is near ^ 16: bit 4 never
++   * carries. Pinned so the compiler keeps them instead of recomputing them per node. */
++  const unsigned long long base = reinterpret_cast<unsigned long long>(cycles_bvh4.nodes);
++  const unsigned long long bx = wdf_pin64(base + (idir.x >= 0.0f ? 0u : 16u));
++  const unsigned long long by = wdf_pin64(base + (idir.y >= 0.0f ? 32u : 48u));
++  const unsigned long long bz = wdf_pin64(base + (idir.z >= 0.0f ? 64u : 80u));
++  while (s.node_addr >= 0 && s.node_addr != ENTRYPOINT_SENTINEL) {
++#  ifdef CYCLES_BVH2DF_COUNT
++    s.count_nodes++;
++#  endif
++#  ifdef __HAIR__
++    if (s.node_addr >= BVH4_BVH2_TAG) {
++      /* Subtree under an unaligned BVH2 node: BVH2 traversal, children stay tagged. */
++      wdf2_node<Dpx>(s, stack, tmax, s.node_addr - BVH4_BVH2_TAG, BVH4_BVH2_TAG);
++      continue;
++    }
++#  endif
++    const unsigned long long o = (unsigned long long)(unsigned)s.node_addr * 128u;
++    const unsigned long long ax = bx + o, ay = by + o, az = bz + o;
++    const float4 NX = *reinterpret_cast<const float4 *>(ax);
++    const float4 FX = *reinterpret_cast<const float4 *>(ax ^ 16u);
++    const float4 NY = *reinterpret_cast<const float4 *>(ay);
++    const float4 FY = *reinterpret_cast<const float4 *>(ay ^ 16u);
++    const float4 NZ = *reinterpret_cast<const float4 *>(az);
++    const float4 FZ = *reinterpret_cast<const float4 *>(az ^ 16u);
++    const char *nb = reinterpret_cast<const char *>(base + o);
++    const int4 ch = *reinterpret_cast<const int4 *>(nb + 96);
++#  ifdef __VISIBILITY_FLAG__
++    const uint4 vs = *reinterpret_cast<const uint4 *>(nb + 112);
++    const uint vv[4] = {vs.x, vs.y, vs.z, vs.w};
++#  endif
++    const float nxv[4] = {NX.x, NX.y, NX.z, NX.w}, fxv[4] = {FX.x, FX.y, FX.z, FX.w};
++    const float nyv[4] = {NY.x, NY.y, NY.z, NY.w}, fyv[4] = {FY.x, FY.y, FY.z, FY.w};
++    const float nzv[4] = {NZ.x, NZ.y, NZ.z, NZ.w}, fzv[4] = {FZ.x, FZ.y, FZ.z, FZ.w};
++    float d[4];
++    int a[4] = {ch.x, ch.y, ch.z, ch.w};
++#  pragma unroll
++    for (int j = 0; j < 4; j++) {
++      const float tnx = fmaf(nxv[j], idir.x, -pidx), tny = fmaf(nyv[j], idir.y, -pidy),
++                  tnz = fmaf(nzv[j], idir.z, -pidz);
++      const float tfx = fmaf(fxv[j], idir.x, -pidx), tfy = fmaf(fyv[j], idir.y, -pidy),
++                  tfz = fmaf(fzv[j], idir.z, -pidz);
++      float tn, tf;
++      if constexpr (Dpx) {
++        tn = wdf_max4i(tnx, tny, tnz, tmin);
++        tf = wdf_min4i(tfx, tfy, tfz, tmax);
++      }
++      else {
++        tn = fmaxf(fmaxf(tmin, tnx), fmaxf(tny, tnz));
++        tf = fminf(fminf(tmax, tfx), fminf(tfy, tfz));
++      }
++#  ifdef __VISIBILITY_FLAG__
++      d[j] = (tn <= tf && (vv[j] & vis)) ? tn : INFINITY;
++#  else
++      d[j] = (tn <= tf) ? tn : INFINITY;
++#  endif
++    }
++#  define WDF_CS(x, y) \
++    { \
++      const bool sw = d[y] < d[x]; \
++      const float td = sw ? d[y] : d[x]; \
++      d[y] = sw ? d[x] : d[y]; \
++      d[x] = td; \
++      const int ta = sw ? a[y] : a[x]; \
++      a[y] = sw ? a[x] : a[y]; \
++      a[x] = ta; \
++    }
++    WDF_CS(0, 1) WDF_CS(2, 3) WDF_CS(0, 2) WDF_CS(1, 3) WDF_CS(1, 2)
++#  undef WDF_CS
++#  pragma unroll
++    for (int j = 3; j >= 1; j--) {
++      if (d[j] != INFINITY) {
++        wdf_push(s, stack, a[j], d[j]);
++      }
++    }
++    if (d[0] != INFINITY) {
++      s.node_addr = a[0];
++    }
++    else {
++      wdf_pop(s, stack);
++    }
++  }
++}
++#endif
++
++/* bvh2df_step (STEP=1) with the variant's inner loop and stack. */
++template<int Mode, int W, bool Dpx, class E>
++ccl_device_forceinline bool wdf_step(BVH2DFRay &s, E *stack)
++{
++  constexpr bool record_all = (Mode == 1);
++  const float node_tmax = record_all ? s.ray.tmax : s.isect.t;
++#ifdef WDF_HAS_BVH4
++  if constexpr (W == 4) {
++    wdf4_inner<Dpx>(s, stack, node_tmax);
++  }
++  else
++#endif
++  {
++    while (s.node_addr >= 0 && s.node_addr != ENTRYPOINT_SENTINEL) {
++#ifdef CYCLES_BVH2DF_COUNT
++      s.count_nodes++;
++#endif
++      wdf2_node<Dpx>(s, stack, node_tmax, s.node_addr, 0);
++    }
++  }
++  if (s.node_addr < 0) {
++    const float4 leaf = kernel_data_fetch(bvh_leaf_nodes, (-s.node_addr - 1));
++    const int prim_addr = __float_as_int(leaf.x);
++    if (prim_addr >= 0) {
++      const int prim_addr2 = __float_as_int(leaf.y);
++      const uint type = __float_as_int(leaf.w);
++#ifdef CYCLES_BVH2DF_COUNT
++      s.count_leaves++;
++      s.count_prims += prim_addr2 - prim_addr;
++#endif
++      wdf_pop(s, stack);
++#ifdef __TRANSPARENT_SHADOWS__
++      const bool stop = record_all ?
++                            bvh2df_leaf_shadow_all(nullptr, s, prim_addr, prim_addr2, type) :
++                            bvh2df_leaf_closest(nullptr, s, prim_addr, prim_addr2, type);
++#else
++      const bool stop = bvh2df_leaf_closest(nullptr, s, prim_addr, prim_addr2, type);
++#endif
++      if (stop) {
++        s.hit = true;
++        return true;
++      }
++    }
++    else {
++      /* bvh2df_instance_push with the variant's object root. */
++      s.object = kernel_data_fetch(prim_object, -prim_addr - 1);
++#ifdef __OBJECT_MOTION__
++      if (kernel_data.bvh.have_motion) {
++        bvh_instance_motion_push(nullptr, s.object, &s.ray, &s.P, &s.dir, &s.idir);
++      }
++      else {
++        bvh_instance_push(nullptr, s.object, &s.ray, &s.P, &s.dir, &s.idir);
++      }
++#else
++      bvh_instance_push(nullptr, s.object, &s.ray, &s.P, &s.dir, &s.idir);
++#endif
++      wdf_push(s, stack, ENTRYPOINT_SENTINEL, -INFINITY);
++#ifdef WDF_HAS_BVH4
++      s.node_addr = (W == 4) ? cycles_bvh4.object_root[s.object] :
++                               kernel_data_fetch(object_node, s.object);
++#else
++      s.node_addr = kernel_data_fetch(object_node, s.object);
++#endif
++    }
++  }
++  if (s.node_addr == ENTRYPOINT_SENTINEL) {
++    if (s.stack_ptr >= 0) {
++      kernel_assert(s.object != OBJECT_NONE);
++      bvh_instance_pop(&s.ray, &s.P, &s.dir, &s.idir);
++      s.object = OBJECT_NONE;
++      wdf_pop(s, stack);
++    }
++    if (s.node_addr == ENTRYPOINT_SENTINEL) {
++      s.hit = record_all ? false : (s.isect.prim != PRIM_NONE);
++      return true;
++    }
++  }
++  return false;
++}
++
++/* bvh2df_run at the bhotB knobs (FETCH=0, CHUNK=0, POLICY=1, DEFER=1, SPLITSTACK=1) with
++ * wdf_step. Work::begin takes the variant's stack (template) and calls wdf_begin<W>. */
++template<int Mode, int W, bool Dpx, bool Cull, class Work>
++ccl_device_forceinline void wdf_run(Work &work, uint *counter, const int work_size)
++{
++  using E = typename WdfEntrySel<Cull && Mode == 0>::T;
++  BVH2DFRay s;
++  E stack[BVH_STACK_SIZE];
++  const uint lane = threadIdx.x & 31;
++  const uint warp_mask = __activemask();
++  bool active = false;
++  bool exhausted = false;
++  bool pending = false;
++  int state = 0;
++  while (true) {
++    if (pending) {
++      work.finish(state, s);
++      pending = false;
++    }
++    const bool idle = !active && !exhausted;
++    const uint fetch_mask = __ballot_sync(warp_mask, idle);
++    if (fetch_mask) {
++      const int leader = __ffs(fetch_mask) - 1;
++      uint base = 0;
++      if (lane == leader) {
++        base = atomicAdd(counter, uint(__popc(fetch_mask)));
++      }
++      base = __shfl_sync(warp_mask, base, leader);
++      if (idle) {
++        const uint next = base + __popc(fetch_mask & ((1u << lane) - 1));
++        exhausted = next >= uint(work_size);
++        if (!exhausted) {
++          state = work.state(int(next));
++          active = work.begin(state, s, stack);
++          if (!active) {
++            work.finish(state, s);
++          }
++        }
++      }
++    }
++    if (!__any_sync(warp_mask, active)) {
++      if (__all_sync(warp_mask, exhausted)) {
++        return;
++      }
++      continue;
++    }
++    while (true) {
++      if (active) {
++        if (wdf_step<Mode, W, Dpx>(s, stack)) {
++          pending = true;
++          active = false;
++        }
++      }
++      const uint live = __ballot_sync(warp_mask, active);
++      if (!live) {
++        break;
++      }
++      /* Refill only while rays remain; once the counter is exhausted keep stepping. */
++      if (__popc(live) < CYCLES_BVH2DF_MINLIVE && !__all_sync(warp_mask, exhausted || active)) {
++        break;
++      }
++    }
++  }
++}
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/kernel/film/light_passes.h b/intern/cycles/kernel/film/light_passes.h
+index 7e76c4e..ad44267 100644
+--- a/intern/cycles/kernel/film/light_passes.h
++++ b/intern/cycles/kernel/film/light_passes.h
+@@ -123,9 +123,28 @@ ccl_device_inline Spectrum bsdf_eval_pass_glossy_weight(const ccl_private BsdfEv
+  * to render buffers instead of using per-thread memory, and to avoid the
+  * impact of clamping on other contributions. */
+ 
++#if defined(CYCLES_RR_CLAMP_AWARE)
++/* Clamp-aware RR (integrator/path_state.h): the shadow path keeps its clamp scale E as a log2 code in
++ * shadow_path.volume_bounds_bounce (1/1024 steps in log2: 0.07% relative). */
++ccl_device_inline uint16_t path_state_rr_clamp_encode(const float scale)
++{
++  return uint16_t(clamp(log2f(scale) * 1024.0f + 32768.5f, 0.0f, 65535.0f));
++}
++
++ccl_device_inline float path_state_rr_clamp_decode(const uint16_t code)
++{
++  return exp2f((float(code) - 32768.0f) * (1.0f / 1024.0f));
++}
++#endif
++
+ ccl_device_forceinline void film_clamp_light(KernelGlobals kg,
+                                              ccl_private Spectrum *L,
+-                                             const int bounce)
++                                             const int bounce
++#if defined(CYCLES_RR_CLAMP_AWARE)
++                                             ,
++                                             const float limit_scale
++#endif
++)
+ {
+ #ifdef __KERNEL_DEBUG_NAN__
+   if (!isfinite_safe(*L)) {
+@@ -138,8 +157,15 @@ ccl_device_forceinline void film_clamp_light(KernelGlobals kg,
+   *L = ensure_finite(*L);
+ 
+ #ifdef __CLAMP_SAMPLE__
++#  if defined(CYCLES_RR_CLAMP_AWARE)
++  /* Clamp-aware RR (integrator/path_state.h): E * clamp(L / E, limit) = clamp(L, limit * E). */
++  const float limit = ((bounce > 0) ? kernel_data.integrator.sample_clamp_indirect :
++                                      kernel_data.integrator.sample_clamp_direct) *
++                      limit_scale;
++#  else
+   const float limit = (bounce > 0) ? kernel_data.integrator.sample_clamp_indirect :
+                                      kernel_data.integrator.sample_clamp_direct;
++#  endif
+   const float sum = reduce_add(fabs(*L));
+   if (sum > limit) {
+     *L *= limit / sum;
+@@ -492,7 +518,14 @@ ccl_device_inline void film_write_direct_light(KernelGlobals kg,
+ {
+   /* The throughput for shadow paths already contains the light shader evaluation. */
+   Spectrum contribution = INTEGRATOR_STATE(state, shadow_path, throughput);
++  #if defined(CYCLES_RR_CLAMP_AWARE)
++  film_clamp_light(kg,
++                   &contribution,
++                   INTEGRATOR_STATE(state, shadow_path, bounce),
++                   path_state_rr_clamp_decode(INTEGRATOR_STATE(state, shadow_path, volume_bounds_bounce)));
++#else
+   film_clamp_light(kg, &contribution, INTEGRATOR_STATE(state, shadow_path, bounce));
++#endif
+ 
+   ccl_global float *buffer = film_pass_pixel_render_buffer_shadow(kg, state, render_buffer);
+ 
+@@ -635,7 +668,14 @@ ccl_device_inline void film_write_background(KernelGlobals kg,
+                                              ccl_global float *ccl_restrict render_buffer)
+ {
+   Spectrum contribution = INTEGRATOR_STATE(state, path, throughput) * L;
++  #if defined(CYCLES_RR_CLAMP_AWARE)
++  film_clamp_light(kg,
++                   &contribution,
++                   INTEGRATOR_STATE(state, path, bounce) - 1,
++                   INTEGRATOR_STATE(state, path, optical_depth));
++#else
+   film_clamp_light(kg, &contribution, INTEGRATOR_STATE(state, path, bounce) - 1);
++#endif
+ 
+   ccl_global float *buffer = film_pass_pixel_render_buffer(kg, state, render_buffer);
+   const PathRayVisibility path_visibility = INTEGRATOR_STATE(state, path, visibility);
+@@ -665,7 +705,14 @@ ccl_device_inline void film_write_volume_emission(KernelGlobals kg,
+                                                   const int lightgroup = LIGHTGROUP_NONE)
+ {
+   Spectrum contribution = L;
++  #if defined(CYCLES_RR_CLAMP_AWARE)
++  film_clamp_light(kg,
++                   &contribution,
++                   INTEGRATOR_STATE(state, path, bounce) - 1,
++                   INTEGRATOR_STATE(state, path, optical_depth));
++#else
+   film_clamp_light(kg, &contribution, INTEGRATOR_STATE(state, path, bounce) - 1);
++#endif
+ 
+   ccl_global float *buffer = film_pass_pixel_render_buffer(kg, state, render_buffer);
+   const PathRayVisibility path_visibility = INTEGRATOR_STATE(state, path, visibility);
+@@ -685,7 +732,14 @@ ccl_device_inline void film_write_surface_emission(KernelGlobals kg,
+                                                    const int lightgroup = LIGHTGROUP_NONE)
+ {
+   Spectrum contribution = INTEGRATOR_STATE(state, path, throughput) * L * mis_weight;
++  #if defined(CYCLES_RR_CLAMP_AWARE)
++  film_clamp_light(kg,
++                   &contribution,
++                   INTEGRATOR_STATE(state, path, bounce) - 1,
++                   INTEGRATOR_STATE(state, path, optical_depth));
++#else
+   film_clamp_light(kg, &contribution, INTEGRATOR_STATE(state, path, bounce) - 1);
++#endif
+ 
+   ccl_global float *buffer = film_pass_pixel_render_buffer(kg, state, render_buffer);
+   const PathRayVisibility path_visibility = INTEGRATOR_STATE(state, path, visibility);
+diff --git a/intern/cycles/kernel/integrator/intersect_dynamic.h b/intern/cycles/kernel/integrator/intersect_dynamic.h
+index 5aeb6df..356c149 100644
+--- a/intern/cycles/kernel/integrator/intersect_dynamic.h
++++ b/intern/cycles/kernel/integrator/intersect_dynamic.h
+@@ -18,6 +18,11 @@
+  * scene_intersect_shadow_all (BVHShadowAllPayload). */
+ 
+ #include "kernel/bvh/bvh2_dynamic.h"
++#if defined(CYCLES_BVH4_CLOSEST) || defined(CYCLES_BVH4_SHADOW) || \
++    defined(CYCLES_BVH2_SHADOW_DPX) || defined(CYCLES_BVH2_SHADOW_CULL)
++/* BVH4 / DPX / cull variants of the inner loop (kernel/bvh/bvh_wide_dynamic.h). */
++#  include "kernel/bvh/bvh_wide_dynamic.h"
++#endif
+ 
+ CCL_NAMESPACE_BEGIN
+ 
+@@ -30,7 +35,11 @@ struct IntersectClosestDFWork {
+     return path_index_array ? path_index_array[index] : index;
+   }
+ 
++#ifdef WDF_CLOSEST
++  template<class E> ccl_device_forceinline bool begin(const int state, BVH2DFRay &s, E *stack)
++#else
+   ccl_device_forceinline bool begin(const int state, BVH2DFRay &s, BVH2DFStackEntry *stack)
++#endif
+   {
+     KernelGlobals kg = nullptr;
+     Ray &ray = s.ray;
+@@ -66,7 +75,11 @@ struct IntersectClosestDFWork {
+     if (!intersection_ray_valid(&ray)) {
+       return false;
+     }
++#ifdef WDF_CLOSEST
++    wdf_begin<WDF_CLOSEST_W>(s, stack);
++#else
+     bvh2df_begin(kg, s, stack);
++#endif
+     return true;
+   }
+ 
+@@ -143,7 +156,11 @@ struct IntersectShadowDFWork {
+     return path_index_array ? path_index_array[index] : index;
+   }
+ 
++#ifdef WDF_SHADOW
++  template<class E> ccl_device_forceinline bool begin(const int state, BVH2DFRay &s, E *stack)
++#else
+   ccl_device_forceinline bool begin(const int state, BVH2DFRay &s, BVH2DFStackEntry *stack)
++#endif
+   {
+     KernelGlobals kg = nullptr;
+     integrator_state_read_shadow_ray(state, &s.ray);
+@@ -180,7 +197,11 @@ struct IntersectShadowDFWork {
+     if (!intersection_ray_valid(&s.ray)) {
+       return false;
+     }
++#ifdef WDF_SHADOW
++    wdf_begin<WDF_SHADOW_W>(s, stack);
++#else
+     bvh2df_begin(kg, s, stack);
++#endif
+     return true;
+   }
+ 
+@@ -254,7 +275,11 @@ ccl_device_forceinline void integrator_intersect_closest_df(const ccl_global int
+                                                             const int work_size)
+ {
+   IntersectClosestDFWork work{path_index_array, render_buffer};
++#ifdef WDF_CLOSEST
++  wdf_run<0, WDF_CLOSEST_W, WDF_CLOSEST_DPX, true>(work, &bvh2df_closest_counters[0], work_size);
++#else
+   bvh2df_run<0>(work, &bvh2df_closest_counters[0], work_size);
++#endif
+   bvh2df_block_done(bvh2df_closest_counters);
+ }
+ 
+@@ -265,12 +290,22 @@ ccl_device_forceinline void integrator_intersect_shadow_df(const ccl_global int
+ #ifdef __TRANSPARENT_SHADOWS__
+   /* Uniform for the launch: one loop per leaf type. */
+   if (kernel_data.integrator.transparent_shadows) {
++#  ifdef WDF_SHADOW
++    wdf_run<1, WDF_SHADOW_W, WDF_SHADOW_DPX, WDF_SHADOW_CULL>(
++        work, &bvh2df_shadow_counters[0], work_size);
++#  else
+     bvh2df_run<1>(work, &bvh2df_shadow_counters[0], work_size);
++#  endif
+   }
+   else
+ #endif
+   {
++#ifdef WDF_SHADOW
++    wdf_run<0, WDF_SHADOW_W, WDF_SHADOW_DPX, WDF_SHADOW_CULL>(
++        work, &bvh2df_shadow_counters[0], work_size);
++#else
+     bvh2df_run<0>(work, &bvh2df_shadow_counters[0], work_size);
++#endif
+   }
+   bvh2df_block_done(bvh2df_shadow_counters);
+ }
+diff --git a/intern/cycles/kernel/integrator/path_state.h b/intern/cycles/kernel/integrator/path_state.h
+index c56b062..625c929 100644
+--- a/intern/cycles/kernel/integrator/path_state.h
++++ b/intern/cycles/kernel/integrator/path_state.h
+@@ -64,7 +64,12 @@ ccl_device_inline void path_state_init_integrator(KernelGlobals kg,
+   INTEGRATOR_STATE_WRITE(state, path, min_ray_pdf) = FLT_MAX;
+   INTEGRATOR_STATE_WRITE(state, path, continuation_probability) = 1.0f;
+   INTEGRATOR_STATE_WRITE(state, path, throughput) = throughput;
++#if defined(CYCLES_RR_CLAMP_AWARE)
++  /* Clamp-aware RR: path.optical_depth holds the clamp scale E (see path_state_rr_clamp_update). */
++  INTEGRATOR_STATE_WRITE(state, path, optical_depth) = 1.0f;
++#else
+   INTEGRATOR_STATE_WRITE(state, path, optical_depth) = 0.0f;
++#endif
+ #if defined(__PATH_GUIDING__)
+   if ((kernel_data.kernel_features & KERNEL_FEATURE_PATH_GUIDING)) {
+     INTEGRATOR_STATE_WRITE(state, path, unguided_throughput) = 1.0f;
+@@ -447,6 +452,46 @@ ccl_device_inline float path_state_continuation_probability(KernelGlobals kg,
+ #endif
+ }
+ 
++#if defined(CYCLES_RR_CLAMP_AWARE)
++/* Ours (approximate track): clamp-aware Russian roulette. Cycles clamps every film contribution C at a limit
++ * (sample_clamp_direct / _indirect). A stronger RR (p_o < stock's p_s) divides survivors by the smaller p_o, so
++ * more of them reach the limit and the clamped image darkens. Here each path carries E = P_s / P_o, the ratio of
++ * stock's and our survival probability of the path prefix, where P_s uses stock's rule p_s = min(sqrt(max(T / E)), 1)
++ * on the stock-weighted throughput T / E. The film clamps at limit * E, i.e. writes E * clamp(C / E, limit): a
++ * surviving path stands for 1 / E stock paths that each clamp at the limit. Its expectation over our RR equals
++ * stock's expected clamped contribution exactly, for any p_o; the RR speed is ours. Storage without a host
++ * change: path.optical_depth (float) and shadow_path.volume_bounds_bounce (uint16, log2 code); both are used
++ * only by volumes. */
++#  ifdef __VOLUME__
++#    error "CYCLES_RR_CLAMP_AWARE stores its scale in volume-only state fields: build without KERNEL_FEATURE_VOLUME"
++#  endif
++#  ifndef CYCLES_RR_EXP100
++#    error "CYCLES_RR_CLAMP_AWARE needs CYCLES_RR_EXP100 (with stock RR the scale stays 1)"
++#  endif
++/* Called where the throughput is divided by our continuation probability p_o (same vertex, same throughput and
++ * bounce counters as in intersect_closest). Updates E *= p_s / p_o. */
++ccl_device_inline void path_state_rr_clamp_update(KernelGlobals kg,
++                                                  IntegratorState state,
++                                                  const uint32_t path_flag,
++                                                  const float p_o)
++{
++  if (path_flag & PATH_RAY_TRANSPARENT) {
++    if (INTEGRATOR_STATE(state, path, transparent_bounce) <=
++        kernel_data.integrator.transparent_min_bounce)
++    {
++      return;
++    }
++  }
++  else if (INTEGRATOR_STATE(state, path, bounce) <= kernel_data.integrator.min_bounce) {
++    return;
++  }
++  const float scale = INTEGRATOR_STATE(state, path, optical_depth);
++  const float t_stock = reduce_max(fabs(INTEGRATOR_STATE(state, path, throughput))) / scale;
++  const float p_s = min(sqrtf(t_stock), 1.0f);
++  INTEGRATOR_STATE_WRITE(state, path, optical_depth) = scale * (p_s / p_o);
++}
++#endif
++
+ ccl_device_inline bool path_state_ao_bounce(KernelGlobals kg, ConstIntegratorState state)
+ {
+   if (!kernel_data.integrator.ao_bounces) {
+diff --git a/intern/cycles/kernel/integrator/shade_surface.h b/intern/cycles/kernel/integrator/shade_surface.h
+index 0242071..b7c8a76 100644
+--- a/intern/cycles/kernel/integrator/shade_surface.h
++++ b/intern/cycles/kernel/integrator/shade_surface.h
+@@ -273,7 +273,12 @@ integrate_direct_light_shadow_init_common(KernelGlobals kg,
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, rng_pixel) = sc_rng_pixel;
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, sample) = sc_sample;
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, transparent_bounce) = sc_transparent_bounce;
++  #  if defined(CYCLES_RR_CLAMP_AWARE)
++  INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, volume_bounds_bounce) = path_state_rr_clamp_encode(
++      INTEGRATOR_STATE(state, path, optical_depth));
++#  else
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, volume_bounds_bounce) = sc_volume_bounds_bounce;
++#  endif
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, glossy_bounce) = sc_glossy_bounce;
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, throughput) = throughput;
+ 
+@@ -316,8 +321,13 @@ integrate_direct_light_shadow_init_common(KernelGlobals kg,
+ 
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, transparent_bounce) = INTEGRATOR_STATE(
+       state, path, transparent_bounce);
++  #if defined(CYCLES_RR_CLAMP_AWARE)
++  INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, volume_bounds_bounce) = path_state_rr_clamp_encode(
++      INTEGRATOR_STATE(state, path, optical_depth));
++#else
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, volume_bounds_bounce) = INTEGRATOR_STATE(
+       state, path, volume_bounds_bounce);
++#endif
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, glossy_bounce) = INTEGRATOR_STATE(
+       state, path, glossy_bounce);
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, throughput) = throughput;
+@@ -777,8 +787,14 @@ ccl_device_forceinline int integrate_surface_volume_only_bounce(IntegratorState
+ }
+ #endif
+ 
++#if defined(CYCLES_RR_CLAMP_AWARE)
++ccl_device_forceinline bool integrate_surface_terminate(KernelGlobals kg,
++                                                        IntegratorState state,
++                                                        const uint32_t path_flag)
++#else
+ ccl_device_forceinline bool integrate_surface_terminate(IntegratorState state,
+                                                         const uint32_t path_flag)
++#endif
+ {
+   const float continuation_probability = (path_flag & PATH_RAY_TERMINATE_ON_NEXT_SURFACE) ?
+                                              0.0f :
+@@ -787,6 +803,11 @@ ccl_device_forceinline bool integrate_surface_terminate(IntegratorState state,
+   if (continuation_probability == 0.0f) {
+     return true;
+   }
++#if defined(CYCLES_RR_CLAMP_AWARE)
++  /* Before the division: p_s is computed from the undivided throughput. Also when p_o = 1 (throughput >= 1
++   * while stock's T / E < 1). */
++  path_state_rr_clamp_update(kg, state, path_flag, continuation_probability);
++#endif
+   if (continuation_probability != 1.0f) {
+     INTEGRATOR_STATE_WRITE(state, path, throughput) /= continuation_probability;
+   }
+@@ -875,8 +896,13 @@ ccl_device_forceinline void integrate_surface_ao(KernelGlobals kg,
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, flag) = shadow_flag;
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, bounce) = bounce;
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, transparent_bounce) = transparent_bounce;
++  #if defined(CYCLES_RR_CLAMP_AWARE)
++  INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, volume_bounds_bounce) = path_state_rr_clamp_encode(
++      INTEGRATOR_STATE(state, path, optical_depth));
++#else
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, volume_bounds_bounce) = INTEGRATOR_STATE(
+       state, path, volume_bounds_bounce);
++#endif
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, throughput) = throughput;
+ 
+   if (kernel_data.kernel_features & KERNEL_FEATURE_AO_ADDITIVE) {
+@@ -959,7 +985,13 @@ ccl_device int integrate_surface(KernelGlobals kg,
+        * throughput by the probability at the right moment.
+        *
+        * Also ensure we don't do it twice for SSS at both the entry and exit point. */
+-      if (integrate_surface_terminate(state, path_flag)) {
++      if (integrate_surface_terminate(
++#if defined(CYCLES_RR_CLAMP_AWARE)
++              kg,
++#endif
++              state,
++              path_flag))
++      {
+         return LABEL_NONE;
+       }
+ 
+@@ -1005,7 +1037,13 @@ ccl_device int integrate_surface(KernelGlobals kg,
+ #ifdef __VOLUME__
+   }
+   else {
+-    if (integrate_surface_terminate(state, path_flag)) {
++    if (integrate_surface_terminate(
++#if defined(CYCLES_RR_CLAMP_AWARE)
++              kg,
++#endif
++              state,
++              path_flag))
++      {
+       return LABEL_NONE;
+     }
+ 
+diff --git a/intern/cycles/kernel/svm/approx.h b/intern/cycles/kernel/svm/approx.h
+new file mode 100644
+index 0000000..90999c8
+--- /dev/null
++++ b/intern/cycles/kernel/svm/approx.h
+@@ -0,0 +1,236 @@
++/* SPDX-FileCopyrightText: 2026 cycles-h100
++ *
++ * SPDX-License-Identifier: Apache-2.0 */
++
++/* Approximate options for indirect bounces (tree53-approx, analysis/v53_approx_kernel.md).
++ *
++ * CYCLES_APPROX_BUMP_INDIRECT: at bounce >= 1, Bump nodes output their unperturbed input normal,
++ * and the SVM program skips the dx and dy copies of the Bump height graph.
++ *
++ * Why a run-time skip can find them: ShaderGraph::refine_bump_nodes() (and bump_from_displacement)
++ * copies the height graph twice, and every copy feeds only its Bump input (SampleX / SampleY).
++ * SVMCompiler::generate_svm_nodes() emits nodes depth-first from the sinks, so each copy is one
++ * contiguous run of nodes that ends with its root, and the dx run is followed directly by the dy
++ * run (equal Sethi-Ullman keys, dx copies have the lower ids). The two runs have the same node
++ * types in the same order; only the bump offsets of their Geometry / Texture Coordinate /
++ * Attribute / Wireframe nodes differ (DX in one, DY in the other).
++ *
++ * At the first DX-tagged node p, svm_approx_bump_skip() decodes forward to the first DY-tagged
++ * node q (n = q - p words), checks that [q, q + n) repeats [p, q) node by node (same type, same
++ * size, DX <-> DY, all other tags equal), and returns q + n. On any mismatch or an unknown node
++ * type it returns a negative value and the program runs as stock. The skipped nodes only feed
++ * the Bump node's dx/dy inputs, which a Bump node at bounce >= 1 ignores. */
++
++#pragma once
++
++#include "kernel/globals.h"
++#include "kernel/svm/node_types.h"
++#include "kernel/svm/types.h"
++#include "kernel/svm/util.h"
++
++CCL_NAMESPACE_BEGIN
++
++#ifdef CYCLES_APPROX_BUMP_INDIRECT
++
++/* End offset of the node that starts at `start` (its type word), or -1 for a node type the scan
++ * does not decode (closures, jumps, bump nodes, raycast, sky, AOV, ...). *tag is the node's bump
++ * offset for nodes that have one, else -1. */
++ccl_device_inline int svm_approx_node_end(KernelGlobals kg, const int start, ccl_private int *tag)
++{
++  const uint node_type = kernel_data_fetch(svm_nodes, start);
++  const int data = start + 1;
++  *tag = -1;
++  switch (node_type) {
++#  define APPROX_SVM_FIXED(NODE, T) \
++    case NODE: \
++      return data + (int)(sizeof(T) / sizeof(uint));
++  APPROX_SVM_FIXED(NODE_CONVERT, SVMNodeConvert)
++  APPROX_SVM_FIXED(NODE_CONVERT_DERIVATIVE, SVMNodeConvert)
++  APPROX_SVM_FIXED(NODE_VALUE_F, SVMNodeValueF)
++  APPROX_SVM_FIXED(NODE_VALUE_F_DERIVATIVE, SVMNodeValueF)
++  APPROX_SVM_FIXED(NODE_VALUE_V, SVMNodeValueV)
++  APPROX_SVM_FIXED(NODE_VALUE_V_DERIVATIVE, SVMNodeValueV)
++  APPROX_SVM_FIXED(NODE_DISPLACEMENT, SVMNodeDisplacement)
++  APPROX_SVM_FIXED(NODE_VECTOR_DISPLACEMENT, SVMNodeVectorDisplacement)
++  APPROX_SVM_FIXED(NODE_TEX_IMAGE, SVMNodeTexImage)
++  APPROX_SVM_FIXED(NODE_TEX_IMAGE_DERIVATIVE, SVMNodeTexImage)
++  APPROX_SVM_FIXED(NODE_TEX_IMAGE_BOX, SVMNodeTexImageBox)
++  APPROX_SVM_FIXED(NODE_TEX_IMAGE_BOX_DERIVATIVE, SVMNodeTexImageBox)
++  APPROX_SVM_FIXED(NODE_TEX_NOISE, SVMNodeTexNoise)
++  APPROX_SVM_FIXED(NODE_HSV, SVMNodeHSV)
++  APPROX_SVM_FIXED(NODE_FRESNEL, SVMNodeFresnel)
++  APPROX_SVM_FIXED(NODE_LAYER_WEIGHT, SVMNodeLayerWeight)
++  APPROX_SVM_FIXED(NODE_MATH, SVMNodeMath)
++  APPROX_SVM_FIXED(NODE_BOOLEAN_MATH, SVMNodeBooleanMath)
++  APPROX_SVM_FIXED(NODE_INTEGER_MATH, SVMNodeIntegerMath)
++  APPROX_SVM_FIXED(NODE_VECTOR_MATH, SVMNodeVectorMath)
++  APPROX_SVM_FIXED(NODE_VECTOR_MATH_DERIVATIVE, SVMNodeVectorMath)
++  APPROX_SVM_FIXED(NODE_GAMMA, SVMNodeGamma)
++  APPROX_SVM_FIXED(NODE_BRIGHTCONTRAST, SVMNodeBrightContrast)
++  APPROX_SVM_FIXED(NODE_LIGHT_PATH, SVMNodeLightPath)
++  APPROX_SVM_FIXED(NODE_OBJECT_INFO, SVMNodeObjectInfo)
++  APPROX_SVM_FIXED(NODE_PARTICLE_INFO, SVMNodeParticleInfo)
++  APPROX_SVM_FIXED(NODE_HAIR_INFO, SVMNodeHairInfo)
++  APPROX_SVM_FIXED(NODE_POINT_INFO, SVMNodePointInfo)
++  APPROX_SVM_FIXED(NODE_TEXTURE_MAPPING, SVMNodeTextureMapping)
++  APPROX_SVM_FIXED(NODE_TEXTURE_MAPPING_DERIVATIVE, SVMNodeTextureMapping)
++  APPROX_SVM_FIXED(NODE_MAPPING, SVMNodeMapping)
++  APPROX_SVM_FIXED(NODE_MAPPING_DERIVATIVE, SVMNodeMapping)
++  APPROX_SVM_FIXED(NODE_MIN_MAX, SVMNodeMinMax)
++  APPROX_SVM_FIXED(NODE_CAMERA, SVMNodeCamera)
++  APPROX_SVM_FIXED(NODE_TEX_ENVIRONMENT, SVMNodeTexEnvironment)
++  APPROX_SVM_FIXED(NODE_TEX_ENVIRONMENT_DERIVATIVE, SVMNodeTexEnvironment)
++  APPROX_SVM_FIXED(NODE_TEX_GRADIENT, SVMNodeTexGradient)
++  APPROX_SVM_FIXED(NODE_TEX_VORONOI, SVMNodeTexVoronoi)
++  APPROX_SVM_FIXED(NODE_TEX_GABOR, SVMNodeTexGabor)
++  APPROX_SVM_FIXED(NODE_TEX_WAVE, SVMNodeTexWave)
++  APPROX_SVM_FIXED(NODE_TEX_MAGIC, SVMNodeTexMagic)
++  APPROX_SVM_FIXED(NODE_TEX_CHECKER, SVMNodeTexChecker)
++  APPROX_SVM_FIXED(NODE_TEX_BRICK, SVMNodeTexBrick)
++  APPROX_SVM_FIXED(NODE_TEX_WHITE_NOISE, SVMNodeTexWhiteNoise)
++  APPROX_SVM_FIXED(NODE_NORMAL, SVMNodeNormal)
++  APPROX_SVM_FIXED(NODE_LIGHT_FALLOFF, SVMNodeLightFalloff)
++  APPROX_SVM_FIXED(NODE_IES, SVMNodeIES)
++  APPROX_SVM_FIXED(NODE_TANGENT, SVMNodeTangent)
++  APPROX_SVM_FIXED(NODE_TANGENT_DERIVATIVE, SVMNodeTangent)
++  APPROX_SVM_FIXED(NODE_NORMAL_MAP, SVMNodeNormalMap)
++  APPROX_SVM_FIXED(NODE_RADIAL_TILING, SVMNodeRadialTiling)
++  APPROX_SVM_FIXED(NODE_INVERT, SVMNodeInvert)
++  APPROX_SVM_FIXED(NODE_MIX, SVMNodeMix)
++  APPROX_SVM_FIXED(NODE_SEPARATE_COLOR, SVMNodeSeparateColor)
++  APPROX_SVM_FIXED(NODE_COMBINE_COLOR, SVMNodeCombineColor)
++  APPROX_SVM_FIXED(NODE_SEPARATE_VECTOR, SVMNodeSeparateVector)
++  APPROX_SVM_FIXED(NODE_SEPARATE_VECTOR_DERIVATIVE, SVMNodeSeparateVector)
++  APPROX_SVM_FIXED(NODE_COMBINE_VECTOR, SVMNodeCombineVector)
++  APPROX_SVM_FIXED(NODE_COMBINE_VECTOR_DERIVATIVE, SVMNodeCombineVector)
++  APPROX_SVM_FIXED(NODE_GET_VECTOR_COMPONENT, SVMNodeGetVectorComponent)
++  APPROX_SVM_FIXED(NODE_GET_VECTOR_COMPONENT_DERIVATIVE, SVMNodeGetVectorComponent)
++  APPROX_SVM_FIXED(NODE_VECTOR_ROTATE, SVMNodeVectorRotate)
++  APPROX_SVM_FIXED(NODE_VECTOR_TRANSFORM, SVMNodeVectorTransform)
++  APPROX_SVM_FIXED(NODE_WAVELENGTH, SVMNodeWavelength)
++  APPROX_SVM_FIXED(NODE_BLACKBODY, SVMNodeBlackbody)
++  APPROX_SVM_FIXED(NODE_MAP_RANGE, SVMNodeMapRange)
++  APPROX_SVM_FIXED(NODE_VECTOR_MAP_RANGE, SVMNodeVectorMapRange)
++  APPROX_SVM_FIXED(NODE_CLAMP, SVMNodeClamp)
++  APPROX_SVM_FIXED(NODE_MIX_COLOR, SVMNodeMixColor)
++  APPROX_SVM_FIXED(NODE_MIX_FLOAT, SVMNodeMixFloat)
++  APPROX_SVM_FIXED(NODE_MIX_VECTOR, SVMNodeMixVector)
++  APPROX_SVM_FIXED(NODE_MIX_VECTOR_NON_UNIFORM, SVMNodeMixVectorNonUniform)
++  APPROX_SVM_FIXED(NODE_SCENE_TIME, SVMNodeSceneTime)
++#  undef APPROX_SVM_FIXED
++    case NODE_GEOMETRY:
++    case NODE_GEOMETRY_DERIVATIVE: {
++      const ccl_global SVMNodeGeometry &node = *reinterpret_cast<const ccl_global SVMNodeGeometry *>(
++          &kernel_data_fetch(svm_nodes, data));
++      *tag = (int)node.bump_offset;
++      return data + (int)(sizeof(SVMNodeGeometry) / sizeof(uint));
++    }
++    case NODE_ATTR:
++    case NODE_ATTR_DERIVATIVE: {
++      const ccl_global SVMNodeAttr &node = *reinterpret_cast<const ccl_global SVMNodeAttr *>(
++          &kernel_data_fetch(svm_nodes, data));
++      *tag = (int)node.bump_offset;
++      return data + (int)(sizeof(SVMNodeAttr) / sizeof(uint));
++    }
++    case NODE_WIREFRAME: {
++      const ccl_global SVMNodeWireframe &node = *reinterpret_cast<const ccl_global SVMNodeWireframe *>(
++          &kernel_data_fetch(svm_nodes, data));
++      *tag = (int)node.bump_offset;
++      return data + (int)(sizeof(SVMNodeWireframe) / sizeof(uint));
++    }
++    case NODE_TEX_COORD:
++    case NODE_TEX_COORD_DERIVATIVE: {
++      const ccl_global SVMNodeTexCoord &node = *reinterpret_cast<const ccl_global SVMNodeTexCoord *>(
++          &kernel_data_fetch(svm_nodes, data));
++      *tag = (int)node.bump_offset;
++      return svm_node_tex_coord_skip(node, data + (int)(sizeof(SVMNodeTexCoord) / sizeof(uint)));
++    }
++    case NODE_RGB_RAMP: {
++      const ccl_global SVMNodeRGBRamp &node = *reinterpret_cast<const ccl_global SVMNodeRGBRamp *>(
++          &kernel_data_fetch(svm_nodes, data));
++      return data + (int)(sizeof(SVMNodeRGBRamp) / sizeof(uint)) + (int)node.table_size * 4;
++    }
++    case NODE_CURVES: {
++      const ccl_global SVMNodeCurves &node = *reinterpret_cast<const ccl_global SVMNodeCurves *>(
++          &kernel_data_fetch(svm_nodes, data));
++      return data + (int)(sizeof(SVMNodeCurves) / sizeof(uint)) + (int)node.table_size * 4;
++    }
++    case NODE_FLOAT_CURVE: {
++      const ccl_global SVMNodeFloatCurve &node =
++          *reinterpret_cast<const ccl_global SVMNodeFloatCurve *>(&kernel_data_fetch(svm_nodes, data));
++      return data + (int)(sizeof(SVMNodeFloatCurve) / sizeof(uint)) + (int)node.table_size;
++    }
++    default:
++      return -1;
++  }
++}
++
++#  ifndef CYCLES_APPROX_BUMP_MAX_WORDS
++#    define CYCLES_APPROX_BUMP_MAX_WORDS 4096
++#  endif
++
++/* p: start of a DX-tagged node. Returns the offset after the dy run (> 0) when the dx and dy runs
++ * are found and match, else -(offset before which no new attempt should be made). */
++ccl_device_noinline int svm_approx_bump_skip(KernelGlobals kg, const int p)
++{
++  /* Pass 1: find the first DY-tagged node q. */
++  int q = p;
++  int tag;
++  while (true) {
++    const int e = svm_approx_node_end(kg, q, &tag);
++    if (e < 0) {
++      return -q;
++    }
++    if (tag == NODE_BUMP_OFFSET_DY) {
++      break;
++    }
++    q = e;
++    if (q - p > CYCLES_APPROX_BUMP_MAX_WORDS) {
++      return -q;
++    }
++  }
++  /* Pass 2: [q, q + (q - p)) must repeat [p, q) node by node. */
++  int x = p;
++  int y = q;
++  while (x < q) {
++    int tx;
++    int ty;
++    if (kernel_data_fetch(svm_nodes, x) != kernel_data_fetch(svm_nodes, y)) {
++      return -q;
++    }
++    const int ex = svm_approx_node_end(kg, x, &tx);
++    const int ey = svm_approx_node_end(kg, y, &ty);
++    if (ex < 0 || ey < 0 || ex - x != ey - y) {
++      return -q;
++    }
++    if (tx == NODE_BUMP_OFFSET_DY || (tx == NODE_BUMP_OFFSET_DX) != (ty == NODE_BUMP_OFFSET_DY) ||
++        (tx != NODE_BUMP_OFFSET_DX && tx != ty))
++    {
++      return -q;
++    }
++    x = ex;
++    y = ey;
++  }
++  return (x == q) ? y : -q;
++}
++
++#  ifdef CYCLES_APPROX_BUMP_COUNT
++/* Debug: count skip attempts and successes, print at every power of two from 2^16 attempts. */
++__device__ unsigned long long svm_approx_bump_counts[2];
++#    define APPROX_BUMP_COUNT(skip_end) \
++      { \
++        const unsigned long long n = atomicAdd(&svm_approx_bump_counts[0], 1ull) + 1; \
++        const unsigned long long k = (skip_end > 0) ? \
++                                         atomicAdd(&svm_approx_bump_counts[1], 1ull) + 1 : \
++                                         svm_approx_bump_counts[1]; \
++        if (n >= 65536 && (n & (n - 1)) == 0) { \
++          printf("CYCLES_APPROX_BUMP_COUNT attempts %llu skipped %llu last %d at %d\n", n, k, skip_end, node_start); \
++        } \
++      }
++#  else
++#    define APPROX_BUMP_COUNT(skip_end)
++#  endif
++
++#endif /* CYCLES_APPROX_BUMP_INDIRECT */
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/kernel/svm/image.h b/intern/cycles/kernel/svm/image.h
+index 66981b7..ec5c97f 100644
+--- a/intern/cycles/kernel/svm/image.h
++++ b/intern/cycles/kernel/svm/image.h
+@@ -87,7 +87,12 @@ ccl_device_noinline void svm_node_tex_image_box(KernelGlobals kg,
+                                                 ccl_private ShaderData *sd,
+                                                 ccl_private float *ccl_restrict stack,
+                                                 const ccl_global SVMNodeTexImageBox &ccl_restrict
+-                                                    node)
++                                                    node
++#ifdef CYCLES_APPROX_TEX_INDIRECT
++                                                ,
++                                                const bool approx_indirect
++#endif
++)
+ {
+   /* get object space normal */
+   float3 N = sd->N;
+@@ -154,6 +159,21 @@ ccl_device_noinline void svm_node_tex_image_box(KernelGlobals kg,
+     weight.x = 1.0f;
+   }
+ 
++#ifdef CYCLES_APPROX_TEX_INDIRECT
++  /* At bounce >= 1 sample only the axis with the largest blend weight (one texture fetch). */
++  if (approx_indirect) {
++    if (weight.x >= weight.y && weight.x >= weight.z) {
++      weight = make_float3(1.0f, 0.0f, 0.0f);
++    }
++    else if (weight.y >= weight.z) {
++      weight = make_float3(0.0f, 1.0f, 0.0f);
++    }
++    else {
++      weight = make_float3(0.0f, 0.0f, 1.0f);
++    }
++  }
++#endif
++
+   /* now fetch textures */
+   float4 f = zero_float4();
+ 
+diff --git a/intern/cycles/kernel/svm/svm.h b/intern/cycles/kernel/svm/svm.h
+index c26694f..9a0144a 100644
+--- a/intern/cycles/kernel/svm/svm.h
++++ b/intern/cycles/kernel/svm/svm.h
+@@ -79,6 +79,7 @@
+ #include "kernel/svm/wavelength.h"
+ #include "kernel/svm/white_noise.h"
+ #include "kernel/svm/wireframe.h"
++#include "kernel/svm/approx.h"
+ #include "util/defines.h"
+ 
+ #ifdef __SHADER_RAYTRACE__
+@@ -127,7 +128,38 @@ ccl_device void svm_eval_nodes(KernelGlobals kg,
+   Spectrum closure_weight = zero_spectrum();
+   int offset = (sd->shader & SHADER_MASK) * (1 + sizeof(SVMNodeShaderJump) / sizeof(uint));
+ 
++#if defined(CYCLES_APPROX_BUMP_INDIRECT) || defined(CYCLES_APPROX_TEX_INDIRECT)
++  /* Approximate options (kernel/svm/approx.h): main-path surface shading at bounce >= 1 only;
++   * shadow, light, background, volume and displacement evaluations stay exact. */
++  int approx_bounce = 0;
++  if constexpr (type == SHADER_TYPE_SURFACE && (node_feature_mask & KERNEL_FEATURE_NODE_BSDF) &&
++                (node_feature_mask & KERNEL_FEATURE_NODE_AOV))
++  {
++    approx_bounce = INTEGRATOR_STATE(state, path, bounce);
++  }
++  const bool approx_indirect = approx_bounce >= 1;
++  (void)approx_indirect;
++#endif
++#if defined(CYCLES_APPROX_BUMP_INDIRECT) && !defined(CYCLES_APPROX_BUMP_NOSKIP)
++  int approx_bump_retry = 0; /* No new skip attempt before this offset. */
++#  define APPROX_BUMP_SKIP(node) \
++    if (approx_indirect && (node).bump_offset == NODE_BUMP_OFFSET_DX && node_start >= approx_bump_retry) { \
++      const int skip_end = svm_approx_bump_skip(kg, node_start); \
++      APPROX_BUMP_COUNT(skip_end) \
++      if (skip_end > 0) { \
++        offset = skip_end; \
++        break; \
++      } \
++      approx_bump_retry = -skip_end; \
++    }
++#else
++#  define APPROX_BUMP_SKIP(node)
++#endif
++
+   while (true) {
++#ifdef CYCLES_APPROX_BUMP_INDIRECT
++    const int node_start = offset;
++#endif
+     const uint node_type = kernel_data_fetch(svm_nodes, offset++);
+ 
+     /* NOTE: Every case must always read its full node struct regardless of enabled features,
+@@ -214,11 +246,16 @@ ccl_device void svm_eval_nodes(KernelGlobals kg,
+       }
+       break;
+       SVM_CASE(NODE_GEOMETRY)
+-      svm_node_geometry<float3>(kg, sd, stack, svm_node_get<SVMNodeGeometry>(kg, &offset));
++      {
++        const ccl_global auto &node = svm_node_get<SVMNodeGeometry>(kg, &offset);
++        APPROX_BUMP_SKIP(node)
++        svm_node_geometry<float3>(kg, sd, stack, node);
++      }
+       break;
+       SVM_CASE(NODE_GEOMETRY_DERIVATIVE)
+       {
+         const ccl_global auto &node = svm_node_get<SVMNodeGeometry>(kg, &offset);
++        APPROX_BUMP_SKIP(node)
+         IF_NOT_KERNEL_NODES_FEATURE (VOLUME) {
+           svm_node_geometry<dual3>(kg, sd, stack, node);
+         }
+@@ -238,12 +275,14 @@ ccl_device void svm_eval_nodes(KernelGlobals kg,
+       SVM_CASE(NODE_TEX_COORD)
+       {
+         const ccl_global auto &node = svm_node_get<SVMNodeTexCoord>(kg, &offset);
++        APPROX_BUMP_SKIP(node)
+         offset = svm_node_tex_coord(kg, sd, path_visibility, stack, node, offset);
+       }
+       break;
+       SVM_CASE(NODE_TEX_COORD_DERIVATIVE)
+       {
+         const ccl_global auto &node = svm_node_get<SVMNodeTexCoord>(kg, &offset);
++        APPROX_BUMP_SKIP(node)
+         IF_NOT_KERNEL_NODES_FEATURE (VOLUME) {
+           offset = svm_node_tex_coord_derivative(kg, sd, path_visibility, stack, node, offset);
+         }
+@@ -277,6 +316,7 @@ ccl_device void svm_eval_nodes(KernelGlobals kg,
+       SVM_CASE(NODE_ATTR)
+       {
+         const ccl_global auto &node = svm_node_get<SVMNodeAttr>(kg, &offset);
++        APPROX_BUMP_SKIP(node)
+         IF_KERNEL_NODES_FEATURE (VOLUME) {
+ #ifdef __VOLUME__
+           svm_node_attr_volume(kg, sd, stack, node);
+@@ -290,6 +330,7 @@ ccl_device void svm_eval_nodes(KernelGlobals kg,
+       SVM_CASE(NODE_ATTR_DERIVATIVE)
+       {
+         const ccl_global auto &node = svm_node_get<SVMNodeAttr>(kg, &offset);
++        APPROX_BUMP_SKIP(node)
+         IF_NOT_KERNEL_NODES_FEATURE (VOLUME) {
+           svm_node_attr_derivative(kg, sd, stack, node);
+         }
+@@ -319,13 +360,22 @@ ccl_device void svm_eval_nodes(KernelGlobals kg,
+       }
+       break;
+       SVM_CASE(NODE_TEX_IMAGE_BOX)
++#ifdef CYCLES_APPROX_TEX_INDIRECT
++      svm_node_tex_image_box<float3>(
++          kg, sd, stack, svm_node_get<SVMNodeTexImageBox>(kg, &offset), approx_indirect);
++#else
+       svm_node_tex_image_box<float3>(kg, sd, stack, svm_node_get<SVMNodeTexImageBox>(kg, &offset));
++#endif
+       break;
+       SVM_CASE(NODE_TEX_IMAGE_BOX_DERIVATIVE)
+       {
+         const ccl_global auto &node = svm_node_get<SVMNodeTexImageBox>(kg, &offset);
+         IF_NOT_KERNEL_NODES_FEATURE (VOLUME) {
++#ifdef CYCLES_APPROX_TEX_INDIRECT
++          svm_node_tex_image_box<dual3>(kg, sd, stack, node, approx_indirect);
++#else
+           svm_node_tex_image_box<dual3>(kg, sd, stack, node);
++#endif
+         }
+       }
+       break;
+@@ -333,6 +383,20 @@ ccl_device void svm_eval_nodes(KernelGlobals kg,
+       svm_node_tex_noise(stack, svm_node_get<SVMNodeTexNoise>(kg, &offset));
+       break;
+       SVM_CASE(NODE_SET_BUMP)
++#ifdef CYCLES_APPROX_BUMP_INDIRECT
++      if (approx_indirect) {
++        /* Unperturbed input normal, as svm_node_set_bump() with zero height differences. */
++        const ccl_global auto &node = svm_node_get<SVMNodeSetBump>(kg, &offset);
++        IF_KERNEL_NODES_FEATURE (BUMP) {
++          stack_store_float3(
++              stack, node.out_offset, stack_load_float3_default(stack, node.normal_offset, sd->N));
++        }
++        else {
++          stack_store_float3(stack, node.out_offset, zero_float3());
++        }
++        break;
++      }
++#endif
+       svm_node_set_bump<node_feature_mask>(
+           kg, sd, stack, svm_node_get<SVMNodeSetBump>(kg, &offset));
+       break;

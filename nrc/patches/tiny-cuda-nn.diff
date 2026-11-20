@@ -1,0 +1,114 @@
+diff --git a/include/tiny-cuda-nn/encodings/grid.h b/include/tiny-cuda-nn/encodings/grid.h
+index 6b290df..44a8eee 100644
+--- a/include/tiny-cuda-nn/encodings/grid.h
++++ b/include/tiny-cuda-nn/encodings/grid.h
+@@ -1761,9 +1761,13 @@ create_grid_encoding_templated_2(uint32_t n_dims_to_encode, const json& encoding
+ 	// If higher-dimensional hash encodings are desired, corresponding switch cases can be added
+ 	switch (n_dims_to_encode) {
+ 		// case 1: return new GridEncodingTemplated<T, 1, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
++#if defined(TCNN_NRC_MINIMAL)
++		case 3: return new GridEncodingTemplated<T, 3, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
++#else
+ 		case 2: return new GridEncodingTemplated<T, 2, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
+ 		case 3: return new GridEncodingTemplated<T, 3, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
+ 		case 4: return new GridEncodingTemplated<T, 4, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
++#endif
+ 		// case 5: return new GridEncodingTemplated<T, 5, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
+ 		// case 6: return new GridEncodingTemplated<T, 6, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
+ 		// case 7: return new GridEncodingTemplated<T, 7, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
+@@ -1829,10 +1833,14 @@ template <typename T, HashType HASH_TYPE>
+ MultiLevelEncoding<T>* create_grid_encoding_templated_1(uint32_t n_dims_to_encode, const json& encoding) {
+ 	const uint32_t n_features_per_level = encoding.value("n_features_per_level", 2u);
+ 	switch (n_features_per_level) {
++#if defined(TCNN_NRC_MINIMAL) // cycles_nrc: only the NRC grid (3D, 2 features/level) to keep the build under 10 min
++		case 2: return create_grid_encoding_templated_2<T, 2, HASH_TYPE>(n_dims_to_encode, encoding);
++#else
+ 		case 1: return create_grid_encoding_templated_2<T, 1, HASH_TYPE>(n_dims_to_encode, encoding);
+ 		case 2: return create_grid_encoding_templated_2<T, 2, HASH_TYPE>(n_dims_to_encode, encoding);
+ 		case 4: return create_grid_encoding_templated_2<T, 4, HASH_TYPE>(n_dims_to_encode, encoding);
+ 		case 8: return create_grid_encoding_templated_2<T, 8, HASH_TYPE>(n_dims_to_encode, encoding);
++#endif
+ 		default: throw std::runtime_error{"GridEncoding: n_features_per_level must be 1, 2, 4, or 8."};
+ 	}
+ }
+diff --git a/src/encoding.cu b/src/encoding.cu
+index 47cba46..fab4102 100644
+--- a/src/encoding.cu
++++ b/src/encoding.cu
+@@ -34,7 +34,7 @@
+ #include <tiny-cuda-nn/encodings/frequency.h>
+ #include <tiny-cuda-nn/encodings/grid.h>
+ #include <tiny-cuda-nn/encodings/identity.h>
+-#if !defined(TCNN_NO_FWD_BWD)
++#if !defined(TCNN_NO_FWD_BWD) && !defined(TCNN_NRC_MINIMAL)
+ #	include <tiny-cuda-nn/encodings/internal/permuto.h>
+ #	include <tiny-cuda-nn/encodings/multi_level_lod.h>
+ #endif
+@@ -77,7 +77,7 @@ auto register_builtin_encodings() {
+ 	register_encoding<T>(factories, "TiledGrid", grid_factory);
+ 	register_encoding<T>(factories, "DenseGrid", grid_factory);
+ 
+-#if !defined(TCNN_NO_FWD_BWD)
++#if !defined(TCNN_NO_FWD_BWD) && !defined(TCNN_NRC_MINIMAL)
+ 	register_encoding<T>(factories, "Permuto", [](uint32_t n_dims_to_encode, const json& encoding) {
+ 		return create_permuto_encoding<T>(n_dims_to_encode, encoding);
+ 	});
+diff --git a/src/fully_fused_mlp.cu b/src/fully_fused_mlp.cu
+index b0970b4..22719da 100644
+--- a/src/fully_fused_mlp.cu
++++ b/src/fully_fused_mlp.cu
+@@ -943,9 +943,11 @@ void FullyFusedMLP<T, WIDTH>::initialize_params(pcg32& rnd, float* params_full_p
+ 	}
+ }
+ 
+-template class FullyFusedMLP<network_precision_t, 128>;
++template class FullyFusedMLP<network_precision_t, 128>; // nrc-bake: 64 and 128 neurons
+ template class FullyFusedMLP<network_precision_t, 64>;
++#if !defined(TCNN_NRC_MINIMAL)
+ template class FullyFusedMLP<network_precision_t, 32>;
+ template class FullyFusedMLP<network_precision_t, 16>;
++#endif
+ 
+ }
+diff --git a/src/network.cu b/src/network.cu
+index 2693494..a6d01f7 100644
+--- a/src/network.cu
++++ b/src/network.cu
+@@ -83,8 +83,12 @@ uint32_t minimum_alignment(const json& network) {
+ #if TCNN_MIN_GPU_ARCH > 70
+ 		uint32_t n_neurons = network.value("n_neurons", 128u);
+ 		switch (n_neurons) {
++#if !defined(TCNN_NRC_MINIMAL)
+ 			case  16: return FullyFusedMLP<network_precision_t,  16>::REQUIRED_ALIGNMENT();
++#endif
++#if !defined(TCNN_NRC_MINIMAL)
+ 			case  32: return FullyFusedMLP<network_precision_t,  32>::REQUIRED_ALIGNMENT();
++#endif
+ 			case  64: return FullyFusedMLP<network_precision_t,  64>::REQUIRED_ALIGNMENT();
+ 			case 128: return FullyFusedMLP<network_precision_t, 128>::REQUIRED_ALIGNMENT();
+ 			default: throw std::runtime_error{fmt::format("FullyFusedMLP only supports 16, 32, 64, and 128 neurons, but got {}. Use CutlassMLP instead if this is a requirement.", n_neurons)};
+@@ -115,8 +119,12 @@ Network<T>* create_network(const json& network) {
+ 
+ 			uint32_t n_neurons = network.value("n_neurons", 128u);
+ 			switch (n_neurons) {
++#if !defined(TCNN_NRC_MINIMAL)
+ 				case  16: return new FullyFusedMLP<T,  16>{TCNN_FULLY_FUSED_PARAMS};
++#endif
++#if !defined(TCNN_NRC_MINIMAL)
+ 				case  32: return new FullyFusedMLP<T,  32>{TCNN_FULLY_FUSED_PARAMS};
++#endif
+ 				case  64: return new FullyFusedMLP<T,  64>{TCNN_FULLY_FUSED_PARAMS};
+ 				case 128: return new FullyFusedMLP<T, 128>{TCNN_FULLY_FUSED_PARAMS};
+ 				default: throw std::runtime_error{fmt::format("FullyFusedMLP only supports 16, 32, 64, and 128 neurons, but got {}. Use CutlassMLP instead if this is a requirement.", n_neurons)};
+diff --git a/src/rtc_kernel.cu b/src/rtc_kernel.cu
+index b7f0ab8..360cc65 100644
+--- a/src/rtc_kernel.cu
++++ b/src/rtc_kernel.cu
+@@ -73,6 +73,7 @@ CudaRtcKernel::CudaRtcKernel(const std::string& name, const std::string& kernel_
+ 
+ CudaRtcKernel::~CudaRtcKernel() {}
+ void CudaRtcKernel::clear() {}
++void CudaRtcKernel::set(CUfunction_attribute, int) {} // cycles_nrc: missing upstream when TCNN_RTC is off
+ 
+ }
+ #else

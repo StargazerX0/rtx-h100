@@ -1,0 +1,3124 @@
+diff --git a/intern/cycles/kernel/bvh/bvh_local_fast.h b/intern/cycles/kernel/bvh/bvh_local_fast.h
+new file mode 100644
+index 0000000..43c39b7
+--- /dev/null
++++ b/intern/cycles/kernel/bvh/bvh_local_fast.h
+@@ -0,0 +1,536 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++
++#pragma once
++
++#ifdef CYCLES_SSS_LOCAL_FIX
++
++/* Lean, exact single-hit local BVH traversal for subsurface random walk (CYCLES_SSS_LOCAL_FIX).
++ *
++ * Fixes and optimizations over stock kernel/bvh/local.h (all exact for single-hit SSS walk rays,
++ * where lcg_state == nullptr, max_hits == 1, tmin == 0, and Ng is unused):
++ *   1. Tightens isect_t on every closer hit (stock local.h passes isect_t by value to
++ *      triangle_intersect_local, so tmax never shrinks during traversal).
++ *   2. Cull-on-pop stack (CYCLES_SSS_LOCAL_CULL=1, default): skips stacked nodes whose entry
++ *      distance exceeds the tightened isect_t.
++ *   3. Drops dead Ng (cross + normalize) and LocalIntersection[4] array; writes one Intersection.
++ *   4. Uses bvh_aligned_node_intersect directly when !__HAIR__ (or !have_curves), eliminating
++ *      bvh_unaligned_node_intersect bloat and per-node unaligned flag checks.
++ *   5. Hoists object_node, object_flag, position_offset once per walk, and skips the wasted
++ *      world-space bvh_clamp_direction / bvh_inverse_direction before bvh_instance_push.
++ *   6. Optional H100 DPX 4-way slab min/max (CYCLES_SSS_LOCAL_DPX; exact for tmin >= 0).
++ *   7. Optional 4-wide BVH4 local traversal (CYCLES_SSS_LOCAL_BVH4; uses host cycles_bvh4).
++ *   8. Step-by-step interface (bvh_local_fast_begin / bvh_local_fast_step) for two-phase
++ *      persistent warp scheduling (CYCLES_SSS_STEP_BVH).
++ */
++
++#ifndef CYCLES_SSS_LOCAL_CULL
++#  define CYCLES_SSS_LOCAL_CULL 1
++#endif
++#ifndef CYCLES_SSS_LOCAL_STACK
++#  define CYCLES_SSS_LOCAL_STACK BVH_STACK_SIZE
++#endif
++#ifndef CYCLES_SSS_LOCAL_NO_VIS
++#  define CYCLES_SSS_LOCAL_NO_VIS 0
++#endif
++
++CCL_NAMESPACE_BEGIN
++
++#ifdef CYCLES_SSS_LOCAL_BVH4
++#  ifndef CYCLES_KERNEL_BVH4_DEF
++#    define CYCLES_KERNEL_BVH4_DEF 1
++struct KernelBVH4 {
++  const float4 *nodes;
++  const int *object_root;
++  int root;
++  int pad;
++};
++extern "C" __constant__ KernelBVH4 cycles_bvh4;
++__constant__ KernelBVH4 cycles_bvh4;
++#  endif
++#  ifndef BVH4_BVH2_TAG
++#    define BVH4_BVH2_TAG 0x40000000
++#  endif
++#endif
++
++#if CYCLES_SSS_LOCAL_CULL
++typedef int2 BVHLocalStackEntry;
++ccl_device_forceinline void blf_stack_set(int2 &e, const int a, const float d)
++{
++  e = make_int2(a, __float_as_int(d));
++}
++#else
++typedef int BVHLocalStackEntry;
++ccl_device_forceinline void blf_stack_set(int &e, const int a, const float /*d*/)
++{
++  e = a;
++}
++#endif
++
++struct BVHLocalFastState {
++  float3 P;
++  float3 dir;
++  float3 idir;
++  float isect_t;
++  int node_addr;
++  int stack_ptr;
++  int local_object;
++  int object;
++  int position_offset;
++  int self_prim;
++  Intersection isect;
++  bool hit;
++};
++
++ccl_device_forceinline void blf_push(BVHLocalFastState &tr,
++                                     BVHLocalStackEntry *stack,
++                                     const int a,
++                                     const float d)
++{
++  ++tr.stack_ptr;
++  kernel_assert(tr.stack_ptr < CYCLES_SSS_LOCAL_STACK);
++  blf_stack_set(stack[tr.stack_ptr], a, d);
++}
++
++#if CYCLES_SSS_LOCAL_CULL
++ccl_device_forceinline void blf_pop(BVHLocalFastState &tr, const int2 *stack)
++{
++  const float t = tr.isect_t;
++  int2 e;
++  do {
++    e = stack[tr.stack_ptr];
++    --tr.stack_ptr;
++  } while (__int_as_float(e.y) > t);
++  tr.node_addr = e.x;
++}
++#else
++ccl_device_forceinline void blf_pop(BVHLocalFastState &tr, const int *stack)
++{
++  tr.node_addr = stack[tr.stack_ptr];
++  --tr.stack_ptr;
++}
++#endif
++
++#ifdef CYCLES_SSS_LOCAL_DPX
++ccl_device_forceinline float blf_max4i(const float a, const float b, const float c, const float lo)
++{
++  return __int_as_float(__vimax3_s32(
++      __float_as_int(a), __float_as_int(b), max(__float_as_int(c), __float_as_int(lo))));
++}
++ccl_device_forceinline float blf_min4i(const float a, const float b, const float c, const float hi)
++{
++  return __int_as_float(__vimin3_s32(
++      __float_as_int(a), __float_as_int(b), min(__float_as_int(c), __float_as_int(hi))));
++}
++#endif
++
++/* Aligned BVH2 node intersection for local rays (tmin == 0.0f). */
++ccl_device_forceinline int blf_aligned_bvh2(const float4 cnodes,
++                                            const float3 P,
++                                            const float3 idir,
++                                            const float tmax,
++                                            const int node_addr,
++                                            float dist[2])
++{
++  const float4 node0 = kernel_data_fetch(bvh_nodes, node_addr + 1);
++  const float4 node1 = kernel_data_fetch(bvh_nodes, node_addr + 2);
++  const float4 node2 = kernel_data_fetch(bvh_nodes, node_addr + 3);
++
++#ifdef CYCLES_BVH_FMA
++  const float pidx = P.x * idir.x, pidy = P.y * idir.y, pidz = P.z * idir.z;
++  const float c0lox = fmaf(node0.x, idir.x, -pidx);
++  const float c0hix = fmaf(node0.z, idir.x, -pidx);
++  const float c0loy = fmaf(node1.x, idir.y, -pidy);
++  const float c0hiy = fmaf(node1.z, idir.y, -pidy);
++  const float c0loz = fmaf(node2.x, idir.z, -pidz);
++  const float c0hiz = fmaf(node2.z, idir.z, -pidz);
++  const float c1lox = fmaf(node0.y, idir.x, -pidx);
++  const float c1hix = fmaf(node0.w, idir.x, -pidx);
++  const float c1loy = fmaf(node1.y, idir.y, -pidy);
++  const float c1hiy = fmaf(node1.w, idir.y, -pidy);
++  const float c1loz = fmaf(node2.y, idir.z, -pidz);
++  const float c1hiz = fmaf(node2.w, idir.z, -pidz);
++#else
++  const float c0lox = (node0.x - P.x) * idir.x;
++  const float c0hix = (node0.z - P.x) * idir.x;
++  const float c0loy = (node1.x - P.y) * idir.y;
++  const float c0hiy = (node1.z - P.y) * idir.y;
++  const float c0loz = (node2.x - P.z) * idir.z;
++  const float c0hiz = (node2.z - P.z) * idir.z;
++  const float c1lox = (node0.y - P.x) * idir.x;
++  const float c1hix = (node0.w - P.x) * idir.x;
++  const float c1loy = (node1.y - P.y) * idir.y;
++  const float c1hiy = (node1.w - P.y) * idir.y;
++  const float c1loz = (node2.y - P.z) * idir.z;
++  const float c1hiz = (node2.w - P.z) * idir.z;
++#endif
++
++#ifdef CYCLES_SSS_LOCAL_DPX
++  const float c0min = blf_max4i(
++      fminf(c0lox, c0hix), fminf(c0loy, c0hiy), fminf(c0loz, c0hiz), 0.0f);
++  const float c0max = blf_min4i(
++      fmaxf(c0lox, c0hix), fmaxf(c0loy, c0hiy), fmaxf(c0loz, c0hiz), tmax);
++  const float c1min = blf_max4i(
++      fminf(c1lox, c1hix), fminf(c1loy, c1hiy), fminf(c1loz, c1hiz), 0.0f);
++  const float c1max = blf_min4i(
++      fmaxf(c1lox, c1hix), fmaxf(c1loy, c1hiy), fmaxf(c1loz, c1hiz), tmax);
++#else
++  const float c0min = max4(0.0f, min(c0lox, c0hix), min(c0loy, c0hiy), min(c0loz, c0hiz));
++  const float c0max = min4(tmax, max(c0lox, c0hix), max(c0loy, c0hiy), max(c0loz, c0hiz));
++  const float c1min = max4(0.0f, min(c1lox, c1hix), min(c1loy, c1hiy), min(c1loz, c1hiz));
++  const float c1max = min4(tmax, max(c1lox, c1hix), max(c1loy, c1hiy), max(c1loz, c1hiz));
++#endif
++
++  dist[0] = c0min;
++  dist[1] = c1min;
++
++#if defined(__VISIBILITY_FLAG__) && !CYCLES_SSS_LOCAL_NO_VIS
++  return (((c0max >= c0min) && (__float_as_uint(cnodes.x) & PATH_RAY_VISIBILITY_OBJECT_ALL)) ? 1 :
++                                                                                               0) |
++         (((c1max >= c1min) && (__float_as_uint(cnodes.y) & PATH_RAY_VISIBILITY_OBJECT_ALL)) ? 2 :
++                                                                                               0);
++#else
++  return ((c0max >= c0min) ? 1 : 0) | ((c1max >= c1min) ? 2 : 0);
++#endif
++}
++
++ccl_device_forceinline void blf_bvh2_node(BVHLocalFastState &tr,
++                                          BVHLocalStackEntry *stack,
++                                          const float tmax,
++                                          const int addr,
++                                          const int tag)
++{
++  const float4 cnodes = kernel_data_fetch(bvh_nodes, addr + 0);
++  float dist[2];
++  int mask;
++#ifdef __HAIR__
++  if (kernel_data.bvh.have_curves &&
++      (__float_as_uint(cnodes.x) & PATH_RAY_VISIBILITY_NODE_UNALIGNED))
++  {
++    mask = bvh_unaligned_node_intersect(
++        nullptr, tr.P, tr.dir, 0.0f, tmax, addr, PATH_RAY_VISIBILITY_OBJECT_ALL, dist);
++  }
++  else
++#endif
++  {
++    mask = blf_aligned_bvh2(cnodes, tr.P, tr.idir, tmax, addr, dist);
++  }
++
++  int child0 = __float_as_int(cnodes.z);
++  int child1 = __float_as_int(cnodes.w);
++  if (tag) {
++    child0 = (child0 >= 0) ? child0 + tag : child0;
++    child1 = (child1 >= 0) ? child1 + tag : child1;
++  }
++
++  if (mask == 3) {
++    float dfar = dist[1];
++    if (dist[1] < dist[0]) {
++      const int tmp = child0;
++      child0 = child1;
++      child1 = tmp;
++      dfar = dist[0];
++    }
++    blf_push(tr, stack, child1, dfar);
++    tr.node_addr = child0;
++  }
++  else if (mask == 2) {
++    tr.node_addr = child1;
++  }
++  else if (mask == 1) {
++    tr.node_addr = child0;
++  }
++  else {
++    blf_pop(tr, stack);
++  }
++}
++
++#ifdef CYCLES_SSS_LOCAL_BVH4
++ccl_device_forceinline unsigned long long blf_pin64(const unsigned long long x)
++{
++  unsigned long long y;
++  asm volatile("mov.b64 %0, %1;" : "=l"(y) : "l"(x));
++  return y;
++}
++
++ccl_device_forceinline void blf_bvh4_inner(BVHLocalFastState &tr, BVHLocalStackEntry *stack)
++{
++  const float3 idir = tr.idir;
++  const float tmax = tr.isect_t;
++  const float pidx = tr.P.x * idir.x, pidy = tr.P.y * idir.y, pidz = tr.P.z * idir.z;
++  const unsigned long long base = reinterpret_cast<unsigned long long>(cycles_bvh4.nodes);
++  const unsigned long long bx = blf_pin64(base + (idir.x >= 0.0f ? 0u : 16u));
++  const unsigned long long by = blf_pin64(base + (idir.y >= 0.0f ? 32u : 48u));
++  const unsigned long long bz = blf_pin64(base + (idir.z >= 0.0f ? 64u : 80u));
++
++  while (tr.node_addr >= 0 && tr.node_addr != ENTRYPOINT_SENTINEL) {
++#  ifdef __HAIR__
++    if (tr.node_addr >= BVH4_BVH2_TAG) {
++      blf_bvh2_node(tr, stack, tmax, tr.node_addr - BVH4_BVH2_TAG, BVH4_BVH2_TAG);
++      continue;
++    }
++#  endif
++    const unsigned long long o = (unsigned long long)(unsigned)tr.node_addr * 128u;
++    const unsigned long long ax = bx + o, ay = by + o, az = bz + o;
++    const float4 NX = *reinterpret_cast<const float4 *>(ax);
++    const float4 FX = *reinterpret_cast<const float4 *>(ax ^ 16u);
++    const float4 NY = *reinterpret_cast<const float4 *>(ay);
++    const float4 FY = *reinterpret_cast<const float4 *>(ay ^ 16u);
++    const float4 NZ = *reinterpret_cast<const float4 *>(az);
++    const float4 FZ = *reinterpret_cast<const float4 *>(az ^ 16u);
++    const char *nb = reinterpret_cast<const char *>(base + o);
++    const int4 ch = *reinterpret_cast<const int4 *>(nb + 96);
++#  if defined(__VISIBILITY_FLAG__) && !CYCLES_SSS_LOCAL_NO_VIS
++    const uint4 vs = *reinterpret_cast<const uint4 *>(nb + 112);
++    const uint vv[4] = {vs.x, vs.y, vs.z, vs.w};
++#  endif
++    const float nxv[4] = {NX.x, NX.y, NX.z, NX.w}, fxv[4] = {FX.x, FX.y, FX.z, FX.w};
++    const float nyv[4] = {NY.x, NY.y, NY.z, NY.w}, fyv[4] = {FY.x, FY.y, FY.z, FY.w};
++    const float nzv[4] = {NZ.x, NZ.y, NZ.z, NZ.w}, fzv[4] = {FZ.x, FZ.y, FZ.z, FZ.w};
++    float d[4];
++    int a[4] = {ch.x, ch.y, ch.z, ch.w};
++#  pragma unroll
++    for (int j = 0; j < 4; j++) {
++      const float tnx = fmaf(nxv[j], idir.x, -pidx);
++      const float tny = fmaf(nyv[j], idir.y, -pidy);
++      const float tnz = fmaf(nzv[j], idir.z, -pidz);
++      const float tfx = fmaf(fxv[j], idir.x, -pidx);
++      const float tfy = fmaf(fyv[j], idir.y, -pidy);
++      const float tfz = fmaf(fzv[j], idir.z, -pidz);
++#  ifdef CYCLES_SSS_LOCAL_DPX
++      const float tn = blf_max4i(tnx, tny, tnz, 0.0f);
++      const float tf = blf_min4i(tfx, tfy, tfz, tmax);
++#  else
++      const float tn = fmaxf(fmaxf(0.0f, tnx), fmaxf(tny, tnz));
++      const float tf = fminf(fminf(tmax, tfx), fminf(tfy, tfz));
++#  endif
++#  if defined(__VISIBILITY_FLAG__) && !CYCLES_SSS_LOCAL_NO_VIS
++      d[j] = (tn <= tf && (vv[j] & PATH_RAY_VISIBILITY_OBJECT_ALL)) ? tn : INFINITY;
++#  else
++      d[j] = (tn <= tf) ? tn : INFINITY;
++#  endif
++    }
++#  define BLF_CS(x, y) \
++    { \
++      const bool sw = d[y] < d[x]; \
++      const float td = sw ? d[y] : d[x]; \
++      d[y] = sw ? d[x] : d[y]; \
++      d[x] = td; \
++      const int ta = sw ? a[y] : a[x]; \
++      a[y] = sw ? a[x] : a[y]; \
++      a[x] = ta; \
++    }
++    BLF_CS(0, 1) BLF_CS(2, 3) BLF_CS(0, 2) BLF_CS(1, 3) BLF_CS(1, 2)
++#  undef BLF_CS
++#  pragma unroll
++    for (int j = 3; j >= 1; j--) {
++      if (d[j] != INFINITY) {
++        blf_push(tr, stack, a[j], d[j]);
++      }
++    }
++    if (d[0] != INFINITY) {
++      tr.node_addr = a[0];
++    }
++    else {
++      blf_pop(tr, stack);
++    }
++  }
++}
++#endif /* CYCLES_SSS_LOCAL_BVH4 */
++
++/* Initialize local traversal for one walk ray. Returns false if no traversal is needed. */
++ccl_device_forceinline bool bvh_local_fast_begin(KernelGlobals kg,
++                                                 BVHLocalFastState &tr,
++                                                 BVHLocalStackEntry *stack,
++                                                 const float3 ray_P,
++                                                 const float3 ray_D,
++                                                 const float ray_tmax,
++                                                 const int local_object,
++                                                 const int object_node,
++                                                 const uint object_flag,
++                                                 const int position_offset,
++                                                 const int self_prim
++#ifdef __OBJECT_MOTION__
++                                                 ,
++                                                 const float ray_time
++#endif
++)
++{
++  tr.hit = false;
++  if (!(isfinite_safe(ray_P.x) && isfinite_safe(ray_D.x) && len_squared(ray_D) != 0.0f)) {
++    tr.node_addr = ENTRYPOINT_SENTINEL;
++    return false;
++  }
++
++  blf_stack_set(stack[0], ENTRYPOINT_SENTINEL, -INFINITY);
++  tr.stack_ptr = 0;
++  tr.node_addr = object_node;
++  tr.isect_t = ray_tmax;
++  tr.local_object = local_object;
++  tr.position_offset = position_offset;
++  tr.self_prim = self_prim;
++
++  if (!(object_flag & SD_OBJECT_TRANSFORM_APPLIED)) {
++#ifdef __OBJECT_MOTION__
++    Transform itfm;
++    object_fetch_transform_motion_test(kg, local_object, ray_time, &itfm);
++#else
++    const Transform itfm = object_fetch_transform(kg, local_object, OBJECT_INVERSE_TRANSFORM);
++#endif
++    tr.P = transform_point(&itfm, ray_P);
++    tr.dir = bvh_clamp_direction(transform_direction(&itfm, ray_D));
++    tr.idir = bvh_inverse_direction(tr.dir);
++    tr.object = local_object;
++  }
++  else {
++    tr.P = ray_P;
++    tr.dir = bvh_clamp_direction(ray_D);
++    tr.idir = bvh_inverse_direction(tr.dir);
++    tr.object = OBJECT_NONE;
++  }
++
++  return tr.node_addr != ENTRYPOINT_SENTINEL;
++}
++
++/* One while-while step: traverse inner nodes down to the next leaf, test its triangles, then pop
++ * (after tightening tr.isect_t so cull-on-pop drops stale stack entries immediately).
++ * Returns true when traversal is complete (tr.node_addr == ENTRYPOINT_SENTINEL). */
++ccl_device_forceinline bool bvh_local_fast_step(KernelGlobals kg,
++                                                BVHLocalFastState &tr,
++                                                BVHLocalStackEntry *stack
++#ifdef __OBJECT_MOTION__
++                                                ,
++                                                const float ray_time
++#endif
++)
++{
++#ifdef CYCLES_SSS_LOCAL_BVH4
++  blf_bvh4_inner(tr, stack);
++#else
++  const float tmax = tr.isect_t;
++  while (tr.node_addr >= 0 && tr.node_addr != ENTRYPOINT_SENTINEL) {
++    blf_bvh2_node(tr, stack, tmax, tr.node_addr, 0);
++  }
++#endif
++
++  if (tr.node_addr < 0) {
++    const float4 leaf = kernel_data_fetch(bvh_leaf_nodes, (-tr.node_addr - 1));
++    int prim_addr = __float_as_int(leaf.x);
++    const int prim_addr2 = __float_as_int(leaf.y);
++    const uint type = __float_as_int(leaf.w);
++
++    if ((type & PRIMITIVE_ALL) == PRIMITIVE_TRIANGLE) {
++      for (; prim_addr < prim_addr2; prim_addr++) {
++        if (tr.object == OBJECT_NONE) {
++          if (kernel_data_fetch(prim_object, prim_addr) != tr.local_object) {
++            continue;
++          }
++        }
++        const int prim = kernel_data_fetch(prim_index, prim_addr);
++        if (prim == tr.self_prim) {
++          continue;
++        }
++        if (triangle_intersect_local_single(kg,
++                                            &tr.isect,
++                                            tr.P,
++                                            tr.dir,
++                                            tr.local_object,
++                                            tr.position_offset,
++                                            prim,
++                                            0.0f,
++                                            &tr.isect_t))
++        {
++          tr.hit = true;
++        }
++      }
++    }
++#ifdef __OBJECT_MOTION__
++    else if ((type & PRIMITIVE_ALL) == PRIMITIVE_MOTION_TRIANGLE) {
++      LocalIntersection tmp_isect;
++      tmp_isect.num_hits = tr.hit ? 1 : 0;
++      if (tr.hit) {
++        tmp_isect.hits[0] = tr.isect;
++      }
++      for (; prim_addr < prim_addr2; prim_addr++) {
++        if (tr.object == OBJECT_NONE) {
++          if (kernel_data_fetch(prim_object, prim_addr) != tr.local_object) {
++            continue;
++          }
++        }
++        const int prim = kernel_data_fetch(prim_index, prim_addr);
++        if (prim == tr.self_prim) {
++          continue;
++        }
++        motion_triangle_intersect_local(
++            kg, &tmp_isect, tr.P, tr.dir, ray_time, tr.local_object, prim, 0.0f, tr.isect_t, nullptr, 1);
++        if (tmp_isect.num_hits > 0 && (!tr.hit || tmp_isect.hits[0].t <= tr.isect_t)) {
++          tr.hit = true;
++          tr.isect = tmp_isect.hits[0];
++          tr.isect_t = tr.isect.t;
++        }
++      }
++    }
++#endif
++
++    /* Pop AFTER triangle tests so cull-on-pop uses the tightened isect_t. */
++    blf_pop(tr, stack);
++  }
++
++  return tr.node_addr == ENTRYPOINT_SENTINEL;
++}
++
++/* Complete single-hit local traversal for one walk ray. */
++ccl_device_forceinline bool bvh_intersect_local_single(KernelGlobals kg,
++                                                       const float3 ray_P,
++                                                       const float3 ray_D,
++                                                       const float ray_tmax,
++                                                       const int local_object,
++                                                       const int object_node,
++                                                       const uint object_flag,
++                                                       const int position_offset,
++                                                       const int self_prim,
++#ifdef __OBJECT_MOTION__
++                                                       const float ray_time,
++#endif
++                                                       ccl_private Intersection *out_isect)
++{
++  BVHLocalStackEntry stack[CYCLES_SSS_LOCAL_STACK];
++  BVHLocalFastState tr;
++  if (!bvh_local_fast_begin(kg,
++                            tr,
++                            stack,
++                            ray_P,
++                            ray_D,
++                            ray_tmax,
++                            local_object,
++                            object_node,
++                            object_flag,
++                            position_offset,
++                            self_prim
++#ifdef __OBJECT_MOTION__
++                            ,
++                            ray_time
++#endif
++                            ))
++  {
++    return false;
++  }
++  while (!bvh_local_fast_step(kg,
++                              tr,
++                              stack
++#ifdef __OBJECT_MOTION__
++                              ,
++                              ray_time
++#endif
++                              ))
++  {
++  }
++  if (tr.hit) {
++    *out_isect = tr.isect;
++    return true;
++  }
++  return false;
++}
++
++CCL_NAMESPACE_END
++
++#endif /* CYCLES_SSS_LOCAL_FIX */
+diff --git a/intern/cycles/kernel/bvh/bvh_wide_dynamic.h b/intern/cycles/kernel/bvh/bvh_wide_dynamic.h
+index 353d924..e70eb32 100644
+--- a/intern/cycles/kernel/bvh/bvh_wide_dynamic.h
++++ b/intern/cycles/kernel/bvh/bvh_wide_dynamic.h
+@@ -98,6 +98,8 @@ CCL_NAMESPACE_BEGIN
+ 
+ #if defined(CYCLES_BVH4_CLOSEST) || defined(CYCLES_BVH4_SHADOW)
+ #  define WDF_HAS_BVH4 1
++#  ifndef CYCLES_KERNEL_BVH4_DEF
++#    define CYCLES_KERNEL_BVH4_DEF 1
+ /* The BVH4 side structure. The host looks this symbol up: its presence means the cubin needs
+  * CYCLES_BVH4=1 (device/cuda/device_impl.cpp); offsets 0, 8, 16 (const_copy_to "bvh4_nodes",
+  * "bvh4_object_root", "bvh4_root"). */
+@@ -109,6 +111,7 @@ struct KernelBVH4 {
+ };
+ extern "C" __constant__ KernelBVH4 cycles_bvh4;
+ __constant__ KernelBVH4 cycles_bvh4;
++#  endif
+ #endif
+ 
+ #define BVH4_BVH2_TAG 0x40000000
+diff --git a/intern/cycles/kernel/bvh/local.h b/intern/cycles/kernel/bvh/local.h
+index 09b8b8d..fc7d212 100644
+--- a/intern/cycles/kernel/bvh/local.h
++++ b/intern/cycles/kernel/bvh/local.h
+@@ -171,6 +171,11 @@ ccl_device_hot
+               {
+                 return true;
+               }
++#ifdef CYCLES_SSS_LOCAL_FIX
++              if (lcg_state == nullptr && local_isect != nullptr && local_isect->num_hits) {
++                isect_t = local_isect->hits[0].t;
++              }
++#endif
+             }
+             break;
+           }
+diff --git a/intern/cycles/kernel/geom/triangle_intersect.h b/intern/cycles/kernel/geom/triangle_intersect.h
+index 6da84c9..6f8d475 100644
+--- a/intern/cycles/kernel/geom/triangle_intersect.h
++++ b/intern/cycles/kernel/geom/triangle_intersect.h
+@@ -158,6 +158,42 @@ ccl_device_inline bool triangle_intersect_local(KernelGlobals kg,
+ 
+   return false;
+ }
++
++#  ifdef CYCLES_SSS_LOCAL_FIX
++/* Ours: single-hit local triangle test for subsurface random walk. Tightens *isect_t on hit,
++ * skips dead Ng (cross + normalize) and hoists position_offset out of the leaf loop. */
++ccl_device_forceinline bool triangle_intersect_local_single(KernelGlobals kg,
++                                                            ccl_private Intersection *isect,
++                                                            const float3 P,
++                                                            const float3 dir,
++                                                            const int object,
++                                                            const int position_offset,
++                                                            const int prim,
++                                                            const float tmin,
++                                                            ccl_private float *isect_t)
++{
++  const uint3 tri_vindex = kernel_data_fetch(tri_vindex, prim);
++  const float3 tri_a = kernel_data_fetch(tri_verts, position_offset + tri_vindex.x);
++  const float3 tri_b = kernel_data_fetch(tri_verts, position_offset + tri_vindex.y);
++  const float3 tri_c = kernel_data_fetch(tri_verts, position_offset + tri_vindex.z);
++
++  float t;
++  float u;
++  float v;
++  if (!ray_triangle_intersect(P, dir, tmin, *isect_t, tri_a, tri_b, tri_c, &u, &v, &t)) {
++    return false;
++  }
++
++  *isect_t = t;
++  isect->prim = prim;
++  isect->object = object;
++  isect->type = PRIMITIVE_TRIANGLE;
++  isect->u = u;
++  isect->v = v;
++  isect->t = t;
++  return true;
++}
++#  endif /* CYCLES_SSS_LOCAL_FIX */
+ #endif /* __BVH_LOCAL__ */
+ 
+ /**
+diff --git a/intern/cycles/kernel/integrator/intersect_closest.h b/intern/cycles/kernel/integrator/intersect_closest.h
+index 65a270b..01b14e3 100644
+--- a/intern/cycles/kernel/integrator/intersect_closest.h
++++ b/intern/cycles/kernel/integrator/intersect_closest.h
+@@ -289,6 +289,25 @@ ccl_device_forceinline void integrator_intersect_next_kernel(
+     if (integrator_intersect_skip_lights(kg, state)) {
+       integrator_path_terminate(kg, state, render_buffer, current_kernel);
+     }
++#if defined(CYCLES_EMIT_BAKE) && defined(CYCLES_EMIT_BAKE_BG) && defined(CYCLES_EMIT_BAKE_NO_SUN)
++    else if (!(INTEGRATOR_STATE(state, path, flag) &
++               (PATH_RAY_TRANSPARENT_BACKGROUND | PATH_RAY_SHADOW_CATCHER_BACKGROUND)) &&
++             !(INTEGRATOR_STATE(state, path, visibility) & PATH_RAY_VISIBILITY_CAMERA) &&
++             !(kernel_data.film.light_pass_flag & PASSMASK(BACKGROUND)) &&
++             kernel_data.film.pass_adaptive_aux_buffer == PASS_UNUSED)
++    {
++      const int bg_shader = kernel_data.background.surface_shader & SHADER_MASK;
++      const ccl_global KernelShader &ks = kernel_data_fetch(shaders, bg_shader);
++      if ((ks.flags & SD_HAS_CONSTANT_EMISSION) && ks.constant_emission[0] == 0.0f &&
++          ks.constant_emission[1] == 0.0f && ks.constant_emission[2] == 0.0f)
++      {
++        integrator_path_terminate(kg, state, render_buffer, current_kernel);
++      }
++      else {
++        integrator_path_next(state, current_kernel, DEVICE_KERNEL_INTEGRATOR_SHADE_BACKGROUND);
++      }
++    }
++#endif
+     else {
+       integrator_path_next(state, current_kernel, DEVICE_KERNEL_INTEGRATOR_SHADE_BACKGROUND);
+     }
+diff --git a/intern/cycles/kernel/integrator/intersect_subsurface_dynamic.h b/intern/cycles/kernel/integrator/intersect_subsurface_dynamic.h
+index 0649495..3fc5ded 100644
+--- a/intern/cycles/kernel/integrator/intersect_subsurface_dynamic.h
++++ b/intern/cycles/kernel/integrator/intersect_subsurface_dynamic.h
+@@ -78,6 +78,7 @@ ccl_device_forceinline void subsurface_scatter_exit(KernelGlobals kg,
+   }
+ }
+ 
++#  ifndef CYCLES_SSS_LOCAL_FIX
+ struct IntersectSubsurfaceDFWork {
+   const ccl_global int *path_index_array;
+   SSSWalk w;
+@@ -126,17 +127,316 @@ struct IntersectSubsurfaceDFWork {
+     integrator_path_terminate(kg, state, nullptr, DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE);
+   }
+ };
++#  endif /* !CYCLES_SSS_LOCAL_FIX */
+ 
+ /* [0] the fetch counter, [1] blocks finished in the current launch. */
+ extern "C" __device__ uint sssdf_counters[2];
+ __device__ uint sssdf_counters[2] = {0, 0};
+ 
++#  ifdef CYCLES_SSS_LOCAL_FIX
++#    ifndef CYCLES_SSS_NO_DISK
++/* Disk-only fallback kept out-of-line so the random-walk kernel does not inline a second copy of
++ * subsurface_random_walk / bvh_intersect_local and duplicate its stack frame. */
++ccl_device_noinline void integrator_intersect_subsurface_disk_fallback(KernelGlobals kg,
++                                                                       IntegratorState state)
++{
++  RNGState rng_state;
++  path_state_rng_load(state, &rng_state);
++  Ray ray ccl_optional_struct_init;
++  LocalIntersection ss_isect ccl_optional_struct_init;
++  if (subsurface_disk(kg, state, rng_state, ray, ss_isect)) {
++    subsurface_scatter_exit(kg, state, ray, ss_isect.hits[0]);
++    return;
++  }
++  integrator_path_terminate(kg, state, nullptr, DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE);
++}
++#    endif
++
++/* Exit path for lean SSSWalk (no Ray struct carried; tmin/dP/dD/time unchanged in state). */
++ccl_device_forceinline void subsurface_scatter_exit_walk(KernelGlobals kg,
++                                                         IntegratorState state,
++                                                         float3 ray_P,
++                                                         float3 ray_D,
++                                                         const float ray_tmax,
++                                                         const ccl_private Intersection &exit_isect)
++{
++#    ifdef __VOLUME__
++  if (kernel_data.integrator.use_volumes) {
++    const int object = exit_isect.object;
++    const uint object_flag = kernel_data_fetch(object_flag, object);
++    if (object_flag & SD_OBJECT_INTERSECTS_VOLUME) {
++      const float3 P = INTEGRATOR_STATE(state, ray, P);
++      integrator_volume_stack_update_for_subsurface(kg, state, P, ray_P);
++    }
++  }
++#    endif /* __VOLUME__ */
++
++  ray_P += ray_D * ray_tmax * 2.0f;
++  ray_D = -ray_D;
++
++  integrator_state_write_isect(state, &exit_isect);
++#    if defined(__INTEGRATOR_GPU_PACKED_STATE__) && defined(__KERNEL_GPU__)
++  Ray ray ccl_optional_struct_init;
++  ray.P = ray_P;
++  ray.D = ray_D;
++  ray.tmin = 0.0f;
++  ray.tmax = ray_tmax;
++  ray.time = INTEGRATOR_STATE(state, ray, time);
++  ray.dP = INTEGRATOR_STATE(state, ray, dP);
++  ray.dD = differential_zero_compact();
++  integrator_state_write_ray(state, &ray);
++#    else
++  INTEGRATOR_STATE_WRITE(state, ray, P) = ray_P;
++  INTEGRATOR_STATE_WRITE(state, ray, D) = ray_D;
++  INTEGRATOR_STATE_WRITE(state, ray, tmax) = ray_tmax;
++#    endif
++
++  INTEGRATOR_STATE_WRITE(state, path, rng_offset) += PRNG_BOUNCE_NUM;
++
++  const int shader = intersection_get_shader(kg, &exit_isect);
++  const int shader_flags = kernel_data_fetch(shaders, shader).flags;
++  const uint object_flags = intersection_get_object_flags(kg, &exit_isect);
++  const bool use_caustics = kernel_data.integrator.use_caustics &&
++                            (object_flags & SD_OBJECT_CAUSTICS_RECEIVER);
++  const bool use_raytrace_kernel = (shader_flags & SD_HAS_RAYTRACE);
++
++  if (use_caustics) {
++    integrator_path_next(state,
++                         DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE,
++                         DEVICE_KERNEL_INTEGRATOR_INTERSECT_MNEE);
++  }
++  else if (use_raytrace_kernel) {
++    integrator_path_next_sorted(kg,
++                                state,
++                                DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE,
++                                DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE,
++                                shader);
++  }
++  else {
++    integrator_path_next_sorted(kg,
++                                state,
++                                DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE,
++                                DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE,
++                                shader);
++  }
++}
++
++struct IntersectSubsurfaceFastWork {
++  const ccl_global int *path_index_array;
++  SSSWalk w;
++  int status;
++
++  ccl_device_forceinline int state(const int index)
++  {
++    return path_index_array ? path_index_array[index] : index;
++  }
++
++  ccl_device_forceinline bool begin(const int state)
++  {
++    if (!(INTEGRATOR_STATE(state, path, flag) & PATH_RAY_SUBSURFACE_RANDOM_WALK)) {
++      status = 2;
++      return false;
++    }
++    path_state_rng_load(state, &w.rng_state);
++    if (!sss_walk_begin(nullptr, state, w)) {
++      status = 0;
++      return false;
++    }
++    status = 1;
++    return true;
++  }
++
++  ccl_device_forceinline bool step(const int state)
++  {
++    return sss_walk_step(nullptr, state, w);
++  }
++
++  ccl_device_forceinline void finish(const int state)
++  {
++    KernelGlobals kg = nullptr;
++#    ifndef CYCLES_SSS_NO_DISK
++    if (status == 2) {
++      integrator_intersect_subsurface_disk_fallback(kg, state);
++      return;
++    }
++#    endif
++    if (status == 1 && sss_walk_end(kg, state, w)) {
++      subsurface_scatter_exit_walk(kg, state, w.ray_P, w.ray_D, w.ray_tmax, w.isect);
++      return;
++    }
++    integrator_path_terminate(kg, state, nullptr, DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE);
++  }
++};
++
++#    ifdef CYCLES_SSS_STEP_BVH
++#      ifndef CYCLES_SSS_STEP_MINTRACE
++#        define CYCLES_SSS_STEP_MINTRACE 16
++#      endif
++/* Two-phase persistent SSS + local BVH loop:
++ *   Phase 1: converged BVH leaf steps until < CYCLES_SSS_STEP_MINTRACE lanes are still tracing.
++ *   Phase 2: converged walk math (post_ray + prep_ray) for all lanes whose ray finished.
++ *   Phase 3: deferred finish + warp refill when < CYCLES_BVH2DF_MINLIVE walks remain active. */
++ccl_device_forceinline void integrator_intersect_subsurface_df_stepbvh(
++    const ccl_global int *path_index_array, const int work_size)
++{
++  SSSWalk w;
++  SSSWalkStepCtx ctx;
++  BVHLocalFastState tr;
++  BVHLocalStackEntry stack[CYCLES_SSS_LOCAL_STACK];
++  const uint lane = threadIdx.x & 31;
++  const uint warp_mask = __activemask();
++  bool active = false;
++  bool ray_active = false;
++  bool exhausted = false;
++  bool pending = false;
++  int status = 0;
++  int state = 0;
++
++  auto finish_lane = [&](const int st) {
++    KernelGlobals kg = nullptr;
++#      ifndef CYCLES_SSS_NO_DISK
++    if (status == 2) {
++      integrator_intersect_subsurface_disk_fallback(kg, st);
++      return;
++    }
++#      endif
++    if (status == 1 && sss_walk_end(kg, st, w)) {
++      subsurface_scatter_exit_walk(kg, st, w.ray_P, w.ray_D, w.ray_tmax, w.isect);
++      return;
++    }
++    integrator_path_terminate(kg, st, nullptr, DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE);
++  };
++
++  auto start_ray = [&]() -> bool {
++    sss_walk_prep_ray(nullptr, w, ctx);
++    return bvh_local_fast_begin(nullptr,
++                                tr,
++                                stack,
++                                w.ray_P,
++                                w.ray_D,
++                                w.ray_tmax,
++                                w.object,
++                                w.object_node,
++                                w.object_flag,
++                                w.position_offset,
++                                w.self_prim
++#      ifdef __OBJECT_MOTION__
++                                ,
++                                w.ray_time
++#      endif
++    );
++  };
++
++  while (true) {
++    if (pending) {
++      finish_lane(state);
++      pending = false;
++    }
++    const bool idle = !active && !exhausted;
++    const uint fetch_mask = __ballot_sync(warp_mask, idle);
++    if (fetch_mask) {
++      const int leader = __ffs(fetch_mask) - 1;
++      uint base = 0;
++      if (lane == leader) {
++        base = atomicAdd(&sssdf_counters[0], uint(__popc(fetch_mask)));
++      }
++      base = __shfl_sync(warp_mask, base, leader);
++      if (idle) {
++        const uint next = base + __popc(fetch_mask & ((1u << lane) - 1));
++        exhausted = next >= uint(work_size);
++        if (!exhausted) {
++          state = path_index_array ? path_index_array[int(next)] : int(next);
++          if (!(INTEGRATOR_STATE(state, path, flag) & PATH_RAY_SUBSURFACE_RANDOM_WALK)) {
++            status = 2;
++            finish_lane(state);
++          }
++          else {
++            path_state_rng_load(state, &w.rng_state);
++            if (!sss_walk_begin(nullptr, state, w)) {
++              status = 0;
++              finish_lane(state);
++            }
++            else {
++              status = 1;
++              active = true;
++              ray_active = start_ray();
++            }
++          }
++        }
++      }
++    }
++    if (!__any_sync(warp_mask, active)) {
++      if (__all_sync(warp_mask, exhausted)) {
++        break;
++      }
++      continue;
++    }
++    while (true) {
++      /* Phase 1: converged BVH leaf steps. */
++      while (true) {
++        if (ray_active) {
++          if (bvh_local_fast_step(nullptr,
++                                  tr,
++                                  stack
++#      ifdef __OBJECT_MOTION__
++                                  ,
++                                  w.ray_time
++#      endif
++                                  ))
++          {
++            ray_active = false;
++          }
++        }
++        const uint tracing = __ballot_sync(warp_mask, ray_active);
++        if (!tracing) {
++          break;
++        }
++        if (__popc(tracing) < CYCLES_SSS_STEP_MINTRACE &&
++            __any_sync(warp_mask, active && !ray_active))
++        {
++          break;
++        }
++      }
++      /* Phase 2: converged walk math for lanes whose ray finished. */
++      if (active && !ray_active) {
++        if (tr.hit) {
++          w.isect = tr.isect;
++        }
++        if (sss_walk_post_ray(nullptr, state, w, ctx, tr.hit)) {
++          pending = true;
++          active = false;
++        }
++        else {
++          ray_active = start_ray();
++        }
++      }
++      const uint live = __ballot_sync(warp_mask, active);
++      if (!live) {
++        break;
++      }
++      if (__popc(live) < CYCLES_BVH2DF_MINLIVE && !__all_sync(warp_mask, exhausted || active)) {
++        break;
++      }
++    }
++  }
++}
++#    endif /* CYCLES_SSS_STEP_BVH */
++#  endif   /* CYCLES_SSS_LOCAL_FIX */
++
+ ccl_device_forceinline void integrator_intersect_subsurface_df(
+     const ccl_global int *path_index_array, const int work_size)
+ {
++#  if defined(CYCLES_SSS_LOCAL_FIX) && defined(CYCLES_SSS_STEP_BVH)
++  integrator_intersect_subsurface_df_stepbvh(path_index_array, work_size);
++#  elif defined(CYCLES_SSS_LOCAL_FIX)
++  IntersectSubsurfaceFastWork work;
++  work.path_index_array = path_index_array;
++  bvh2df_run_work(work, &sssdf_counters[0], work_size);
++#  else
+   IntersectSubsurfaceDFWork work;
+   work.path_index_array = path_index_array;
+   bvh2df_run_work(work, &sssdf_counters[0], work_size);
++#  endif
+   __syncthreads();
+   if (threadIdx.x == 0) {
+     __threadfence();
+diff --git a/intern/cycles/kernel/integrator/nrc_types.h b/intern/cycles/kernel/integrator/nrc_types.h
+index c4def79..ff7065b 100644
+--- a/intern/cycles/kernel/integrator/nrc_types.h
++++ b/intern/cycles/kernel/integrator/nrc_types.h
+@@ -71,7 +71,8 @@ struct KernelNRC {
+   int budget_feature; /* 1: features 14, 15 = remaining diffuse / glossy bounces (min with total) / 8 */
+   int train_match;    /* 1: a training path stashes only the vertex where a normal path would have ended */
+   int train_weight;   /* 1: write each record floor(mean(T) / tau + u) times (throughput-weighted regression) */
+-  int pad[2];
++  int diffuse_only;   /* nrc-bake: 1 = a path may end only after a diffuse bounce (label & LABEL_DIFFUSE) */
++  int pad[1];
+ 
+   /* Device arrays. */
+   ccl_global NRCControl *ctrl;
+diff --git a/intern/cycles/kernel/integrator/shade_background.h b/intern/cycles/kernel/integrator/shade_background.h
+index 66df298..02b2400 100644
+--- a/intern/cycles/kernel/integrator/shade_background.h
++++ b/intern/cycles/kernel/integrator/shade_background.h
+@@ -253,11 +253,15 @@ ccl_device void integrator_shade_background(KernelGlobals kg,
+   PROFILING_INIT(kg, PROFILING_SHADE_LIGHT_SETUP);
+ 
+   /* TODO: unify these in a single loop to only have a single shader evaluation call. */
++#if defined(CYCLES_EMIT_BAKE) && defined(CYCLES_EMIT_BAKE_NO_SUN)
++  ShaderEvalResult result = SHADER_EVAL_OK;
++#else
+   ShaderEvalResult result = integrate_sun_lights(kg, state, render_buffer);
+   if (result == SHADER_EVAL_CACHE_MISS) {
+     integrator_path_cache_miss(state, DEVICE_KERNEL_INTEGRATOR_SHADE_BACKGROUND);
+     return;
+   }
++#endif
+   result = integrate_background(kg, state, render_buffer);
+   if (result == SHADER_EVAL_CACHE_MISS) {
+     integrator_path_cache_miss(state, DEVICE_KERNEL_INTEGRATOR_SHADE_BACKGROUND);
+diff --git a/intern/cycles/kernel/integrator/shade_light.h b/intern/cycles/kernel/integrator/shade_light.h
+index 11710cd..6b07df7 100644
+--- a/intern/cycles/kernel/integrator/shade_light.h
++++ b/intern/cycles/kernel/integrator/shade_light.h
+@@ -171,70 +171,84 @@ ccl_device ShaderEvalResult integrate_light_nee(KernelGlobals kg, IntegratorShad
+   float3 eval = zero_spectrum();
+   bool is_background = false;
+ 
+-  /* Setup shader data */
+-  ShaderDataCausticsStorage emission_sd_storage;
+-  ccl_private ShaderData *emission_sd = AS_SHADER_DATA(&emission_sd_storage);
+-
+-  PROFILING_INIT_FOR_SHADER(kg, PROFILING_SHADE_LIGHT_SETUP);
+-  if (isect.type == PRIMITIVE_LAMP) {
+-    /* Lights. */
+-    const ccl_global KernelLight *klight = &kernel_data_fetch(lights, isect.prim);
+-    const LightType light_type = LightType(klight->type);
+-
+-    if (light_type == LIGHT_BACKGROUND) {
+-      /* Background light. */
++#if defined(CYCLES_EMIT_BAKE) && defined(CYCLES_EMIT_BAKE_NEE_KERNEL)
++  bool baked_hit = false;
++  if (isect.type & PRIMITIVE_TRIANGLE) {
++    const int tri_sh = kernel_data_fetch(tri_shader, isect.prim);
++    const int off = emit_bake_shader_surface_offset(kg, tri_sh);
++    if (off >= 0) {
++      baked_hit = emit_bake_eval_pbr_emissive_tex(
++          kg, off, isect.object, isect.prim, isect.u, isect.v, eval);
++    }
++  }
++  if (!baked_hit)
++#endif
++  {
++    /* Setup shader data */
++    ShaderDataCausticsStorage emission_sd_storage;
++    ccl_private ShaderData *emission_sd = AS_SHADER_DATA(&emission_sd_storage);
++
++    PROFILING_INIT_FOR_SHADER(kg, PROFILING_SHADE_LIGHT_SETUP);
++    if (isect.type == PRIMITIVE_LAMP) {
++      /* Lights. */
++      const ccl_global KernelLight *klight = &kernel_data_fetch(lights, isect.prim);
++      const LightType light_type = LightType(klight->type);
++
++      if (light_type == LIGHT_BACKGROUND) {
++        /* Background light. */
+ #ifdef __RAY_DIFFERENTIALS__
+-      const float ray_dD = background_light_clamp_dD(kg, ray.dD);
++        const float ray_dD = background_light_clamp_dD(kg, ray.dD);
+ #else
+-      const float ray_dD = 0.0f;
++        const float ray_dD = 0.0f;
+ #endif
+-      shader_setup_from_background(kg, emission_sd, ray.P, ray.D, ray_dD, ray.time);
+-      is_background = true;
++        shader_setup_from_background(kg, emission_sd, ray.P, ray.D, ray_dD, ray.time);
++        is_background = true;
++      }
++      else {
++        /* Other light types.
++         * Compute Ng and UV on demand so we don't have to store it in integrator state. */
++        const float3 P = (ray.tmax == FLT_MAX) ? -ray.D : ray.P + ray.tmax * ray.D;
++        float3 Ng = zero_float3();
++        float2 uv = zero_float2();
++        light_normal_uv_from_position(kg, klight, P, ray.D, Ng, uv);
++
++        shader_setup_from_sample(kg,
++                                 emission_sd,
++                                 P,
++                                 Ng,
++                                 -ray.D,
++                                 klight->shader_id,
++                                 isect.object,
++                                 isect.prim,
++                                 uv.x,
++                                 uv.y,
++                                 ray.tmax,
++                                 ray.time,
++                                 false,
++                                 true);
++      }
+     }
+     else {
+-      /* Other light types.
+-       * Compute Ng and UV on demand so we don't have to store it in integrator state. */
+-      const float3 P = (ray.tmax == FLT_MAX) ? -ray.D : ray.P + ray.tmax * ray.D;
+-      float3 Ng = zero_float3();
+-      float2 uv = zero_float2();
+-      light_normal_uv_from_position(kg, klight, P, ray.D, Ng, uv);
+-
+-      shader_setup_from_sample(kg,
+-                               emission_sd,
+-                               P,
+-                               Ng,
+-                               -ray.D,
+-                               klight->shader_id,
+-                               isect.object,
+-                               isect.prim,
+-                               uv.x,
+-                               uv.y,
+-                               ray.tmax,
+-                               ray.time,
+-                               false,
+-                               true);
++      shader_setup_from_ray(kg, emission_sd, &ray, &isect);
+     }
+-  }
+-  else {
+-    shader_setup_from_ray(kg, emission_sd, &ray, &isect);
+-  }
+ 
+-  /* Evaluate shader. */
+-  PROFILING_SHADER(emission_sd->object, emission_sd->shader);
+-  PROFILING_EVENT(PROFILING_SHADE_LIGHT_EVAL);
++    /* Evaluate shader. */
++    PROFILING_SHADER(emission_sd->object, emission_sd->shader);
++    PROFILING_EVENT(PROFILING_SHADE_LIGHT_EVAL);
+ 
+-  /* No proper path flag, we're evaluating this for all closures. that's
+-   * weak but we'd have to do multiple evaluations otherwise. */
+-  surface_shader_eval<KERNEL_FEATURE_NODE_MASK_SURFACE_LIGHT>(
+-      kg, state, emission_sd, nullptr, PATH_RAY_VISIBILITY_NONE, PATH_RAY_EMISSION);
++    /* No proper path flag, we're evaluating this for all closures. that's
++     * weak but we'd have to do multiple evaluations otherwise. */
++    surface_shader_eval<KERNEL_FEATURE_NODE_MASK_SURFACE_LIGHT>(
++        kg, state, emission_sd, nullptr, PATH_RAY_VISIBILITY_NONE, PATH_RAY_EMISSION);
+ 
+-  if (emission_sd->runtime_flag & SR_CACHE_MISS) {
+-    return SHADER_EVAL_CACHE_MISS;
+-  }
++    if (emission_sd->runtime_flag & SR_CACHE_MISS) {
++      return SHADER_EVAL_CACHE_MISS;
++    }
+ 
+-  /* Evaluate emission closures. */
+-  eval = (is_background) ? surface_shader_background(emission_sd) :
+-                           surface_shader_emission(emission_sd);
++    /* Evaluate emission closures. */
++    eval = (is_background) ? surface_shader_background(emission_sd) :
++                             surface_shader_emission(emission_sd);
++  }
+ 
+   /* Probabilistic light termination.
+    * Light threshold is only used without light tree. */
+diff --git a/intern/cycles/kernel/integrator/shade_surface.h b/intern/cycles/kernel/integrator/shade_surface.h
+index 936efb0..4ad341d 100644
+--- a/intern/cycles/kernel/integrator/shade_surface.h
++++ b/intern/cycles/kernel/integrator/shade_surface.h
+@@ -592,8 +592,16 @@ ccl_device
+ 
+   /* Evaluate constant part of light shader, rest will optionally be done in another kernel. */
+   Spectrum light_shader_eval ccl_optional_struct_init;
++#ifdef CYCLES_EMIT_BAKE
++  const bool is_constant_light_shader = light_sample_shader_eval_nee_baked(
++      kg, ls, light_shader_eval);
++  if (is_constant_light_shader && is_zero(light_shader_eval)) {
++    return SHADER_EVAL_EMPTY;
++  }
++#else
+   const bool is_constant_light_shader = light_sample_shader_eval_nee_constant(
+       kg, ls.shader, ls.prim, ls.type != LIGHT_TRIANGLE, light_shader_eval);
++#endif
+ 
+   /* Evaluate BSDF. */
+   BsdfEval bsdf_eval ccl_optional_struct_init;
+@@ -1080,8 +1088,14 @@ ccl_device_noinline void nrc_write_features(ConstIntegratorState state,
+     const int rt = kernel_data.integrator.max_bounce - INTEGRATOR_STATE(state, path, bounce);
+     const int rd = kernel_data.integrator.max_diffuse_bounce -
+                    INTEGRATOR_STATE(state, path, diffuse_bounce);
++    /* Ours (bakeH, analysis/v53_bakeH.md): a cache baked under other bounce limits (bhotB: glossy 6 / 6 / 3) gets
++     * its own glossy budget at compile time, so approxH's glossy <= 2 does not shift feature 15 of every query. */
++#  ifdef CYCLES_NRC_BUDGET_GLOSSY_MAX
++    const int rg = (CYCLES_NRC_BUDGET_GLOSSY_MAX) - INTEGRATOR_STATE(state, path, glossy_bounce);
++#  else
+     const int rg = kernel_data.integrator.max_glossy_bounce -
+                    INTEGRATOR_STATE(state, path, glossy_bounce);
++#  endif
+     bd = float(clamp(min(rt, rd), 0, 8)) * 0.125f;
+     bg = float(clamp(min(rt, rg), 0, 8)) * 0.125f;
+   }
+@@ -1259,6 +1273,7 @@ ccl_device_noinline bool nrc_after_bounce(IntegratorState state,
+   /* Would a normal path end here (warm-up flag and buffer space aside)? */
+   const bool end_here = k >= kernel_nrc.min_bounce &&
+                         !(kernel_nrc.skip_singular && (label & LABEL_SINGULAR)) && spread_ok &&
++                        !(kernel_nrc.diffuse_only && !(label & LABEL_DIFFUSE)) &&
+                         !(INTEGRATOR_STATE(state, path, flag) & PATH_RAY_SHADOW_CATCHER_PASS);
+   const int slot = kernel_nrc.main_slot[state];
+   if (slot >= 0) {
+diff --git a/intern/cycles/kernel/integrator/subsurface_walk_steps.h b/intern/cycles/kernel/integrator/subsurface_walk_steps.h
+index 3743ac4..5d530d9 100644
+--- a/intern/cycles/kernel/integrator/subsurface_walk_steps.h
++++ b/intern/cycles/kernel/integrator/subsurface_walk_steps.h
+@@ -21,8 +21,332 @@
+ #    error "subsurface_walk_steps.h mirrors 5.3.0 with SUBSURFACE_RANDOM_WALK_SIMILARITY_LEVEL set"
+ #  endif
+ 
++#  ifdef CYCLES_SSS_LOCAL_FIX
++#    include "kernel/bvh/bvh_local_fast.h"
++#  endif
++
+ CCL_NAMESPACE_BEGIN
+ 
++#  ifdef CYCLES_SSS_LOCAL_FIX
++
++struct SSSWalk {
++  float3 ray_P, ray_D;
++  float ray_tmax;
++  int self_prim;
++#    ifdef __OBJECT_MOTION__
++  float ray_time;
++#    endif
++  Intersection isect;
++  RNGState rng_state;
++  /* Walk constants (no dead LocalIntersection[4]/Ng, albedo, D, or *_star). */
++  float3 P, N;
++  int object, object_node, position_offset;
++  uint object_flag;
++  Spectrum alpha, sigma_t, sigma_s;
++  float anisotropy, guided_fraction, diffusion_length, phase_log;
++  /* Loop-carried. */
++  Spectrum throughput;
++  float opposite_distance;
++  int bounce;
++  bool hit, have_opposite_interface;
++};
++
++struct SSSWalkStepCtx {
++  Spectrum channel_pdf;
++  float t;
++  float backward_fraction;
++  float forward_pdf_factor;
++  float backward_pdf_factor;
++  float forward_stretching;
++  float backward_stretching;
++};
++
++/* rng_state must hold path_state_rng_load(state) on entry, as subsurface_scatter passes it. */
++ccl_device_forceinline bool sss_walk_begin(KernelGlobals kg, IntegratorState state, SSSWalk &w)
++{
++  RNGState &rng_state = w.rng_state;
++
++  w.P = INTEGRATOR_STATE(state, ray, P);
++  const float3 D = INTEGRATOR_STATE(state, ray, D);
++#    ifdef __OBJECT_MOTION__
++  w.ray_time = INTEGRATOR_STATE(state, ray, time);
++#    endif
++  w.N = INTEGRATOR_STATE(state, subsurface, N);
++  w.object = INTEGRATOR_STATE(state, isect, object);
++  w.self_prim = INTEGRATOR_STATE(state, isect, prim);
++
++  w.ray_P = w.P;
++  w.ray_D = D;
++  w.ray_tmax = FLT_MAX;
++
++  /* Convert subsurface to volume coefficients. */
++  const Spectrum albedo = INTEGRATOR_STATE(state, subsurface, albedo);
++  const Spectrum radius = INTEGRATOR_STATE(state, subsurface, radius);
++  float anisotropy = INTEGRATOR_STATE(state, subsurface, anisotropy);
++
++  bool van_de_hulst;
++  if (anisotropy >= 1.0f) {
++    anisotropy -= 2.0f;
++    van_de_hulst = anisotropy < 0.0f;
++  }
++  else {
++    van_de_hulst = true;
++  }
++
++  Spectrum sigma_t;
++  Spectrum alpha;
++  Spectrum throughput = INTEGRATOR_STATE(state, path, throughput);
++  subsurface_random_walk_coefficients(
++      albedo, radius, anisotropy, van_de_hulst, &sigma_t, &alpha, &throughput);
++  const Spectrum sigma_s = sigma_t * alpha;
++
++  const float diffusion_length = diffusion_length_dwivedi(reduce_max(alpha));
++
++  if (diffusion_length == 1.0f) {
++    return false;
++  }
++
++  w.phase_log = logf((diffusion_length + 1.0f) / (diffusion_length - 1.0f));
++  path_state_rng_scramble(&rng_state, 0xdeadbeef);
++
++  w.hit = false;
++  w.have_opposite_interface = false;
++  w.opposite_distance = 0.0f;
++
++  const float guided_fraction = 1.0f - fmaxf(0.5f, powf(fabsf(anisotropy), 0.125f));
++
++  w.sigma_t = sigma_t;
++  w.sigma_s = sigma_s;
++  w.anisotropy = anisotropy;
++  w.guided_fraction = guided_fraction;
++
++  w.alpha = alpha;
++  w.throughput = throughput;
++  w.diffusion_length = diffusion_length;
++  w.bounce = 0;
++
++#    ifdef CYCLES_SSS_LOCAL_BVH4
++  w.object_node = cycles_bvh4.object_root[w.object];
++#    else
++  w.object_node = kernel_data_fetch(object_node, w.object);
++#    endif
++  w.object_flag = kernel_data_fetch(object_flag, w.object);
++  w.position_offset = kernel_data_fetch(objects, w.object).position_offset;
++  return true;
++}
++
++/* Prepare the ray for bounce w.bounce before local BVH intersection. */
++ccl_device_forceinline void sss_walk_prep_ray(KernelGlobals kg, SSSWalk &w, SSSWalkStepCtx &ctx)
++{
++  RNGState &rng_state = w.rng_state;
++  const int bounce = w.bounce;
++  const float3 P = w.P;
++  const float3 N = w.N;
++  const float diffusion_length = w.diffusion_length;
++  const float phase_log = w.phase_log;
++
++  rng_state.rng_offset += PRNG_BOUNCE_NUM;
++
++  float anisotropy = w.anisotropy;
++  float guided_fraction = w.guided_fraction;
++  Spectrum sigma_t = w.sigma_t;
++  if (bounce > SUBSURFACE_RANDOM_WALK_SIMILARITY_LEVEL) {
++    anisotropy = 0.0f;
++    guided_fraction = 0.75f;
++    const Spectrum sigma_s_star = w.sigma_s * (1.0f - w.anisotropy);
++    sigma_t = w.sigma_t - w.sigma_s + sigma_s_star;
++  }
++
++  float rchannel = path_state_rng_1D(kg, &rng_state, PRNG_SUBSURFACE_COLOR_CHANNEL);
++  const int channel = volume_sample_channel(w.alpha, w.throughput, &rchannel, &ctx.channel_pdf);
++  float sample_sigma_t = volume_channel_get(sigma_t, channel);
++  const float randt = path_state_rng_1D(kg, &rng_state, PRNG_SUBSURFACE_SCATTER_DISTANCE);
++
++  ctx.backward_fraction = 0.0f;
++  ctx.forward_pdf_factor = 0.0f;
++  ctx.forward_stretching = 1.0f;
++  ctx.backward_pdf_factor = 0.0f;
++  ctx.backward_stretching = 1.0f;
++
++  if (bounce > 0) {
++    const bool guided = (path_state_rng_1D(kg, &rng_state, PRNG_SUBSURFACE_GUIDE_STRATEGY) <
++                         guided_fraction);
++
++    bool guide_backward = false;
++    if (w.have_opposite_interface) {
++      const float x = clamp(dot(w.ray_P - P, -N), 0.0f, w.opposite_distance);
++      ctx.backward_fraction = 1.0f /
++                              (1.0f + expf((w.opposite_distance - 2.0f * x) / diffusion_length));
++      guide_backward = path_state_rng_1D(kg, &rng_state, PRNG_SUBSURFACE_GUIDE_DIRECTION) <
++                       ctx.backward_fraction;
++    }
++
++    const float2 rand_scatter = path_state_rng_2D(kg, &rng_state, PRNG_SUBSURFACE_BSDF);
++    float cos_theta;
++    float hg_pdf;
++    if (guided) {
++      cos_theta = sample_phase_dwivedi(diffusion_length, phase_log, rand_scatter.x);
++      if (guide_backward) {
++        cos_theta = -cos_theta;
++      }
++      const float3 newD = direction_from_cosine(N, cos_theta, rand_scatter.y);
++      hg_pdf = phase_henyey_greenstein(dot(w.ray_D, newD), anisotropy);
++      w.ray_D = newD;
++    }
++    else {
++      const float3 newD = phase_henyey_greenstein_sample(
++          w.ray_D, anisotropy, rand_scatter, &hg_pdf);
++      cos_theta = dot(newD, N);
++      w.ray_D = newD;
++    }
++
++    ctx.forward_pdf_factor = M_1_2PI_F * eval_phase_dwivedi(diffusion_length, phase_log, cos_theta) /
++                             hg_pdf;
++    ctx.backward_pdf_factor = M_1_2PI_F *
++                              eval_phase_dwivedi(diffusion_length, phase_log, -cos_theta) / hg_pdf;
++
++    ctx.forward_stretching = (1.0f - cos_theta / diffusion_length);
++    ctx.backward_stretching = (1.0f + cos_theta / diffusion_length);
++    if (guided) {
++      sample_sigma_t *= guide_backward ? ctx.backward_stretching : ctx.forward_stretching;
++    }
++  }
++
++  const float t = -logf(1.0f - randt) / sample_sigma_t;
++  ctx.t = t;
++
++  if (bounce == 0) {
++    w.ray_tmax = max(t, 10.0f / (reduce_min(sigma_t)));
++  }
++  else {
++    w.ray_tmax = t;
++    w.self_prim = PRIM_NONE;
++  }
++}
++
++/* Complete bounce w.bounce after local BVH intersection; true when the walk loop has ended. */
++ccl_device_forceinline bool sss_walk_post_ray(
++    KernelGlobals kg, IntegratorState state, SSSWalk &w, const SSSWalkStepCtx &ctx, const bool ray_hit)
++{
++  const int bounce = w.bounce;
++  float guided_fraction = w.guided_fraction;
++  Spectrum sigma_t = w.sigma_t;
++  Spectrum sigma_s = w.sigma_s;
++  if (bounce > SUBSURFACE_RANDOM_WALK_SIMILARITY_LEVEL) {
++    guided_fraction = 0.75f;
++    sigma_s = w.sigma_s * (1.0f - w.anisotropy);
++    sigma_t = w.sigma_t - w.sigma_s + sigma_s;
++  }
++
++  bool hit = ray_hit;
++  if (hit) {
++    w.ray_tmax = w.isect.t;
++  }
++
++  if (bounce == 0) {
++    if (hit) {
++      w.have_opposite_interface = true;
++      w.opposite_distance = dot(w.ray_P + w.ray_tmax * w.ray_D - w.P, -w.N);
++    }
++    hit = w.ray_tmax < ctx.t;
++  }
++
++  const float t = hit ? w.ray_tmax : ctx.t;
++  w.ray_P += t * w.ray_D;
++
++  Spectrum transmittance;
++  Spectrum pdf = subsurface_random_walk_pdf(sigma_t, t, hit, &transmittance);
++  if (bounce > 0) {
++    Spectrum guided_pdf = subsurface_random_walk_pdf(
++        ctx.forward_stretching * sigma_t, t, hit, nullptr);
++
++    if (w.have_opposite_interface) {
++      const Spectrum back_pdf = subsurface_random_walk_pdf(
++          ctx.backward_stretching * sigma_t, t, hit, nullptr);
++      guided_pdf = mix(guided_pdf * ctx.forward_pdf_factor,
++                       back_pdf * ctx.backward_pdf_factor,
++                       ctx.backward_fraction);
++    }
++    else {
++      guided_pdf *= ctx.forward_pdf_factor;
++    }
++
++    pdf = mix(pdf, guided_pdf, guided_fraction);
++  }
++
++  w.throughput *= (hit ? transmittance : sigma_s * transmittance) / dot(ctx.channel_pdf, pdf);
++  w.hit = hit;
++
++  if (hit) {
++    return true;
++  }
++  if (reduce_max(w.throughput) < VOLUME_THROUGHPUT_EPSILON) {
++    return true;
++  }
++#    if defined(CYCLES_SSS_WALK_RR_Q)
++#      if defined(CYCLES_SSS_WALK_RR_QI)
++  const bool sss_indirect = INTEGRATOR_STATE(state, path, bounce) > 0;
++  const int sss_k0 = sss_indirect ? CYCLES_SSS_WALK_RR_K0I : CYCLES_SSS_WALK_RR_K0;
++  if (bounce + 1 >= sss_k0) {
++    const float q = float(sss_indirect ? CYCLES_SSS_WALK_RR_QI : CYCLES_SSS_WALK_RR_Q) * 0.001f;
++    const float u = hash_uint4_to_float(
++        w.rng_state.rng_pixel, uint(w.rng_state.sample), w.rng_state.rng_offset, uint(bounce) ^ 0x5bd1e995u);
++    if (u >= q) {
++      return true;
++    }
++    w.throughput /= q;
++  }
++#      else
++  if (bounce + 1 >= CYCLES_SSS_WALK_RR_K0) {
++    const float q = float(CYCLES_SSS_WALK_RR_Q) * 0.001f;
++    const float u = hash_uint4_to_float(
++        w.rng_state.rng_pixel, uint(w.rng_state.sample), w.rng_state.rng_offset, uint(bounce) ^ 0x5bd1e995u);
++    if (u >= q) {
++      return true;
++    }
++    w.throughput /= q;
++  }
++#      endif
++#    endif
++  w.bounce = bounce + 1;
++#    if defined(CYCLES_SSS_STEP_CAP)
++  return w.bounce >= min(CYCLES_SSS_STEP_CAP, BSSRDF_MAX_BOUNCES);
++#    else
++  return w.bounce >= BSSRDF_MAX_BOUNCES;
++#    endif
++}
++
++ccl_device_forceinline bool sss_walk_step(KernelGlobals kg, IntegratorState state, SSSWalk &w)
++{
++  SSSWalkStepCtx ctx;
++  sss_walk_prep_ray(kg, w, ctx);
++  const bool ray_hit = bvh_intersect_local_single(kg,
++                                                  w.ray_P,
++                                                  w.ray_D,
++                                                  w.ray_tmax,
++                                                  w.object,
++                                                  w.object_node,
++                                                  w.object_flag,
++                                                  w.position_offset,
++                                                  w.self_prim,
++#    ifdef __OBJECT_MOTION__
++                                                  w.ray_time,
++#    endif
++                                                  &w.isect);
++  return sss_walk_post_ray(kg, state, w, ctx, ray_hit);
++}
++
++ccl_device_forceinline bool sss_walk_end(KernelGlobals kg, IntegratorState state, SSSWalk &w)
++{
++  if (w.hit) {
++    kernel_assert(isfinite_safe(w.throughput));
++    INTEGRATOR_STATE_WRITE(state, path, throughput) = w.throughput;
++  }
++  return w.hit;
++}
++
++#  else /* !CYCLES_SSS_LOCAL_FIX */
++
+ struct SSSWalk {
+   Ray ray;
+   /* subsurface_scatter's ss_isect, as stock carries it through the walk. A local per bounce
+@@ -343,6 +667,8 @@ ccl_device_forceinline bool sss_walk_end(KernelGlobals kg, IntegratorState state
+   return w.hit;
+ }
+ 
++#  endif /* CYCLES_SSS_LOCAL_FIX */
++
+ CCL_NAMESPACE_END
+ 
+ #endif /* __SUBSURFACE__ */
+diff --git a/intern/cycles/kernel/light/common.h b/intern/cycles/kernel/light/common.h
+index c327f20..ca514ef 100644
+--- a/intern/cycles/kernel/light/common.h
++++ b/intern/cycles/kernel/light/common.h
+@@ -28,6 +28,10 @@ struct LightSample {
+   int group;           /* lightgroup */
+   LightType type;      /* type of light */
+   int emitter_id;      /* index in the emitter array */
++#ifdef CYCLES_EMIT_BAKE
++  float tri_u;
++  float tri_v;
++#endif
+ };
+ 
+ /* Result of evaluating a light from an intersection. */
+diff --git a/intern/cycles/kernel/light/emit_bake.h b/intern/cycles/kernel/light/emit_bake.h
+new file mode 100644
+index 0000000..ba91cee
+--- /dev/null
++++ b/intern/cycles/kernel/light/emit_bake.h
+@@ -0,0 +1,345 @@
++/* SPDX-FileCopyrightText: 2026 Blender Foundation
++ *
++ * SPDX-License-Identifier: Apache-2.0 */
++
++#pragma once
++
++#ifdef CYCLES_EMIT_BAKE
++
++#  include "kernel/geom/attribute.h"
++#  include "kernel/geom/object.h"
++#  include "kernel/geom/triangle.h"
++#  include "kernel/globals.h"
++#  include "kernel/image.h"
++#  include "kernel/light/common.h"
++#  include "kernel/svm/node_types.h"
++#  include "kernel/svm/types.h"
++#  include "kernel/util/colorspace.h"
++#  include "util/color.h"
++
++#  ifdef CYCLES_EMIT_BAKE_SKY_LUT
++#    include "kernel/light/emit_bake_classroom_lut.h"
++#  endif
++
++CCL_NAMESPACE_BEGIN
++
++ccl_device_inline bool emit_bake_input_is_const(const SVMInputFloat in)
++{
++  return (in.bits & 0xFFFFFF00u) != SVM_INPUT_STACK_OFFSET_MASK;
++}
++
++ccl_device_inline float emit_bake_input_float(const SVMInputFloat in)
++{
++  return __uint_as_float(in.bits);
++}
++
++ccl_device_inline bool emit_bake_input_is_const3(const SVMInputFloat3 in)
++{
++  return emit_bake_input_is_const(in.x);
++}
++
++ccl_device_inline float3 emit_bake_input_float3(const SVMInputFloat3 in)
++{
++  return make_float3(__uint_as_float(in.x.bits),
++                     __uint_as_float(in.y.bits),
++                     __uint_as_float(in.z.bits));
++}
++
++ccl_device_inline int emit_bake_shader_surface_offset(KernelGlobals kg, const int shader_id)
++{
++  const int base = (shader_id & SHADER_MASK) * (1 + (int)(sizeof(SVMNodeShaderJump) / sizeof(uint)));
++  if (kernel_data_fetch(svm_nodes, base) != NODE_SHADER_JUMP) {
++    return -1;
++  }
++  return (int)kernel_data_fetch(svm_nodes, base + 1);
++}
++
++/* Exact fast evaluation for distance-only non-constant lamp shaders:
++ *  - Pattern 1: NODE_LIGHT_FALLOFF -> NODE_EMISSION_WEIGHT -> NODE_CLOSURE_EMISSION
++ *               (classroom Point x6, blackBoard_light)
++ *  - Pattern 2: NODE_LIGHT_PATH(ray_length) -> NODE_MATH(DIVIDE) -> NODE_MAP_RANGE(SMOOTHERSTEP)
++ *               -> NODE_CLAMP -> NODE_JUMP_IF_ONE -> NODE_MIX_CLOSURE -> NODE_CLOSURE_SET_WEIGHT
++ *               -> NODE_CLOSURE_EMISSION (monster Area.001..Area.008)
++ * Returns true and writes shader emission (before klight->strength) into eval if matched. */
++ccl_device_noinline bool emit_bake_eval_lamp(KernelGlobals kg,
++                                             const int shader_id,
++                                             const float ray_length,
++                                             ccl_private Spectrum &eval)
++{
++  const int off = emit_bake_shader_surface_offset(kg, shader_id);
++  if (off < 0) {
++    return false;
++  }
++
++  const uint op0 = kernel_data_fetch(svm_nodes, off);
++
++  /* Pattern 1: NODE_LIGHT_FALLOFF (5w) -> NODE_EMISSION_WEIGHT (5w) -> NODE_CLOSURE_EMISSION. */
++  if (op0 == NODE_LIGHT_FALLOFF &&
++      kernel_data_fetch(svm_nodes, off + 5) == NODE_EMISSION_WEIGHT &&
++      kernel_data_fetch(svm_nodes, off + 10) == NODE_CLOSURE_EMISSION)
++  {
++    const ccl_global SVMNodeLightFalloff &lf =
++        *reinterpret_cast<const ccl_global SVMNodeLightFalloff *>(
++            &kernel_data_fetch(svm_nodes, off + 1));
++    const ccl_global SVMNodeEmissionWeight &ew =
++        *reinterpret_cast<const ccl_global SVMNodeEmissionWeight *>(
++            &kernel_data_fetch(svm_nodes, off + 6));
++    if (emit_bake_input_is_const(lf.strength) && emit_bake_input_is_const(lf.smooth) &&
++        emit_bake_input_is_const3(ew.color) && !emit_bake_input_is_const(ew.strength) &&
++        (ew.strength.bits & 0xFFu) == (uint)lf.out_offset)
++    {
++      float s = emit_bake_input_float(lf.strength);
++      if (ray_length != FLT_MAX) {
++        if (lf.falloff_type == NODE_LIGHT_FALLOFF_LINEAR) {
++          s *= ray_length;
++        }
++        else if (lf.falloff_type == NODE_LIGHT_FALLOFF_CONSTANT) {
++          s *= ray_length * ray_length;
++        }
++        const float smooth = emit_bake_input_float(lf.smooth);
++        if (smooth > 0.0f) {
++          const float sq = ray_length * ray_length;
++          s *= sq / (smooth + sq);
++        }
++      }
++      eval = rgb_to_spectrum(emit_bake_input_float3(ew.color) * s);
++      return true;
++    }
++  }
++
++  /* Pattern 2: Monster controlled-falloff Area lights (smootherstep(ray_length / div)). */
++  if (op0 == NODE_LIGHT_PATH && kernel_data_fetch(svm_nodes, off + 3) == NODE_MATH &&
++      kernel_data_fetch(svm_nodes, off + 9) == NODE_MAP_RANGE &&
++      kernel_data_fetch(svm_nodes, off + 30) == NODE_CLOSURE_SET_WEIGHT &&
++      kernel_data_fetch(svm_nodes, off + 34) == NODE_CLOSURE_EMISSION)
++  {
++    const ccl_global SVMNodeMath &mnode = *reinterpret_cast<const ccl_global SVMNodeMath *>(
++        &kernel_data_fetch(svm_nodes, off + 4));
++    const ccl_global SVMNodeMapRange &mr = *reinterpret_cast<const ccl_global SVMNodeMapRange *>(
++        &kernel_data_fetch(svm_nodes, off + 10));
++    if (mnode.math_type == NODE_MATH_DIVIDE && emit_bake_input_is_const(mnode.value2) &&
++        mr.range_type == NODE_MAP_RANGE_SMOOTHERSTEP)
++    {
++      const float div = emit_bake_input_float(mnode.value2);
++      if (div > 0.0f && ray_length >= div) {
++        eval = zero_spectrum();
++        return true;
++      }
++      const float x = fmaxf(safe_divide(ray_length, div), 0.0f);
++      const float fac = x * x * x * (x * (x * 6.0f - 15.0f) + 10.0f);
++      const ccl_global SVMNodeClosureSetWeight &sw =
++          *reinterpret_cast<const ccl_global SVMNodeClosureSetWeight *>(
++              &kernel_data_fetch(svm_nodes, off + 31));
++      eval = rgb_to_spectrum(make_float3(sw.rgb) * (1.0f - fac));
++      return true;
++    }
++  }
++
++  return false;
++}
++
++/* Exact fast evaluation for PBR + UV-mapped Emissive texture mesh (junkshop 5 emissive meshes).
++ * Evaluates only the emissive texture (skipping 4 dead PBR textures + NormalMap + Principled). */
++ccl_device_inline bool emit_bake_eval_pbr_emissive_tex(KernelGlobals kg,
++                                                       const int off,
++                                                       const int object,
++                                                       const int prim,
++                                                       const float tri_u,
++                                                       const float tri_v,
++                                                       ccl_private Spectrum &eval)
++{
++  if (kernel_data_fetch(svm_nodes, off) != NODE_ATTR ||
++      kernel_data_fetch(svm_nodes, off + 109) != NODE_TEX_IMAGE ||
++      kernel_data_fetch(svm_nodes, off + 117) != NODE_EMISSION_WEIGHT ||
++      kernel_data_fetch(svm_nodes, off + 122) != NODE_CLOSURE_EMISSION)
++  {
++    return false;
++  }
++
++  const ccl_global SVMNodeAttr &attr_node = *reinterpret_cast<const ccl_global SVMNodeAttr *>(
++      &kernel_data_fetch(svm_nodes, off + 1));
++  const ccl_global SVMNodeTexImage &tex_node =
++      *reinterpret_cast<const ccl_global SVMNodeTexImage *>(
++          &kernel_data_fetch(svm_nodes, off + 110));
++  const ccl_global SVMNodeEmissionWeight &ew =
++      *reinterpret_cast<const ccl_global SVMNodeEmissionWeight *>(
++          &kernel_data_fetch(svm_nodes, off + 118));
++
++  if (tex_node.projection != NODE_IMAGE_PROJ_FLAT || tex_node.id < 0 ||
++      tex_node.co != attr_node.out_offset || !emit_bake_input_is_const(ew.strength) ||
++      emit_bake_input_is_const3(ew.color) ||
++      (ew.color.x.bits & 0xFFu) != (uint)tex_node.out_offset)
++  {
++    return false;
++  }
++
++  const ccl_global KernelImageTexture &tex = kernel_data_fetch(image_textures, tex_node.id);
++  if (tex.tile_descriptor_offset != KERNEL_TILE_LOAD_NONE ||
++      tex.image_info_id == KERNEL_IMAGE_NONE)
++  {
++    return false;
++  }
++
++  const ccl_global KernelImageInfo &info = kernel_data_fetch(image_info, tex.image_info_id);
++  if (info.interpolation == INTERPOLATION_CUBIC || info.interpolation == INTERPOLATION_SMART) {
++    return false;
++  }
++
++  const AttributeDescriptor desc = find_attribute(kg, object, prim, attr_node.attr);
++  if (desc.offset == ATTR_STD_NOT_FOUND ||
++      !(desc.element & (ATTR_ELEMENT_VERTEX | ATTR_ELEMENT_CORNER)))
++  {
++    return false;
++  }
++
++  int i0, i1, i2;
++  if (desc.element & ATTR_ELEMENT_VERTEX) {
++    const uint3 vi = kernel_data_fetch(tri_vindex, prim);
++    i0 = vi.x;
++    i1 = vi.y;
++    i2 = vi.z;
++  }
++  else {
++    const int tri = prim * 3;
++    i0 = tri + 0;
++    i1 = tri + 1;
++    i2 = tri + 2;
++  }
++
++  const float2 f0 = kernel_data_fetch(attributes_float2, desc.offset + i0);
++  const float2 f1 = kernel_data_fetch(attributes_float2, desc.offset + i1);
++  const float2 f2 = kernel_data_fetch(attributes_float2, desc.offset + i2);
++  const float2 uv = triangle_interpolate(tri_u, tri_v, f0, f1, f2);
++
++  ccl_gpu_image_object_2D tex_obj = (ccl_gpu_image_object_2D)info.data;
++  const int texture_type = info.data_type;
++  float4 r;
++  if (texture_type == IMAGE_DATA_TYPE_FLOAT4 || texture_type == IMAGE_DATA_TYPE_BYTE4 ||
++      texture_type == IMAGE_DATA_TYPE_HALF4 || texture_type == IMAGE_DATA_TYPE_USHORT4)
++  {
++    r = ccl_gpu_image_object_read_2D<float4>(tex_obj, uv.x, uv.y);
++  }
++  else {
++    const float f = ccl_gpu_image_object_read_2D<float>(tex_obj, uv.x, uv.y);
++    r = make_float4(f, f, f, 1.0f);
++  }
++
++  if (r.x <= 0.0f && r.y <= 0.0f && r.z <= 0.0f) {
++    eval = zero_spectrum();
++    return true;
++  }
++
++  const float alpha = r.w;
++  if ((tex_node.flags & NODE_IMAGE_ALPHA_UNASSOCIATE) && alpha != 1.0f && alpha != 0.0f) {
++    r /= alpha;
++    r.w = alpha;
++  }
++  if (tex_node.flags & NODE_IMAGE_COMPRESS_AS_SRGB) {
++    r = color_srgb_to_linear_v4(r);
++  }
++
++  const float strength = emit_bake_input_float(ew.strength);
++  eval = rgb_to_spectrum(make_float3(r.x, r.y, r.z) * strength);
++  return true;
++}
++
++/* Evaluate non-constant triangle mesh emitters inline in shade_surface (NEE). */
++ccl_device_noinline bool emit_bake_eval_mesh_nee(KernelGlobals kg,
++                                                 const ccl_private LightSample &ls,
++                                                 ccl_private Spectrum &eval)
++{
++  const int off = emit_bake_shader_surface_offset(kg, ls.shader);
++  if (off < 0) {
++    return false;
++  }
++
++  const uint op0 = kernel_data_fetch(svm_nodes, off);
++
++  /* Pattern 3: Monster light softboxes (Object -> Mapping(TEXTURE) -> QuadraticSphere -> *mul). */
++  if (op0 == NODE_TEX_COORD && kernel_data_fetch(svm_nodes, off + 3) == NODE_MAPPING &&
++      kernel_data_fetch(svm_nodes, off + 18) == NODE_TEX_GRADIENT &&
++      kernel_data_fetch(svm_nodes, off + 21) == NODE_MATH &&
++      kernel_data_fetch(svm_nodes, off + 27) == NODE_EMISSION_WEIGHT &&
++      kernel_data_fetch(svm_nodes, off + 32) == NODE_CLOSURE_EMISSION)
++  {
++    const ccl_global SVMNodeTexCoord &tc = *reinterpret_cast<const ccl_global SVMNodeTexCoord *>(
++        &kernel_data_fetch(svm_nodes, off + 1));
++    const ccl_global SVMNodeMapping &mp = *reinterpret_cast<const ccl_global SVMNodeMapping *>(
++        &kernel_data_fetch(svm_nodes, off + 4));
++    const ccl_global SVMNodeTexGradient &gr =
++        *reinterpret_cast<const ccl_global SVMNodeTexGradient *>(
++            &kernel_data_fetch(svm_nodes, off + 19));
++    const ccl_global SVMNodeMath &mn = *reinterpret_cast<const ccl_global SVMNodeMath *>(
++        &kernel_data_fetch(svm_nodes, off + 22));
++    const ccl_global SVMNodeEmissionWeight &ew =
++        *reinterpret_cast<const ccl_global SVMNodeEmissionWeight *>(
++            &kernel_data_fetch(svm_nodes, off + 28));
++    const uint object_flag = kernel_data_fetch(object_flag, ls.object);
++    if (tc.texco_type == NODE_TEXCO_OBJECT && mp.mapping_type == NODE_MAPPING_TYPE_TEXTURE &&
++        gr.gradient_type == NODE_BLEND_QUADRATIC_SPHERE && mn.math_type == NODE_MATH_MULTIPLY &&
++        !(object_flag & SD_OBJECT_MOTION) && emit_bake_input_is_const3(mp.location) &&
++        emit_bake_input_is_const3(mp.rotation) && emit_bake_input_is_const3(mp.scale) &&
++        emit_bake_input_is_const(mn.value2) && emit_bake_input_is_const3(ew.color))
++    {
++      const float3 rot = emit_bake_input_float3(mp.rotation);
++      if (is_zero(rot)) {
++        const Transform itfm = object_fetch_transform(kg, ls.object, OBJECT_INVERSE_TRANSFORM);
++        const float3 P_obj = transform_point(&itfm, ls.P);
++        const float3 loc = emit_bake_input_float3(mp.location);
++        const float3 scale = emit_bake_input_float3(mp.scale);
++        const float3 v = safe_divide(P_obj - loc, scale);
++        const float r = fmaxf(0.999999f - len(v), 0.0f);
++        const float fac = saturatef(r * r);
++        const float mul = emit_bake_input_float(mn.value2);
++        eval = rgb_to_spectrum(emit_bake_input_float3(ew.color) * (fac * mul));
++        return true;
++      }
++    }
++  }
++
++#  ifndef CYCLES_EMIT_BAKE_NEE_KERNEL
++  /* Pattern 4: Junkshop PBR + Emissive 2D image texture evaluated inline via 1 tex2D. */
++  if (op0 == NODE_ATTR) {
++    if (emit_bake_eval_pbr_emissive_tex(kg, off, ls.object, ls.prim, ls.tri_u, ls.tri_v, eval)) {
++      return true;
++    }
++  }
++#  endif
++
++#  ifdef CYCLES_EMIT_BAKE_SKY_LUT
++  /* Pattern 5: Classroom dayLight_portal (Backfacing -> Sky -> Curves -> HSV -> *20). */
++  if (op0 == NODE_LIGHT_PATH && kernel_data_fetch(svm_nodes, off + 24) == NODE_TEX_SKY &&
++      kernel_data_fetch(svm_nodes, off + 59) == NODE_CURVES &&
++      kernel_data_fetch(svm_nodes, off + 1096) == NODE_HSV &&
++      kernel_data_fetch(svm_nodes, off + 27) == EMIT_BAKE_CLASSROOM_SKY_SIG_PHI &&
++      kernel_data_fetch(svm_nodes, off + 28) == EMIT_BAKE_CLASSROOM_SKY_SIG_THETA)
++  {
++    const float3 Ng = make_float3(ls.Ng);
++    const float d_dot_n = dot(ls.D, Ng);
++    /* Backfacing = (dot(Ng, -ls.D) < 0) <=> (dot(ls.D, Ng) > 0). Frontfacing is Transparent. */
++    if (d_dot_n <= 0.0f) {
++      eval = zero_spectrum();
++      return true;
++    }
++    const float3 R = ls.D - 2.0f * d_dot_n * Ng;
++    eval = rgb_to_spectrum(emit_bake_classroom_sky_eval(R));
++    return true;
++  }
++#  endif
++
++  return false;
++}
++
++ccl_device_inline bool emit_bake_eval_nee(KernelGlobals kg,
++                                          const ccl_private LightSample &ls,
++                                          ccl_private Spectrum &eval)
++{
++  if (ls.type != LIGHT_TRIANGLE) {
++    return emit_bake_eval_lamp(kg, ls.shader, ls.t, eval);
++  }
++  return emit_bake_eval_mesh_nee(kg, ls, eval);
++}
++
++CCL_NAMESPACE_END
++
++#endif /* CYCLES_EMIT_BAKE */
+diff --git a/intern/cycles/kernel/light/emit_bake_classroom_lut.h b/intern/cycles/kernel/light/emit_bake_classroom_lut.h
+new file mode 100644
+index 0000000..5d6152a
+--- /dev/null
++++ b/intern/cycles/kernel/light/emit_bake_classroom_lut.h
+@@ -0,0 +1,1078 @@
++/* Auto-generated 32x32 2D LUT for classroom dayLight_portal sky emission.
++ * Parameterized by u = sqrt(max(R.z, 0)), v = sqrt(0.5 * (1 - dot(R, sun_dir))). */
++#pragma once
++
++CCL_NAMESPACE_BEGIN
++
++#define EMIT_BAKE_CLASSROOM_SKY_N 32
++#define EMIT_BAKE_CLASSROOM_SUN_X -0.94615382f
++#define EMIT_BAKE_CLASSROOM_SUN_Y 0.06153840f
++#define EMIT_BAKE_CLASSROOM_SUN_Z 0.31781438f
++#define EMIT_BAKE_CLASSROOM_SKY_SIG_PHI 3217080218u
++#define EMIT_BAKE_CLASSROOM_SKY_SIG_THETA 1067428330u
++
++ccl_device_constant float k_emit_bake_classroom_sky_lut[32 * 32 * 3] = {
++  20.297701f, 18.404371f, 16.158882f,
++  19.784687f, 17.938105f, 15.853272f,
++  18.452463f, 16.701962f, 15.030095f,
++  16.640940f, 14.994792f, 13.873058f,
++  14.597275f, 13.102810f, 12.540054f,
++  12.547507f, 11.273519f, 11.175106f,
++  10.715961f, 9.668749f, 9.910531f,
++  9.175200f, 8.326563f, 8.800396f,
++  7.900207f, 7.222833f, 7.846344f,
++  6.985582f, 6.452589f, 7.166128f,
++  6.252456f, 5.838615f, 6.601676f,
++  5.636038f, 5.318504f, 6.103867f,
++  5.113879f, 4.873401f, 5.663229f,
++  4.667002f, 4.488187f, 5.271325f,
++  4.281505f, 4.151913f, 4.921482f,
++  3.947560f, 3.857452f, 4.610207f,
++  3.658184f, 3.600064f, 4.334613f,
++  3.409388f, 3.377631f, 4.094482f,
++  3.199937f, 3.189613f, 3.891397f,
++  3.028828f, 3.036582f, 3.726209f,
++  2.898389f, 2.921148f, 3.604018f,
++  2.810402f, 2.845855f, 3.528105f,
++  2.768138f, 2.814527f, 3.503576f,
++  2.775559f, 2.831393f, 3.535838f,
++  2.836950f, 2.901055f, 3.630484f,
++  2.957041f, 3.028531f, 3.793540f,
++  3.140589f, 3.218795f, 4.030914f,
++  3.392403f, 3.476925f, 4.347321f,
++  3.716937f, 3.807761f, 4.748136f,
++  4.118165f, 4.215684f, 5.236734f,
++  4.599043f, 4.704923f, 5.816554f,
++  5.170191f, 5.295986f, 6.529695f,
++  20.299435f, 18.406382f, 16.161619f,
++  19.786421f, 17.940132f, 15.856019f,
++  18.454229f, 16.704073f, 15.032940f,
++  16.642849f, 14.997070f, 13.876132f,
++  14.599457f, 13.105303f, 12.543470f,
++  12.549955f, 11.276182f, 11.178865f,
++  10.718595f, 9.671567f, 9.914680f,
++  9.178010f, 8.329541f, 8.804850f,
++  7.903214f, 7.225948f, 7.851066f,
++  6.990094f, 6.457168f, 7.172501f,
++  6.257163f, 5.843365f, 6.608361f,
++  5.640913f, 5.323383f, 6.110825f,
++  5.118884f, 4.878397f, 5.670399f,
++  4.672100f, 4.493266f, 5.278645f,
++  4.286667f, 4.157037f, 4.928906f,
++  3.952798f, 3.862645f, 4.617773f,
++  3.663467f, 3.605302f, 4.342262f,
++  3.414705f, 3.382903f, 4.102193f,
++  3.205319f, 3.194944f, 3.899241f,
++  3.034215f, 3.041914f, 3.734058f,
++  2.903776f, 2.926487f, 3.611867f,
++  2.815823f, 2.851219f, 3.536011f,
++  2.773559f, 2.819891f, 3.511482f,
++  2.780980f, 2.836757f, 3.543745f,
++  2.842346f, 2.906396f, 3.638333f,
++  2.962427f, 3.033868f, 3.801384f,
++  3.145918f, 3.224069f, 4.038626f,
++  3.397703f, 3.482170f, 4.354969f,
++  3.722173f, 3.812946f, 4.755657f,
++  4.123303f, 4.220775f, 5.244054f,
++  4.604065f, 4.709902f, 5.823638f,
++  5.175022f, 5.300766f, 6.536380f,
++  20.387087f, 18.507925f, 16.300037f,
++  19.874088f, 18.042803f, 15.995028f,
++  18.543283f, 16.810860f, 15.176768f,
++  16.739056f, 15.112367f, 14.031625f,
++  14.709922f, 13.231541f, 12.715531f,
++  12.673958f, 11.411311f, 11.368649f,
++  10.851972f, 9.814482f, 10.121019f,
++  9.320383f, 8.479692f, 9.027730f,
++  8.080523f, 7.408516f, 8.115259f,
++  7.216975f, 6.687504f, 7.491949f,
++  6.493915f, 6.081804f, 6.942975f,
++  5.885840f, 5.568727f, 6.458249f,
++  5.369768f, 5.128870f, 6.027913f,
++  4.928452f, 4.748281f, 5.645082f,
++  4.547399f, 4.416009f, 5.303281f,
++  4.216590f, 4.124511f, 4.997648f,
++  3.930005f, 3.869846f, 4.727445f,
++  3.683772f, 3.649456f, 4.491820f,
++  3.475652f, 3.462942f, 4.291403f,
++  3.306242f, 3.311241f, 4.129239f,
++  3.176754f, 3.196808f, 4.009187f,
++  3.089521f, 3.122327f, 3.934806f,
++  3.047479f, 3.091173f, 3.910469f,
++  3.054820f, 3.107918f, 3.942479f,
++  3.115305f, 3.176636f, 4.035191f,
++  3.233991f, 3.302683f, 4.195323f,
++  3.415915f, 3.491335f, 4.428925f,
++  3.665009f, 3.746788f, 4.739939f,
++  3.985974f, 4.074055f, 5.133003f,
++  4.382099f, 4.477048f, 5.611120f,
++  4.856577f, 4.959918f, 6.177955f,
++  5.418750f, 5.542138f, 6.872386f,
++  20.467844f, 18.605093f, 16.433111f,
++  19.955093f, 18.141005f, 16.130789f,
++  18.625992f, 16.913002f, 15.317634f,
++  16.828968f, 15.222887f, 14.182152f,
++  14.814133f, 13.353310f, 12.881874f,
++  12.792332f, 11.543037f, 11.552696f,
++  10.980290f, 9.954116f, 10.321819f,
++  9.458210f, 8.626896f, 9.244793f,
++  8.288526f, 7.624209f, 8.408352f,
++  7.437420f, 6.913243f, 7.803446f,
++  6.724147f, 6.315497f, 7.268398f,
++  6.123998f, 5.808958f, 6.795969f,
++  5.615184f, 5.375268f, 6.377140f,
++  5.179163f, 4.999380f, 6.003600f,
++  4.802660f, 4.671087f, 5.669467f,
++  4.475758f, 4.382864f, 5.370711f,
++  4.192155f, 4.130588f, 5.105446f,
++  3.948178f, 3.912521f, 4.874203f,
++  3.742252f, 3.727745f, 4.677666f,
++  3.574325f, 3.577650f, 4.518510f,
++  3.445880f, 3.463953f, 4.399877f,
++  3.359086f, 3.389800f, 4.326294f,
++  3.317319f, 3.358894f, 4.302563f,
++  3.324326f, 3.375304f, 4.333773f,
++  3.384443f, 3.443685f, 4.425662f,
++  3.502050f, 3.568688f, 4.583422f,
++  3.681795f, 3.755234f, 4.812815f,
++  3.928004f, 4.007937f, 5.117714f,
++  4.244811f, 4.331219f, 5.502606f,
++  4.635891f, 4.729259f, 5.970500f,
++  5.103503f, 5.205642f, 6.523612f,
++  5.656500f, 5.779030f, 7.200038f,
++  20.497999f, 18.667202f, 16.545843f,
++  19.987200f, 18.205105f, 16.245171f,
++  18.663660f, 16.983522f, 15.438537f,
++  16.876671f, 15.303693f, 14.314710f,
++  14.876799f, 13.446759f, 13.029917f,
++  12.871359f, 11.648069f, 11.718855f,
++  11.072652f, 10.069374f, 10.504892f,
++  9.563232f, 8.752186f, 9.445086f,
++  8.477102f, 7.829792f, 8.695723f,
++  7.639065f, 7.129311f, 8.107531f,
++  6.936668f, 6.540063f, 7.587102f,
++  6.346011f, 6.040939f, 7.127457f,
++  5.844636f, 5.612923f, 6.718866f,
++  5.415172f, 5.242219f, 6.354497f,
++  5.044072f, 4.918205f, 6.028338f,
++  4.721672f, 4.633766f, 5.736301f,
++  4.441685f, 4.384741f, 5.476760f,
++  4.201006f, 4.169122f, 5.250467f,
++  3.997465f, 3.986398f, 5.057388f,
++  3.831562f, 3.837772f, 4.901238f,
++  3.704538f, 3.725413f, 4.785073f,
++  3.618746f, 3.652057f, 4.712688f,
++  3.577451f, 3.621387f, 4.689336f,
++  3.584264f, 3.637564f, 4.720022f,
++  3.643493f, 3.705160f, 4.810390f,
++  3.759196f, 3.828440f, 4.964893f,
++  3.936568f, 4.012922f, 5.189986f,
++  4.179204f, 4.262300f, 5.488583f,
++  4.491468f, 4.581609f, 5.865522f,
++  4.875990f, 4.973901f, 6.321968f,
++  5.335619f, 5.442928f, 6.861097f,
++  5.878889f, 6.007411f, 7.520105f,
++  20.366089f, 18.608469f, 16.590929f,
++  19.862665f, 18.151638f, 16.295448f,
++  18.556953f, 16.943604f, 15.500669f,
++  16.789377f, 15.280922f, 14.390380f,
++  14.809196f, 13.442587f, 13.121983f,
++  12.827023f, 11.663264f, 11.830420f,
++  11.052968f, 10.103904f, 10.637941f,
++  9.589250f, 8.827102f, 9.621346f,
++  8.608239f, 8.005087f, 8.976421f,
++  7.786311f, 7.316088f, 8.402672f,
++  7.098721f, 6.737625f, 7.896731f,
++  6.520633f, 6.247608f, 7.449475f,
++  6.030015f, 5.827456f, 7.052140f,
++  5.609536f, 5.462902f, 6.696379f,
++  5.246206f, 5.144444f, 6.378089f,
++  4.930557f, 4.864931f, 6.093224f,
++  4.656407f, 4.619768f, 5.839695f,
++  4.420407f, 4.407512f, 5.617738f,
++  4.220859f, 4.227581f, 5.428953f,
++  4.058353f, 4.081392f, 5.276120f,
++  3.933617f, 3.970497f, 5.161963f,
++  3.849210f, 3.898003f, 5.090733f,
++  3.808526f, 3.867725f, 5.067726f,
++  3.815130f, 3.883632f, 5.097861f,
++  3.873141f, 3.950188f, 5.186506f,
++  3.986812f, 4.071951f, 5.338612f,
++  4.160043f, 4.252949f, 5.557929f,
++  4.397615f, 4.498573f, 5.850686f,
++  4.702914f, 4.812145f, 6.218600f,
++  5.078801f, 5.197432f, 6.663999f,
++  5.527517f, 5.657805f, 7.188997f,
++  6.057461f, 6.211546f, 7.830341f,
++  19.961681f, 18.329279f, 16.512554f,
++  19.474518f, 17.883492f, 16.224627f,
++  18.205425f, 16.700981f, 15.449047f,
++  16.471493f, 15.067054f, 14.358271f,
++  14.517600f, 13.257913f, 13.108590f,
++  12.571450f, 11.513268f, 11.841094f,
++  10.841932f, 9.989615f, 10.677148f,
++  9.589542f, 8.915915f, 9.858931f,
++  8.634731f, 8.112958f, 9.230030f,
++  7.836672f, 7.441071f, 8.672480f,
++  7.169931f, 6.877237f, 8.180790f,
++  6.609646f, 6.399301f, 7.745399f,
++  6.134599f, 5.989803f, 7.358491f,
++  5.727873f, 5.634584f, 7.012589f,
++  5.376082f, 5.323753f, 6.702037f,
++  5.070807f, 5.051108f, 6.424691f,
++  4.805654f, 4.812147f, 6.177629f,
++  4.577214f, 4.604954f, 5.960855f,
++  4.384123f, 4.429321f, 5.776558f,
++  4.226668f, 4.286409f, 5.626877f,
++  4.105837f, 4.178089f, 5.515033f,
++  4.024209f, 4.107415f, 5.445721f,
++  3.984797f, 4.077837f, 5.423264f,
++  3.991055f, 4.093283f, 5.452473f,
++  4.046993f, 4.158139f, 5.538650f,
++  4.156994f, 4.277011f, 5.687291f,
++  4.324642f, 4.453763f, 5.901755f,
++  4.554219f, 4.693441f, 6.187205f,
++  4.849139f, 4.999201f, 6.545617f,
++  5.212068f, 5.374660f, 6.979062f,
++  5.644985f, 5.823044f, 7.489175f,
++  6.156266f, 6.362071f, 8.112422f,
++  19.269804f, 17.794758f, 16.278561f,
++  18.806143f, 17.364994f, 16.002485f,
++  17.587580f, 16.219078f, 15.251143f,
++  15.894595f, 14.624403f, 14.183163f,
++  13.976009f, 12.858714f, 12.954939f,
++  12.085676f, 11.168648f, 11.719389f,
++  10.546139f, 9.823975f, 10.716299f,
++  9.453693f, 8.899915f, 10.034981f,
++  8.534142f, 8.122967f, 9.422768f,
++  7.767211f, 7.473754f, 8.880582f,
++  7.127591f, 6.928940f, 8.402322f,
++  6.591335f, 6.468008f, 7.980005f,
++  6.137554f, 6.073025f, 7.604914f,
++  5.749001f, 5.730506f, 7.269300f,
++  5.413798f, 5.431148f, 6.968809f,
++  5.122468f, 5.167853f, 6.698742f,
++  4.869946f, 4.937753f, 6.459719f,
++  4.652017f, 4.737750f, 6.248867f,
++  4.468086f, 4.568474f, 6.070115f,
++  4.317917f, 4.430496f, 5.924489f,
++  4.202853f, 4.326178f, 5.816145f,
++  4.125000f, 4.257961f, 5.748529f,
++  4.087425f, 4.229399f, 5.726548f,
++  4.093404f, 4.244338f, 5.754849f,
++  4.146775f, 4.307000f, 5.838618f,
++  4.251353f, 4.421469f, 5.982324f,
++  4.411239f, 4.592148f, 6.190727f,
++  4.629965f, 4.823342f, 6.467624f,
++  4.910381f, 5.117768f, 6.813990f,
++  5.255885f, 5.479808f, 7.234131f,
++  5.668319f, 5.912264f, 7.728748f,
++  6.154574f, 6.431632f, 8.331010f,
++  18.358772f, 17.041048f, 15.896234f,
++  17.919931f, 16.629147f, 15.631580f,
++  16.750772f, 15.523567f, 14.904377f,
++  15.097848f, 13.975721f, 13.858878f,
++  13.227103f, 12.269899f, 12.658093f,
++  11.452067f, 10.691044f, 11.500527f,
++  10.234422f, 9.655169f, 10.780225f,
++  9.190063f, 8.768832f, 10.116335f,
++  8.313029f, 8.024622f, 9.521136f,
++  7.583940f, 7.403867f, 8.996042f,
++  6.977592f, 6.883665f, 8.533204f,
++  6.470426f, 6.443408f, 8.124836f,
++  6.042182f, 6.066491f, 7.762177f,
++  5.676005f, 5.739867f, 7.438001f,
++  5.360175f, 5.454530f, 7.147748f,
++  5.086235f, 5.204091f, 6.887890f,
++  4.848621f, 4.984378f, 6.656504f,
++  4.644155f, 4.794464f, 6.454465f,
++  4.471029f, 4.632740f, 6.281085f,
++  4.330156f, 4.501743f, 6.141529f,
++  4.221866f, 4.402146f, 6.036463f,
++  4.148838f, 4.337180f, 5.971212f,
++  4.113571f, 4.309973f, 5.949796f,
++  4.119291f, 4.324303f, 5.977052f,
++  4.169421f, 4.384036f, 6.057539f,
++  4.267700f, 4.493207f, 6.195965f,
++  4.417756f, 4.655727f, 6.396266f,
++  4.623229f, 4.875869f, 6.662283f,
++  4.887062f, 5.156830f, 6.996926f,
++  5.211879f, 5.501821f, 7.401282f,
++  5.599536f, 5.913891f, 7.877278f,
++  6.057504f, 6.410079f, 8.458949f,
++  17.311918f, 16.131514f, 15.391156f,
++  16.892733f, 15.736211f, 15.134824f,
++  15.761019f, 14.669941f, 14.427214f,
++  14.147430f, 13.176888f, 13.404454f,
++  12.346344f, 11.549999f, 12.242030f,
++  10.973879f, 10.364655f, 11.437795f,
++  9.817872f, 9.378502f, 10.735601f,
++  8.827457f, 8.535884f, 10.090598f,
++  7.998153f, 7.829293f, 9.513818f,
++  7.311067f, 7.240909f, 9.006054f,
++  6.742036f, 6.748432f, 8.559732f,
++  6.267301f, 6.332489f, 8.166359f,
++  5.867206f, 5.976439f, 7.817602f,
++  5.525731f, 5.668145f, 7.506334f,
++  5.231640f, 5.398821f, 7.227921f,
++  4.976935f, 5.162685f, 6.978967f,
++  4.755577f, 4.955614f, 6.756879f,
++  4.565689f, 4.776522f, 6.563455f,
++  4.404877f, 4.624531f, 6.398082f,
++  4.273757f, 4.500802f, 6.263624f,
++  4.173693f, 4.407405f, 6.164108f,
++  4.105731f, 4.346162f, 6.101418f,
++  4.072946f, 4.320608f, 6.080806f,
++  4.078331f, 4.334180f, 6.106740f,
++  4.125048f, 4.390496f, 6.183517f,
++  4.216298f, 4.493232f, 6.315052f,
++  4.356225f, 4.646853f, 6.507231f,
++  4.546881f, 4.853991f, 6.760830f,
++  4.792674f, 5.119314f, 7.081333f,
++  5.094692f, 5.444899f, 7.468120f,
++  5.455812f, 5.834125f, 7.924527f,
++  5.883156f, 6.303456f, 8.483149f,
++  16.186398f, 15.122995f, 14.788799f,
++  15.779966f, 14.742826f, 14.539551f,
++  14.676786f, 13.716541f, 13.847485f,
++  13.115711f, 12.291203f, 12.854130f,
++  11.649625f, 11.001595f, 11.980843f,
++  10.425235f, 9.952527f, 11.271825f,
++  9.333172f, 9.020165f, 10.589193f,
++  8.399502f, 8.224360f, 9.963730f,
++  7.620933f, 7.558592f, 9.406693f,
++  6.978537f, 7.004814f, 8.916760f,
++  6.448425f, 6.542187f, 8.487755f,
++  6.007810f, 6.151995f, 8.110621f,
++  5.637013f, 5.818423f, 7.776817f,
++  5.321008f, 5.529687f, 7.479156f,
++  5.049328f, 5.277916f, 7.213483f,
++  4.814071f, 5.057164f, 6.976232f,
++  4.609890f, 4.863568f, 6.764735f,
++  4.434680f, 4.696337f, 6.580704f,
++  4.286705f, 4.554563f, 6.423668f,
++  4.165650f, 4.438857f, 6.295605f,
++  4.073319f, 4.351645f, 6.200800f,
++  4.011051f, 4.294828f, 6.141756f,
++  3.980960f, 4.271053f, 6.122030f,
++  3.986076f, 4.283831f, 6.146589f,
++  4.029016f, 4.336243f, 6.218808f,
++  4.113339f, 4.432320f, 6.343830f,
++  4.242491f, 4.575970f, 6.526103f,
++  4.418740f, 4.769693f, 6.767076f,
++  4.645676f, 5.017973f, 7.071915f,
++  4.925059f, 5.322646f, 7.440339f,
++  5.259158f, 5.687565f, 7.875926f,
++  5.655080f, 6.128105f, 8.409431f,
++  15.018528f, 14.062420f, 14.114858f,
++  14.622312f, 13.697495f, 13.871234f,
++  13.553595f, 12.718768f, 13.198964f,
++  12.195327f, 11.505556f, 12.373513f,
++  10.991795f, 10.471827f, 11.708150f,
++  9.838369f, 9.484177f, 11.017894f,
++  8.810944f, 8.607183f, 10.356234f,
++  7.935763f, 7.859766f, 9.751783f,
++  7.208784f, 7.235603f, 9.214318f,
++  6.612049f, 6.717512f, 8.743435f,
++  6.121292f, 6.285473f, 8.332164f,
++  5.714505f, 5.921607f, 7.971780f,
++  5.373100f, 5.611232f, 7.654179f,
++  5.082517f, 5.342844f, 7.371288f,
++  4.832669f, 5.108586f, 7.118556f,
++  4.616420f, 4.903338f, 6.893288f,
++  4.429182f, 4.723735f, 6.693079f,
++  4.268476f, 4.568596f, 6.519011f,
++  4.132447f, 4.436770f, 6.369988f,
++  4.021801f, 4.329776f, 6.249398f,
++  3.937462f, 4.249137f, 6.160107f,
++  3.880165f, 4.196248f, 6.103727f,
++  3.852670f, 4.174282f, 6.085074f,
++  3.857457f, 4.186199f, 6.108082f,
++  3.897227f, 4.235159f, 6.176666f,
++  3.974629f, 4.324249f, 6.294178f,
++  4.093476f, 4.457719f, 6.466653f,
++  4.255225f, 4.637690f, 6.694101f,
++  4.464015f, 4.868429f, 6.982460f,
++  4.721239f, 5.152306f, 7.332045f,
++  5.029388f, 5.492446f, 7.746335f,
++  5.394869f, 5.903833f, 8.254417f,
++  13.842793f, 12.990392f, 13.395341f,
++  13.461299f, 12.644571f, 13.159995f,
++  12.494508f, 11.775910f, 12.566744f,
++  11.454063f, 10.880645f, 12.013246f,
++  10.323275f, 9.910982f, 11.366056f,
++  9.238764f, 8.984420f, 10.696172f,
++  8.275360f, 8.162480f, 10.056057f,
++  7.458275f, 7.463655f, 9.472827f,
++  6.783907f, 6.881519f, 8.956809f,
++  6.232096f, 6.398999f, 8.505744f,
++  5.780035f, 5.997516f, 8.113064f,
++  5.405832f, 5.659640f, 7.769526f,
++  5.091977f, 5.371486f, 7.466674f,
++  4.825643f, 5.122927f, 7.198542f,
++  4.596887f, 4.906289f, 6.960022f,
++  4.398806f, 4.716331f, 6.746523f,
++  4.227708f, 4.550614f, 6.558517f,
++  4.080558f, 4.407011f, 6.393726f,
++  3.956440f, 4.285552f, 6.253712f,
++  3.855543f, 4.187046f, 6.140916f,
++  3.778052f, 4.112197f, 6.055967f,
++  3.725966f, 4.063587f, 6.003229f,
++  3.701011f, 4.043421f, 5.985688f,
++  3.705500f, 4.054474f, 6.007134f,
++  3.741963f, 4.099728f, 6.071390f,
++  3.813175f, 4.182405f, 6.182460f,
++  3.921549f, 4.305342f, 6.343181f,
++  4.070484f, 4.472254f, 6.558513f,
++  4.261605f, 4.685536f, 6.829468f,
++  4.497865f, 4.948601f, 7.159970f,
++  4.781248f, 5.264380f, 7.552140f,
++  5.118281f, 5.647328f, 8.035266f,
++  12.697634f, 11.944420f, 12.659087f,
++  12.406877f, 11.691840f, 12.504575f,
++  11.699895f, 11.084477f, 12.139595f,
++  10.723358f, 10.247025f, 11.601686f,
++  9.661213f, 9.338891f, 10.973207f,
++  8.643473f, 8.471633f, 10.324347f,
++  7.743284f, 7.704046f, 9.706607f,
++  6.983805f, 7.052368f, 9.144555f,
++  6.360214f, 6.511382f, 8.649865f,
++  5.851967f, 6.063771f, 8.219175f,
++  5.436366f, 5.691667f, 7.844713f,
++  5.093167f, 5.379132f, 7.518519f,
++  4.805955f, 5.113119f, 7.232112f,
++  4.562332f, 4.883588f, 6.978992f,
++  4.352855f, 4.683560f, 6.753152f,
++  4.172300f, 4.508806f, 6.553294f,
++  4.015885f, 4.355962f, 6.375713f,
++  3.881591f, 4.223870f, 6.221280f,
++  3.768473f, 4.112170f, 6.090304f,
++  3.676304f, 4.021350f, 5.983919f,
++  3.605831f, 3.952732f, 5.904540f,
++  3.558496f, 3.908196f, 5.855238f,
++  3.535878f, 3.889770f, 5.838865f,
++  3.540058f, 3.899979f, 5.858758f,
++  3.573444f, 3.941623f, 5.918683f,
++  3.638610f, 4.017715f, 6.022577f,
++  3.738050f, 4.131243f, 6.173857f,
++  3.873923f, 4.284850f, 6.374914f,
++  4.049311f, 4.481925f, 6.630174f,
++  4.266120f, 4.724948f, 6.941376f,
++  4.525942f, 5.016826f, 7.311195f,
++  4.836454f, 5.372056f, 7.768756f,
++  11.841390f, 11.178592f, 12.155185f,
++  11.594137f, 10.968795f, 12.031195f,
++  10.930691f, 10.401683f, 11.676536f,
++  10.014301f, 9.618823f, 11.154337f,
++  9.016552f, 8.769427f, 10.544871f,
++  8.064043f, 7.959576f, 9.917618f,
++  7.225628f, 7.244511f, 9.321860f,
++  6.522367f, 6.638907f, 8.782229f,
++  5.947289f, 6.137067f, 8.308785f,
++  5.480231f, 5.722894f, 7.898299f,
++  5.099298f, 5.379341f, 7.543259f,
++  4.785137f, 5.091058f, 7.234536f,
++  4.522663f, 4.845851f, 6.964431f,
++  4.299552f, 4.634246f, 6.725155f,
++  4.108907f, 4.450641f, 6.514051f,
++  3.943615f, 4.289605f, 6.325308f,
++  3.801293f, 4.149490f, 6.159961f,
++  3.678776f, 4.028025f, 6.014917f,
++  3.575643f, 3.925523f, 5.892151f,
++  3.491724f, 3.842272f, 5.792945f,
++  3.427620f, 3.779384f, 5.719009f,
++  3.384590f, 3.738573f, 5.673070f,
++  3.364040f, 3.721679f, 5.657616f,
++  3.368036f, 3.731175f, 5.676244f,
++  3.398553f, 3.769444f, 5.731965f,
++  3.458133f, 3.839433f, 5.828818f,
++  3.548923f, 3.943687f, 5.969669f,
++  3.673651f, 4.085220f, 6.158585f,
++  3.833806f, 4.266306f, 6.396898f,
++  4.032146f, 4.490163f, 6.688605f,
++  4.271059f, 4.759822f, 7.037456f,
++  4.556365f, 5.088139f, 7.468847f,
++  11.048594f, 10.462686f, 11.655043f,
++  10.816510f, 10.266668f, 11.534685f,
++  10.193736f, 9.736690f, 11.189946f,
++  9.332710f, 9.005213f, 10.683362f,
++  8.396890f, 8.211903f, 10.093065f,
++  7.507668f, 7.457417f, 9.487442f,
++  6.729700f, 6.792606f, 8.914410f,
++  6.080444f, 6.231455f, 8.397964f,
++  5.551250f, 5.767128f, 7.946426f,
++  5.122757f, 5.384807f, 7.556605f,
++  4.773840f, 5.068031f, 7.220335f,
++  4.486741f, 4.802701f, 6.929396f,
++  4.246340f, 4.576735f, 6.674226f,
++  4.043307f, 4.382844f, 6.450638f,
++  3.868630f, 4.213627f, 6.251423f,
++  3.718313f, 4.066159f, 6.075668f,
++  3.588291f, 3.937427f, 5.920233f,
++  3.476795f, 3.826268f, 5.785347f,
++  3.382981f, 3.732430f, 5.671282f,
++  3.306397f, 3.655994f, 5.578301f,
++  3.248084f, 3.598458f, 5.509390f,
++  3.208942f, 3.561120f, 5.466464f,
++  3.190379f, 3.545774f, 5.452145f,
++  3.194101f, 3.554501f, 5.469344f,
++  3.222094f, 3.589661f, 5.521286f,
++  3.276556f, 3.653851f, 5.611452f,
++  3.359571f, 3.749548f, 5.742814f,
++  3.473308f, 3.879356f, 5.918401f,
++  3.620293f, 4.046147f, 6.142001f,
++  3.801978f, 4.251905f, 6.414991f,
++  4.020620f, 4.500080f, 6.741549f,
++  4.283317f, 4.803436f, 7.148289f,
++  10.293840f, 9.773424f, 11.140612f,
++  10.076165f, 9.590541f, 11.024045f,
++  9.490547f, 9.095187f, 10.689065f,
++  8.682085f, 8.412182f, 10.198102f,
++  7.806506f, 7.672578f, 9.627299f,
++  6.979155f, 6.970887f, 9.044017f,
++  6.258913f, 6.354451f, 8.494419f,
++  5.660816f, 5.835364f, 8.001250f,
++  5.174802f, 5.406727f, 7.571915f,
++  4.781994f, 5.054281f, 7.202450f,
++  4.462780f, 4.762748f, 6.885132f,
++  4.200079f, 4.518598f, 6.611002f,
++  3.980712f, 4.311274f, 6.371669f,
++  3.795275f, 4.133208f, 6.162234f,
++  3.636135f, 3.978223f, 5.976133f,
++  3.498965f, 3.843020f, 5.811839f,
++  3.380561f, 3.725170f, 5.667343f,
++  3.278785f, 3.623208f, 5.541147f,
++  3.193370f, 3.537403f, 5.434948f,
++  3.124108f, 3.467993f, 5.349502f,
++  3.071052f, 3.415352f, 5.285376f,
++  3.035446f, 3.381177f, 5.245383f,
++  3.018606f, 3.367167f, 5.232025f,
++  3.022114f, 3.375231f, 5.247993f,
++  3.047800f, 3.407551f, 5.296331f,
++  3.097449f, 3.466268f, 5.379726f,
++  3.173054f, 3.553699f, 5.501279f,
++  3.277198f, 3.672826f, 5.665178f,
++  3.411251f, 3.825522f, 5.872741f,
++  3.577832f, 4.014901f, 6.128297f,
++  3.778586f, 4.243159f, 6.434419f,
++  4.019701f, 4.522619f, 6.815482f,
++  9.577972f, 9.113547f, 10.619123f,
++  9.373084f, 8.942959f, 10.506020f,
++  8.822812f, 8.480372f, 10.181060f,
++  8.065064f, 7.843518f, 9.706316f,
++  7.247681f, 7.155145f, 9.154670f,
++  6.480024f, 6.504420f, 8.595044f,
++  5.815084f, 5.933642f, 8.069020f,
++  5.264811f, 5.454117f, 7.599251f,
++  4.818975f, 5.059031f, 7.192115f,
++  4.459241f, 4.734664f, 6.843162f,
++  4.167291f, 4.466769f, 6.544816f,
++  3.927052f, 4.242427f, 6.286877f,
++  3.726977f, 4.052440f, 6.063448f,
++  3.557620f, 3.889103f, 5.867110f,
++  3.412608f, 3.747286f, 5.694109f,
++  3.287381f, 3.623347f, 5.540677f,
++  3.179581f, 3.515682f, 5.406375f,
++  3.087239f, 3.422826f, 5.289910f,
++  3.009408f, 3.344267f, 5.191132f,
++  2.946060f, 3.280499f, 5.111162f,
++  2.897797f, 3.232451f, 5.051729f,
++  2.865480f, 3.201337f, 5.014768f,
++  2.850245f, 3.188612f, 5.002402f,
++  2.853511f, 3.196014f, 5.017119f,
++  2.876947f, 3.225533f, 5.061727f,
++  2.922437f, 3.279391f, 5.139334f,
++  2.991699f, 3.359654f, 5.252496f,
++  3.086614f, 3.468559f, 5.404020f,
++  3.209211f, 3.608440f, 5.597067f,
++  3.361603f, 3.782009f, 5.835034f,
++  3.545640f, 3.991923f, 6.121092f,
++  3.767649f, 4.249415f, 6.478832f,
++  8.899456f, 8.484292f, 10.095429f,
++  8.706881f, 8.325098f, 9.985517f,
++  8.190645f, 7.893983f, 9.671284f,
++  7.481714f, 7.300665f, 9.211638f,
++  6.721221f, 6.661610f, 8.681500f,
++  6.010805f, 6.058748f, 8.144827f,
++  5.398000f, 5.531673f, 7.643274f,
++  4.892568f, 5.089647f, 7.197562f,
++  4.483893f, 4.726010f, 6.812769f,
++  4.154973f, 4.428275f, 6.485188f,
++  3.887801f, 4.182039f, 6.204299f,
++  3.668498f, 3.976493f, 5.963231f,
++  3.485788f, 3.802332f, 5.754258f,
++  3.331118f, 3.652637f, 5.571134f,
++  3.198985f, 3.523026f, 5.410223f,
++  3.085147f, 3.410015f, 5.268269f,
++  2.986806f, 3.311396f, 5.143276f,
++  2.902466f, 3.226316f, 5.034788f,
++  2.831646f, 3.154687f, 4.943414f,
++  2.774204f, 3.096724f, 4.869833f,
++  2.730455f, 3.053067f, 4.815158f,
++  2.701030f, 3.024662f, 4.780799f,
++  2.687207f, 3.013075f, 4.769288f,
++  2.690285f, 3.019903f, 4.782933f,
++  2.711793f, 3.046969f, 4.824344f,
++  2.753079f, 3.095925f, 4.895515f,
++  2.816222f, 3.169174f, 5.000030f,
++  2.903045f, 3.268881f, 5.140748f,
++  3.015310f, 3.397198f, 5.320322f,
++  3.154384f, 3.555888f, 5.540545f,
++  3.323033f, 3.748376f, 5.807147f,
++  3.526950f, 3.985286f, 6.141407f,
++  8.257318f, 7.885990f, 9.573260f,
++  8.076968f, 7.737715f, 9.467203f,
++  7.593467f, 7.336455f, 9.162858f,
++  6.932438f, 6.785387f, 8.720407f,
++  6.227522f, 6.193434f, 8.212332f,
++  5.571088f, 5.635809f, 7.699077f,
++  5.007206f, 5.149632f, 7.222146f,
++  4.543406f, 4.742826f, 6.800670f,
++  4.169452f, 4.409034f, 6.439042f,
++  3.868387f, 4.135465f, 6.130745f,
++  3.624245f, 3.909874f, 5.867922f,
++  3.424101f, 3.721586f, 5.643083f,
++  3.257205f, 3.562103f, 5.448155f,
++  3.116454f, 3.425589f, 5.278481f,
++  2.995869f, 3.306869f, 5.128675f,
++  2.891952f, 3.203432f, 4.996704f,
++  2.802455f, 3.113558f, 4.881199f,
++  2.725823f, 3.036126f, 4.781171f,
++  2.661312f, 2.970769f, 4.696538f,
++  2.608981f, 2.917842f, 4.628354f,
++  2.569109f, 2.877927f, 4.577623f,
++  2.542452f, 2.852104f, 4.546057f,
++  2.529953f, 2.841587f, 4.535468f,
++  2.532793f, 2.847828f, 4.547973f,
++  2.552360f, 2.872488f, 4.585968f,
++  2.590221f, 2.917413f, 4.652100f,
++  2.647863f, 2.984364f, 4.748693f,
++  2.727040f, 3.075340f, 4.878608f,
++  2.829375f, 3.192374f, 5.044338f,
++  2.956947f, 3.337994f, 5.249548f,
++  3.111131f, 3.514227f, 5.496618f,
++  3.298295f, 3.731579f, 5.807968f,
++  7.651402f, 7.318764f, 9.056543f,
++  7.482664f, 7.180880f, 8.954227f,
++  7.031639f, 6.808102f, 8.661005f,
++  6.417304f, 6.297469f, 8.236137f,
++  5.764551f, 5.749986f, 7.749514f,
++  5.159604f, 5.235445f, 7.260793f,
++  4.641675f, 4.787875f, 6.809196f,
++  4.216804f, 4.414299f, 6.412512f,
++  3.874345f, 4.107753f, 6.072258f,
++  3.598989f, 3.857086f, 5.783594f,
++  3.376067f, 3.650408f, 5.538384f,
++  3.193624f, 3.478575f, 5.329660f,
++  3.041397f, 3.332734f, 5.148396f,
++  2.912818f, 3.207645f, 4.990344f,
++  2.803085f, 3.099525f, 4.852059f,
++  2.708416f, 3.005195f, 4.729911f,
++  2.626865f, 2.923198f, 4.622985f,
++  2.557086f, 2.852518f, 4.530523f,
++  2.498457f, 2.792967f, 4.452561f,
++  2.450765f, 2.744629f, 4.389424f,
++  2.414513f, 2.708285f, 4.342624f,
++  2.390291f, 2.684783f, 4.313498f,
++  2.378956f, 2.675231f, 4.303715f,
++  2.381597f, 2.680956f, 4.315228f,
++  2.399479f, 2.703470f, 4.350242f,
++  2.434033f, 2.744459f, 4.411201f,
++  2.486719f, 2.805661f, 4.500534f,
++  2.558917f, 2.888728f, 4.620334f,
++  2.652477f, 2.995813f, 4.773793f,
++  2.768824f, 3.128621f, 4.963138f,
++  2.910205f, 3.290131f, 5.192951f,
++  3.081600f, 3.489302f, 5.481663f,
++  7.080218f, 6.781718f, 8.547771f,
++  6.923036f, 6.653977f, 8.448699f,
++  6.503500f, 6.308887f, 8.167630f,
++  5.934021f, 5.836460f, 7.760692f,
++  5.331472f, 5.331132f, 7.296442f,
++  4.775060f, 4.857469f, 6.833159f,
++  4.300214f, 4.446337f, 6.407464f,
++  3.910951f, 4.103422f, 6.034262f,
++  3.597686f, 3.822630f, 5.715741f,
++  3.346179f, 3.593007f, 5.446205f,
++  3.142876f, 3.404430f, 5.218508f,
++  2.976098f, 3.246882f, 5.023625f,
++  2.837554f, 3.113976f, 4.856190f,
++  2.720378f, 2.999947f, 4.709951f,
++  2.620292f, 2.901240f, 4.581763f,
++  2.534235f, 2.815319f, 4.469278f,
++  2.459864f, 2.740390f, 4.370257f,
++  2.396326f, 2.675976f, 4.284883f,
++  2.342871f, 2.621650f, 4.212751f,
++  2.299556f, 2.577738f, 4.154760f,
++  2.266629f, 2.544720f, 4.111755f,
++  2.244630f, 2.523368f, 4.084960f,
++  2.234361f, 2.514707f, 4.075948f,
++  2.236805f, 2.519945f, 4.086515f,
++  2.253117f, 2.540459f, 4.118690f,
++  2.284569f, 2.577755f, 4.174651f,
++  2.332608f, 2.633520f, 4.256877f,
++  2.398607f, 2.709387f, 4.367597f,
++  2.484082f, 2.807179f, 4.509355f,
++  2.590410f, 2.928627f, 4.684432f,
++  2.719529f, 3.076114f, 4.896720f,
++  2.876839f, 3.258671f, 5.165074f,
++  6.543130f, 6.274589f, 8.048608f,
++  6.396749f, 6.155986f, 7.953241f,
++  6.008233f, 5.837256f, 7.684574f,
++  5.481639f, 5.401546f, 7.296184f,
++  4.926856f, 4.936369f, 6.855711f,
++  4.416061f, 4.501338f, 6.418463f,
++  3.980708f, 4.124030f, 6.017677f,
++  3.624765f, 3.810056f, 5.668350f,
++  3.338657f, 3.553008f, 5.370994f,
++  3.108953f, 3.343270f, 5.120097f,
++  2.923438f, 3.170764f, 4.908329f,
++  2.771524f, 3.027249f, 4.728115f,
++  2.645123f, 2.905988f, 4.572863f,
++  2.538476f, 2.802043f, 4.437908f,
++  2.447283f, 2.711971f, 4.319416f,
++  2.368761f, 2.633538f, 4.215209f,
++  2.301213f, 2.565482f, 4.124285f,
++  2.243489f, 2.506977f, 4.045897f,
++  2.195083f, 2.457783f, 3.980038f,
++  2.155728f, 2.417883f, 3.926760f,
++  2.125638f, 2.387710f, 3.886832f,
++  2.105562f, 2.368207f, 3.861971f,
++  2.096221f, 2.360315f, 3.853600f,
++  2.098518f, 2.365144f, 3.863383f,
++  2.113510f, 2.383956f, 3.893200f,
++  2.142392f, 2.418140f, 3.945132f,
++  2.185946f, 2.468692f, 4.020184f,
++  2.245944f, 2.537625f, 4.121644f,
++  2.323847f, 2.626677f, 4.252061f,
++  2.421082f, 2.737593f, 4.413892f,
++  2.539107f, 2.872361f, 4.610058f,
++  2.683054f, 3.039340f, 4.858251f,
++  6.038277f, 5.795546f, 7.560958f,
++  5.903293f, 5.686682f, 7.470453f,
++  5.543809f, 5.392721f, 7.213849f,
++  5.058594f, 4.991871f, 6.845168f,
++  4.548969f, 4.564769f, 6.429138f,
++  4.080541f, 4.165697f, 6.017037f,
++  3.682210f, 3.820287f, 5.641507f,
++  3.357008f, 3.533115f, 5.315477f,
++  3.095524f, 3.298248f, 5.038214f,
++  2.886391f, 3.106995f, 4.805964f,
++  2.717195f, 2.949728f, 4.609617f,
++  2.578782f, 2.818923f, 4.442948f,
++  2.463619f, 2.708297f, 4.299409f,
++  2.366396f, 2.613526f, 4.174556f,
++  2.283552f, 2.531722f, 4.065698f,
++  2.212390f, 2.460689f, 3.970461f,
++  2.150796f, 2.398659f, 3.886457f,
++  2.098044f, 2.345203f, 3.813772f,
++  2.053802f, 2.300231f, 3.752697f,
++  2.017957f, 2.263875f, 3.703568f,
++  1.990726f, 2.236552f, 3.667143f,
++  1.972560f, 2.218905f, 3.644460f,
++  1.964115f, 2.211775f, 3.636813f,
++  1.966209f, 2.216163f, 3.645720f,
++  1.979803f, 2.233212f, 3.672894f,
++  2.005977f, 2.264194f, 3.720232f,
++  2.045918f, 2.310490f, 3.789797f,
++  2.100912f, 2.373605f, 3.883826f,
++  2.171969f, 2.454745f, 4.003862f,
++  2.260391f, 2.555508f, 4.152188f,
++  2.368256f, 2.678471f, 4.333278f,
++  2.499914f, 2.830976f, 4.562461f,
++  5.565221f, 5.344572f, 7.087601f,
++  5.440508f, 5.244564f, 7.001462f,
++  5.109037f, 4.974104f, 6.757350f,
++  4.663212f, 4.606395f, 6.409148f,
++  4.195536f, 4.214811f, 6.016777f,
++  3.766915f, 3.849672f, 5.630398f,
++  3.403008f, 3.534093f, 5.279864f,
++  3.105952f, 3.271860f, 4.975733f,
++  2.867881f, 3.057885f, 4.719107f,
++  2.677217f, 2.883668f, 4.503807f,
++  2.523100f, 2.740357f, 4.322275f,
++  2.396976f, 2.621129f, 4.168102f,
++  2.292395f, 2.520729f, 4.036249f,
++  2.204202f, 2.434840f, 3.921893f,
++  2.128496f, 2.360148f, 3.820915f,
++  2.063476f, 2.295249f, 3.732612f,
++  2.007558f, 2.238942f, 3.655631f,
++  1.959812f, 2.190567f, 3.589353f,
++  1.919616f, 2.149736f, 3.533300f,
++  1.887046f, 2.116725f, 3.488201f,
++  1.862306f, 2.091920f, 3.454761f,
++  1.845812f, 2.075908f, 3.433932f,
++  1.838158f, 2.069452f, 3.426902f,
++  1.840091f, 2.073460f, 3.435062f,
++  1.852485f, 2.088973f, 3.459986f,
++  1.876324f, 2.117147f, 3.503412f,
++  1.912694f, 2.159247f, 3.567247f,
++  1.962568f, 2.216437f, 3.653066f,
++  2.027317f, 2.290298f, 3.763369f,
++  2.108365f, 2.382520f, 3.900830f,
++  2.206541f, 2.494290f, 4.066961f,
++  2.326766f, 2.633283f, 4.278071f,
++  5.121570f, 4.919718f, 6.628650f,
++  5.006878f, 4.828031f, 6.547203f,
++  4.702299f, 4.580193f, 6.316440f,
++  4.293431f, 4.243560f, 5.988345f,
++  3.865295f, 3.885537f, 5.620073f,
++  3.473793f, 3.552364f, 5.259318f,
++  3.141626f, 3.264501f, 4.932470f,
++  2.871083f, 3.025763f, 4.650827f,
++  2.654193f, 2.831043f, 4.413017f,
++  2.480440f, 2.672260f, 4.213657f,
++  2.340456f, 2.542208f, 4.046705f,
++  2.226002f, 2.434134f, 3.905211f,
++  2.130515f, 2.342569f, 3.782956f,
++  2.050129f, 2.264311f, 3.677307f,
++  1.981619f, 2.196756f, 3.585258f,
++  1.922551f, 2.137857f, 3.504207f,
++  1.871754f, 2.086764f, 3.433569f,
++  1.828309f, 2.042803f, 3.372589f,
++  1.791812f, 2.005776f, 3.321204f,
++  1.762251f, 1.975854f, 3.279887f,
++  1.739802f, 1.953374f, 3.249249f,
++  1.724840f, 1.938869f, 3.230162f,
++  1.717909f, 1.933030f, 3.223711f,
++  1.719688f, 1.936685f, 3.231172f,
++  1.730970f, 1.950777f, 3.253985f,
++  1.752651f, 1.976354f, 3.293742f,
++  1.785719f, 2.014566f, 3.352187f,
++  1.831181f, 2.066588f, 3.431059f,
++  1.890104f, 2.133686f, 3.532220f,
++  1.963665f, 2.217273f, 3.657826f,
++  2.053359f, 2.319213f, 3.811038f,
++  2.163243f, 2.446015f, 4.005693f,
++  4.705959f, 4.519807f, 6.185583f,
++  4.600775f, 4.435957f, 6.108735f,
++  4.321708f, 4.209612f, 5.891727f,
++  3.947519f, 3.902179f, 5.583445f,
++  3.556722f, 3.576018f, 5.239720f,
++  3.199447f, 3.272507f, 4.903392f,
++  2.896960f, 3.010635f, 4.600450f,
++  2.650717f, 2.793649f, 4.339506f,
++  2.453371f, 2.616612f, 4.119840f,
++  2.295891f, 2.472961f, 3.937123f,
++  2.168254f, 2.354522f, 3.782332f,
++  2.064086f, 2.256275f, 3.651824f,
++  1.977601f, 2.173420f, 3.540106f,
++  1.904627f, 2.102490f, 3.443189f,
++  1.842333f, 2.041158f, 3.358520f,
++  1.788749f, 1.987818f, 3.284296f,
++  1.742669f, 1.941548f, 3.219618f,
++  1.703207f, 1.901685f, 3.163669f,
++  1.670110f, 1.868164f, 3.116656f,
++  1.643305f, 1.841077f, 3.078853f,
++  1.622951f, 1.820730f, 3.050819f,
++  1.609390f, 1.807605f, 3.033346f,
++  1.603099f, 1.802315f, 3.027391f,
++  1.604752f, 1.805663f, 3.034251f,
++  1.615011f, 1.818446f, 3.055103f,
++  1.634710f, 1.841637f, 3.091452f,
++  1.664747f, 1.876274f, 3.144892f,
++  1.706098f, 1.923489f, 3.217165f,
++  1.759639f, 1.984329f, 3.309747f,
++  1.826624f, 2.060262f, 3.425054f,
++  1.908222f, 2.152797f, 3.565517f,
++  2.008154f, 2.267896f, 3.743799f,
++  4.316463f, 4.143316f, 5.758644f,
++  4.220424f, 4.067067f, 5.686699f,
++  3.965273f, 3.860868f, 5.483232f,
++  3.623967f, 3.581393f, 5.195721f,
++  3.267676f, 3.284692f, 4.875243f,
++  2.942666f, 3.008999f, 4.563335f,
++  2.667593f, 2.771451f, 4.282854f,
++  2.443889f, 2.574630f, 4.042212f,
++  2.264733f, 2.414270f, 3.839907f,
++  2.121382f, 2.283710f, 3.670794f,
++  2.005874f, 2.176716f, 3.529415f,
++  1.911412f, 2.087791f, 3.409758f,
++  1.832880f, 2.012706f, 3.307105f,
++  1.766750f, 1.948569f, 3.218413f,
++  1.710228f, 1.893036f, 3.140781f,
++  1.661679f, 1.844811f, 3.072916f,
++  1.619864f, 1.802912f, 3.013633f,
++  1.584049f, 1.766811f, 2.962348f,
++  1.554012f, 1.736445f, 2.919259f,
++  1.529685f, 1.711909f, 2.884611f,
++  1.511214f, 1.693481f, 2.858915f,
++  1.498911f, 1.681597f, 2.842888f,
++  1.493228f, 1.676831f, 2.837451f,
++  1.494737f, 1.679870f, 2.843692f,
++  1.504084f, 1.691482f, 2.862794f,
++  1.522006f, 1.712525f, 2.896085f,
++  1.549323f, 1.743948f, 2.945034f,
++  1.586923f, 1.786776f, 3.011235f,
++  1.635579f, 1.841919f, 3.095994f,
++  1.696416f, 1.910708f, 3.201481f,
++  1.770538f, 1.994547f, 3.330013f,
++  1.861522f, 2.099042f, 3.493572f,
++  3.951910f, 3.789349f, 5.349263f,
++  3.864210f, 3.719955f, 5.281682f,
++  3.631744f, 3.532945f, 5.091864f,
++  3.321186f, 3.279457f, 4.824405f,
++  2.997276f, 3.010489f, 4.526999f,
++  2.701872f, 2.760845f, 4.238197f,
++  2.452584f, 2.546035f, 3.980201f,
++  2.249355f, 2.367759f, 3.757855f,
++  2.087061f, 2.222832f, 3.572107f,
++  1.957223f, 2.104854f, 3.417118f,
++  1.852491f, 2.008101f, 3.287319f,
++  1.766923f, 1.927766f, 3.177695f,
++  1.695853f, 1.859998f, 3.083858f,
++  1.635919f, 1.802019f, 3.002600f,
++  1.584692f, 1.751817f, 2.931502f,
++  1.540685f, 1.708202f, 2.869355f,
++  1.502808f, 1.670337f, 2.815142f,
++  1.470440f, 1.637789f, 2.768435f,
++  1.443293f, 1.610422f, 2.729193f,
++  1.421308f, 1.588307f, 2.697638f,
++  1.404619f, 1.571701f, 2.674232f,
++  1.393505f, 1.560995f, 2.659629f,
++  1.388373f, 1.556705f, 2.654658f,
++  1.389754f, 1.559465f, 2.660342f,
++  1.398218f, 1.569952f, 2.677720f,
++  1.414437f, 1.588948f, 2.708015f,
++  1.439153f, 1.617306f, 2.752564f,
++  1.473171f, 1.655950f, 2.812818f,
++  1.517331f, 1.705858f, 2.890302f,
++  1.572590f, 1.768158f, 2.986841f,
++  1.639902f, 1.844062f, 3.104450f,
++  1.722531f, 1.938674f, 3.254048f,
++  3.610046f, 3.455926f, 4.956008f,
++  3.530371f, 3.393264f, 4.893395f,
++  3.319484f, 3.224359f, 4.717415f,
++  3.037423f, 2.995180f, 4.469313f,
++  2.743497f, 2.752229f, 4.194065f,
++  2.476435f, 2.527208f, 3.928925f,
++  2.250046f, 2.332897f, 3.690134f,
++  2.066448f, 2.172363f, 3.486669f,
++  1.919551f, 2.041591f, 3.316229f,
++  1.802147f, 1.935295f, 3.174392f,
++  1.707520f, 1.848175f, 3.055816f,
++  1.630058f, 1.775679f, 2.955359f,
++  1.565759f, 1.714549f, 2.869505f,
++  1.511569f, 1.662274f, 2.795276f,
++  1.465350f, 1.617113f, 2.730591f,
++  1.425638f, 1.577884f, 2.674053f,
++  1.391414f, 1.543780f, 2.624637f,
++  1.362164f, 1.514460f, 2.582053f,
++  1.337631f, 1.489808f, 2.546275f,
++  1.317765f, 1.469891f, 2.517504f,
++  1.302683f, 1.454938f, 2.496161f,
++  1.292646f, 1.445306f, 2.482852f,
++  1.288024f, 1.441461f, 2.478328f,
++  1.289278f, 1.443956f, 2.483477f,
++  1.296945f, 1.453421f, 2.499297f,
++  1.311631f, 1.470560f, 2.526896f,
++  1.334006f, 1.496141f, 2.567483f,
++  1.364795f, 1.530998f, 2.622382f,
++  1.404735f, 1.575992f, 2.692927f,
++  1.454659f, 1.632100f, 2.780694f,
++  1.515640f, 1.700635f, 2.888013f,
++  1.590684f, 1.786265f, 3.024900f,
++  3.289930f, 3.142427f, 4.580523f,
++  3.217770f, 3.086005f, 4.522479f,
++  3.026541f, 2.933723f, 4.359404f,
++  2.771226f, 2.727410f, 4.129931f,
++  2.505834f, 2.509049f, 3.877258f,
++  2.263956f, 2.306272f, 3.632382f,
++  2.059890f, 2.131879f, 3.414226f,
++  1.894114f, 1.987515f, 3.227839f,
++  1.761529f, 1.870021f, 3.072002f,
++  1.655498f, 1.774411f, 2.942195f,
++  1.570063f, 1.696048f, 2.833800f,
++  1.500265f, 1.630962f, 2.742357f,
++  1.442371f, 1.576128f, 2.664342f,
++  1.393492f, 1.529159f, 2.596719f,
++  1.351807f, 1.488585f, 2.537819f,
++  1.315989f, 1.453339f, 2.486341f,
++  1.285081f, 1.422662f, 2.441264f,
++  1.258649f, 1.396276f, 2.402395f,
++  1.236478f, 1.374091f, 2.369739f,
++  1.218525f, 1.356169f, 2.343476f,
++  1.204899f, 1.342717f, 2.323993f,
++  1.195837f, 1.334057f, 2.311839f,
++  1.191672f, 1.330609f, 2.307702f,
++  1.192821f, 1.332872f, 2.312389f,
++  1.199772f, 1.341415f, 2.326812f,
++  1.213075f, 1.356871f, 2.351980f,
++  1.233333f, 1.379933f, 2.388998f,
++  1.261207f, 1.411353f, 2.439071f,
++  1.297335f, 1.451876f, 2.503346f,
++  1.342443f, 1.502361f, 2.583199f,
++  1.397530f, 1.564031f, 2.680832f,
++  1.465224f, 1.641000f, 2.805079f,
++  2.989392f, 2.846890f, 4.221360f,
++  2.924253f, 2.796329f, 4.167676f,
++  2.752022f, 2.660223f, 4.017971f,
++  2.521598f, 2.475134f, 3.806677f,
++  2.282254f, 2.279464f, 3.574365f,
++  2.064447f, 2.097899f, 3.350304f,
++  1.880684f, 1.941678f, 3.150749f,
++  1.731415f, 1.812429f, 2.980539f,
++  1.612014f, 1.707154f, 2.838236f,
++  1.516694f, 1.621604f, 2.720169f,
++  1.439905f, 1.551501f, 2.621668f,
++  1.377129f, 1.493237f, 2.538518f,
++  1.325024f, 1.444120f, 2.467536f,
++  1.280978f, 1.401992f, 2.405897f,
++  1.243410f, 1.365596f, 2.352222f,
++  1.211118f, 1.333976f, 2.305312f,
++  1.183324f, 1.306525f, 2.264416f,
++  1.159572f, 1.282928f, 2.229191f,
++  1.139651f, 1.263088f, 2.199596f,
++  1.123519f, 1.247062f, 2.175794f,
++  1.111277f, 1.235035f, 2.158135f,
++  1.103137f, 1.227297f, 2.147115f,
++  1.099401f, 1.224224f, 2.143357f,
++  1.100443f, 1.226263f, 2.147593f,
++  1.106703f, 1.233923f, 2.160646f,
++  1.118674f, 1.247772f, 2.183432f,
++  1.136902f, 1.268430f, 2.216951f,
++  1.161979f, 1.296572f, 2.262295f,
++  1.194534f, 1.332917f, 2.320629f,
++  1.235277f, 1.378291f, 2.393336f,
++  1.285050f, 1.433728f, 2.482255f,
++  1.346097f, 1.502817f, 2.595077f,
++};
++
++ccl_device_inline float3 emit_bake_classroom_sky_eval(const float3 R)
++{
++  const float N_m1 = (float)(EMIT_BAKE_CLASSROOM_SKY_N - 1);
++  const float cg = R.x * EMIT_BAKE_CLASSROOM_SUN_X + R.y * EMIT_BAKE_CLASSROOM_SUN_Y +
++                   R.z * EMIT_BAKE_CLASSROOM_SUN_Z;
++  const float u = sqrtf(fmaxf(R.z, 0.0f)) * N_m1;
++  const float v = sqrtf(fmaxf(0.5f * (1.0f - cg), 0.0f)) * N_m1;
++  const int i0 = min((int)u, EMIT_BAKE_CLASSROOM_SKY_N - 2);
++  const int j0 = min((int)v, EMIT_BAKE_CLASSROOM_SKY_N - 2);
++  const float fu = u - (float)i0;
++  const float fv = v - (float)j0;
++
++  const int idx00 = (i0 * EMIT_BAKE_CLASSROOM_SKY_N + j0) * 3;
++  const int idx01 = idx00 + 3;
++  const int idx10 = idx00 + EMIT_BAKE_CLASSROOM_SKY_N * 3;
++  const int idx11 = idx10 + 3;
++
++  const float w00 = (1.0f - fu) * (1.0f - fv);
++  const float w01 = (1.0f - fu) * fv;
++  const float w10 = fu * (1.0f - fv);
++  const float w11 = fu * fv;
++
++  const float r = w00 * k_emit_bake_classroom_sky_lut[idx00 + 0] +
++                  w01 * k_emit_bake_classroom_sky_lut[idx01 + 0] +
++                  w10 * k_emit_bake_classroom_sky_lut[idx10 + 0] +
++                  w11 * k_emit_bake_classroom_sky_lut[idx11 + 0];
++  const float g = w00 * k_emit_bake_classroom_sky_lut[idx00 + 1] +
++                  w01 * k_emit_bake_classroom_sky_lut[idx01 + 1] +
++                  w10 * k_emit_bake_classroom_sky_lut[idx10 + 1] +
++                  w11 * k_emit_bake_classroom_sky_lut[idx11 + 1];
++  const float b = w00 * k_emit_bake_classroom_sky_lut[idx00 + 2] +
++                  w01 * k_emit_bake_classroom_sky_lut[idx01 + 2] +
++                  w10 * k_emit_bake_classroom_sky_lut[idx10 + 2] +
++                  w11 * k_emit_bake_classroom_sky_lut[idx11 + 2];
++  return make_float3(r, g, b);
++}
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/kernel/light/sample.h b/intern/cycles/kernel/light/sample.h
+index a581b51..2f7b02d 100644
+--- a/intern/cycles/kernel/light/sample.h
++++ b/intern/cycles/kernel/light/sample.h
+@@ -17,6 +17,9 @@
+ #include "kernel/geom/shader_data.h"
+ 
+ #include "kernel/sample/mis.h"
++#ifdef CYCLES_EMIT_BAKE
++#  include "kernel/light/emit_bake.h"
++#endif
+ 
+ CCL_NAMESPACE_BEGIN
+ 
+@@ -39,6 +42,27 @@ ccl_device bool light_sample_shader_eval_nee_constant(KernelGlobals kg,
+   return is_constant;
+ }
+ 
++#ifdef CYCLES_EMIT_BAKE
++ccl_device_inline bool light_sample_shader_eval_nee_baked(KernelGlobals kg,
++                                                          const ccl_private LightSample &ls,
++                                                          ccl_private Spectrum &eval)
++{
++  eval = one_spectrum();
++  bool is_constant = surface_shader_constant_emission(kg, ls.shader, &eval);
++  if (!is_constant) {
++    is_constant = emit_bake_eval_nee(kg, ls, eval);
++  }
++
++  if (ls.type != LIGHT_TRIANGLE && (!is_constant || !is_zero(eval))) {
++    const ccl_global KernelLight *klight = &kernel_data_fetch(lights, ls.prim);
++    eval *= rgb_to_spectrum(
++        make_float3(klight->strength[0], klight->strength[1], klight->strength[2]));
++  }
++
++  return is_constant;
++}
++#endif
++
+ /* Evaluate shader on light. Not supported for background and triangle lights, that happens
+  * in shade_surface and shader_background. */
+ ccl_device_noinline_cpu ShaderEvalResult
+@@ -56,7 +80,11 @@ light_sample_shader_eval_forward(KernelGlobals kg,
+   /* setup shading at emitter */
+   Spectrum eval = zero_spectrum();
+ 
+-  if (!surface_shader_constant_emission(kg, klight->shader_id, &eval)) {
++  if (!surface_shader_constant_emission(kg, klight->shader_id, &eval)
++#ifdef CYCLES_EMIT_BAKE
++      && !emit_bake_eval_lamp(kg, klight->shader_id, t, eval)
++#endif
++  ) {
+     /* Setup shader data and call surface_shader_eval once, better
+      * for GPU coherence and compile times. */
+     PROFILING_INIT_FOR_SHADER(kg, PROFILING_SHADE_LIGHT_SETUP);
+diff --git a/intern/cycles/kernel/light/triangle.h b/intern/cycles/kernel/light/triangle.h
+index 89da488..d5d8bd6 100644
+--- a/intern/cycles/kernel/light/triangle.h
++++ b/intern/cycles/kernel/light/triangle.h
+@@ -224,6 +224,10 @@ ccl_device_forceinline bool triangle_light_sample(KernelGlobals kg,
+       ls->pdf = 0.0f;
+       return false;
+     }
++#ifdef CYCLES_EMIT_BAKE
++    ls->tri_u = unused_u;
++    ls->tri_v = unused_v;
++#endif
+ 
+     ls->P = P + ls->D * ls->t;
+ 
+@@ -254,6 +258,10 @@ ccl_device_forceinline bool triangle_light_sample(KernelGlobals kg,
+     }
+ 
+     const float t = 1.0f - u - v;
++#ifdef CYCLES_EMIT_BAKE
++    ls->tri_u = u;
++    ls->tri_v = v;
++#endif
+     ls->P = t * V[0] + u * V[1] + v * V[2];
+     /* compute incoming direction, distance and pdf */
+     ls->D = normalize_len(ls->P - P, &ls->t);
+diff --git a/intern/cycles/kernel/svm/svm.h b/intern/cycles/kernel/svm/svm.h
+index dc161cd..6fb206d 100644
+--- a/intern/cycles/kernel/svm/svm.h
++++ b/intern/cycles/kernel/svm/svm.h
+@@ -80,6 +80,10 @@
+ #include "kernel/svm/white_noise.h"
+ #include "kernel/svm/wireframe.h"
+ #include "kernel/svm/approx.h"
++#if defined(CYCLES_EMIT_BAKE) && defined(CYCLES_EMIT_BAKE_SKY_LUT) && \
++    !defined(CYCLES_EMIT_BAKE_SKY_NEE_ONLY)
++#  include "kernel/light/emit_bake_classroom_lut.h"
++#endif
+ #include "util/defines.h"
+ 
+ #ifdef __SHADER_RAYTRACE__
+@@ -615,6 +619,25 @@ ccl_device void svm_eval_nodes(KernelGlobals kg,
+       SVM_CASE(NODE_TEX_SKY)
+       {
+         const ccl_global auto &node = svm_node_get<SVMNodeTexSky>(kg, &offset);
++#if defined(CYCLES_EMIT_BAKE) && defined(CYCLES_EMIT_BAKE_SKY_LUT) && \
++    !defined(CYCLES_EMIT_BAKE_SKY_NEE_ONLY)
++        if (node.sky_type == NODE_SKY_HOSEK &&
++            kernel_data_fetch(svm_nodes, offset) == EMIT_BAKE_CLASSROOM_SKY_SIG_PHI &&
++            kernel_data_fetch(svm_nodes, offset + 1) == EMIT_BAKE_CLASSROOM_SKY_SIG_THETA &&
++            kernel_data_fetch(svm_nodes, offset + 32) == NODE_CURVES &&
++            kernel_data_fetch(svm_nodes, offset + 1069) == NODE_HSV)
++        {
++          const ccl_global SVMNodeHSV &hsv = *reinterpret_cast<const ccl_global SVMNodeHSV *>(
++              &kernel_data_fetch(svm_nodes, offset + 1070));
++          const float3 dir = stack_load_float3(stack, node.dir_offset);
++          const float3 rgb = emit_bake_classroom_sky_eval(dir) * 0.05f;
++          if (stack_valid(hsv.out_color_offset)) {
++            stack_store_float3(stack, hsv.out_color_offset, rgb);
++          }
++          offset += 1078;
++          break;
++        }
++#endif
+         offset = SVM_NI(svm_node_tex_sky)(kg, sd, path_flag, stack, node, offset);
+       }
+       break;

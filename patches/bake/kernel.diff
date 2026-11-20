@@ -1,0 +1,2886 @@
+diff --git a/intern/cycles/kernel/bvh/bvh2_dynamic.h b/intern/cycles/kernel/bvh/bvh2_dynamic.h
+new file mode 100644
+index 0000000..f08742f
+--- /dev/null
++++ b/intern/cycles/kernel/bvh/bvh2_dynamic.h
+@@ -0,0 +1,742 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++
++#pragma once
++
++/* BVH2 traversal with dynamic ray fetch (persistent threads, Aila-Laine 2009): a lane whose ray
++ * has finished takes the next ray index from a global counter, so a warp keeps more lanes busy
++ * than one ray per thread allows. Each ray visits nodes and primitives in exactly the order the
++ * stock traversal (traversal.h, shadow_all.h) does, so results match it bit for bit.
++ *
++ * The defaults reproduce the bvh2df-1 patch (blender-src-bvh2df 3f3d5e09); every knob below is a
++ * compile-time -D so each change can be measured on its own:
++ *
++ *   CYCLES_BVH2DF_STEP    0: one inner node or one leaf per step (bvh2df-1)
++ *                         1: all inner nodes down to the next leaf, then that leaf (while-while)
++ *   CYCLES_BVH2DF_STACK   0: uint2 stack entries (address + unused mask, bvh2df-1); 1: int
++ *   CYCLES_BVH2DF_POLICY  0: leave the step loop to refill when accumulated idle lanes beyond
++ *                            CYCLES_BVH2DF_ND reach CYCLES_BVH2DF_NW (bvh2df-1: 4, 16)
++ *                         1: leave it when fewer than CYCLES_BVH2DF_MINLIVE lanes are still busy
++ *   CYCLES_BVH2DF_DEFER   0: a lane runs its ray's finish the step it ends (bvh2df-1)
++ *                         1: finished lanes wait and run finish together at the next refill
++ *   CYCLES_BVH2DF_FETCH   0: one atomicAdd per warp for all idle lanes (bvh2df-1)
++ *                         1: one atomicAdd per idle lane
++ *   CYCLES_BVH2DF_CHUNK   0: idle lanes take the next indices of the global counter (bvh2df-1)
++ *                         N: each warp takes N consecutive indices at a time and refills its idle
++ *                            lanes from them, so a warp's rays stay close in the ray order
++ *   CYCLES_BVH2DF_SPLITSTACK 0: the stack is a member of the per-ray struct (bvh2df-1)
++ *                         1: the stack is an array of its own, so the struct's scalars can stay in
++ *                            registers
++ *   Mode template argument of bvh2df_run: 0 closest-hit leaves only, 1 transparent-shadow leaves
++ *   only, -1 both, chosen per ray by s.mode inside the loop (bvh2df-1). A kernel that branches on a
++ *   uniform mode before the loop gives each loop the register pressure of one leaf type.
++ *
++ * The caller supplies a Work type with
++ *   int state(int index)                  the integrator state of fetched work index `index`
++ *   bool begin(int state, BVH2DFRay &s, BVH2DFStackEntry *stack)
++ *                                         load the ray of `state` into s; false if it needs no
++ *                                         traversal
++ *   void finish(int state, BVH2DFRay &s)  write the result of s for `state`
++ * and s.mode selects the traversal: 0 closest hit (with opaque-shadow early exit when visibility
++ * has PATH_RAY_VISIBILITY_SHADOW_OPAQUE, as scene_intersect does), 1 transparent shadow recording
++ * (scene_intersect_shadow_all), whose hits go through bvh_shadow_all_anyhit_filter into
++ * s.payload exactly as in shadow_all.h; begin() sets s.payload up the way
++ * scene_intersect_shadow_all does.
++ *
++ * Blender 5.3.0 port: the leaves mirror 5.3.0 traversal.h and shadow_all.h (renamed visibility
++ * flags, linear thick curves, Gaussian splats, payload-based shadow recording). */
++
++#ifndef CYCLES_BVH2DF_STEP
++#  define CYCLES_BVH2DF_STEP 0
++#endif
++#ifndef CYCLES_BVH2DF_STACK
++#  define CYCLES_BVH2DF_STACK 0
++#endif
++#ifndef CYCLES_BVH2DF_POLICY
++#  define CYCLES_BVH2DF_POLICY 0
++#endif
++#ifndef CYCLES_BVH2DF_ND
++#  define CYCLES_BVH2DF_ND 4
++#endif
++#ifndef CYCLES_BVH2DF_NW
++#  define CYCLES_BVH2DF_NW 16
++#endif
++#ifndef CYCLES_BVH2DF_MINLIVE
++#  define CYCLES_BVH2DF_MINLIVE 16
++#endif
++#ifndef CYCLES_BVH2DF_DEFER
++#  define CYCLES_BVH2DF_DEFER 0
++#endif
++#ifndef CYCLES_BVH2DF_FETCH
++#  define CYCLES_BVH2DF_FETCH 0
++#endif
++#ifndef CYCLES_BVH2DF_CHUNK
++#  define CYCLES_BVH2DF_CHUNK 0
++#endif
++#if CYCLES_BVH2DF_CHUNK && CYCLES_BVH2DF_CHUNK < 32
++#  error "CYCLES_BVH2DF_CHUNK must hold a whole warp's refill (>= 32)"
++#endif
++#ifndef CYCLES_BVH2DF_SPLITSTACK
++#  define CYCLES_BVH2DF_SPLITSTACK 0
++#endif
++
++CCL_NAMESPACE_BEGIN
++
++#if CYCLES_BVH2DF_STACK == 0
++typedef uint2 BVH2DFStackEntry;
++ccl_device_forceinline BVH2DFStackEntry bvh2df_entry(const int addr)
++{
++  return make_uint2(uint(addr), 0);
++}
++ccl_device_forceinline int bvh2df_addr(const BVH2DFStackEntry e)
++{
++  return int(e.x);
++}
++#else
++typedef int BVH2DFStackEntry;
++ccl_device_forceinline BVH2DFStackEntry bvh2df_entry(const int addr)
++{
++  return addr;
++}
++ccl_device_forceinline int bvh2df_addr(const BVH2DFStackEntry e)
++{
++  return e;
++}
++#endif
++
++struct BVH2DFRay {
++#if !CYCLES_BVH2DF_SPLITSTACK
++  BVH2DFStackEntry stack[BVH_STACK_SIZE];
++#endif
++  Ray ray;
++  Intersection isect;
++  float3 P, dir, idir;
++  int stack_ptr, node_addr, object;
++  uint visibility;
++  int mode;
++  bool hit;
++#ifdef __TRANSPARENT_SHADOWS__
++  /* Transparent shadow recording (scene_intersect_shadow_all). */
++  BVHShadowAllPayload payload;
++#endif
++#ifdef CYCLES_BVH2DF_COUNT
++  /* Work counters for the replay's termination-divergence measurement. */
++  uint count_nodes, count_leaves, count_prims;
++#endif
++};
++
++ccl_device_forceinline void bvh2df_pop(BVH2DFRay &s, BVH2DFStackEntry *stack)
++{
++  s.node_addr = bvh2df_addr(stack[s.stack_ptr]);
++  --s.stack_ptr;
++}
++
++/* Same initial state as the stock traversal functions. */
++ccl_device_forceinline void bvh2df_begin(KernelGlobals kg, BVH2DFRay &s, BVH2DFStackEntry *stack)
++{
++  stack[0] = bvh2df_entry(ENTRYPOINT_SENTINEL);
++  s.stack_ptr = 0;
++  s.node_addr = kernel_data.bvh.root;
++  s.P = s.ray.P;
++  s.dir = bvh_clamp_direction(s.ray.D);
++  s.idir = bvh_inverse_direction(s.dir);
++  s.object = OBJECT_NONE;
++  s.isect.t = s.ray.tmax;
++  s.isect.u = 0.0f;
++  s.isect.v = 0.0f;
++  s.isect.prim = PRIM_NONE;
++  s.isect.object = OBJECT_NONE;
++  s.hit = false;
++#ifdef CYCLES_BVH2DF_COUNT
++  s.count_nodes = s.count_leaves = s.count_prims = 0;
++#endif
++}
++
++/* One inner node: the body of the stock inner-node loop. */
++ccl_device_forceinline void bvh2df_node(KernelGlobals kg,
++                                        BVH2DFRay &s,
++                                        BVH2DFStackEntry *stack,
++                                        const float tmax)
++{
++#ifdef CYCLES_BVH2DF_COUNT
++  s.count_nodes++;
++#endif
++  const float4 cnodes = kernel_data_fetch(bvh_nodes, s.node_addr + 0);
++  float dist[2];
++#ifdef __HAIR__
++  const int mask = kernel_data.bvh.have_curves ?
++                       bvh_node_intersect(
++                           kg, s.P, s.dir, s.idir, s.ray.tmin, tmax, s.node_addr, s.visibility, dist) :
++                       bvh_aligned_node_intersect(
++                           kg, s.P, s.idir, s.ray.tmin, tmax, s.node_addr, s.visibility, dist);
++#else
++  const int mask = bvh_aligned_node_intersect(
++      kg, s.P, s.idir, s.ray.tmin, tmax, s.node_addr, s.visibility, dist);
++#endif
++  int child0 = __float_as_int(cnodes.z);
++  int child1 = __float_as_int(cnodes.w);
++  if (mask == 3) {
++    if (dist[1] < dist[0]) {
++      const int tmp = child0;
++      child0 = child1;
++      child1 = tmp;
++    }
++    ++s.stack_ptr;
++    kernel_assert(s.stack_ptr < BVH_STACK_SIZE);
++    stack[s.stack_ptr] = bvh2df_entry(child1);
++    s.node_addr = child0;
++  }
++  else if (mask == 2) {
++    s.node_addr = child1;
++  }
++  else if (mask == 1) {
++    s.node_addr = child0;
++  }
++  else {
++    bvh2df_pop(s, stack);
++  }
++}
++
++ccl_device_forceinline void bvh2df_instance_push(KernelGlobals kg,
++                                                 BVH2DFRay &s,
++                                                 BVH2DFStackEntry *stack,
++                                                 const int prim_addr)
++{
++  s.object = kernel_data_fetch(prim_object, -prim_addr - 1);
++#ifdef __OBJECT_MOTION__
++  if (kernel_data.bvh.have_motion) {
++    bvh_instance_motion_push(kg, s.object, &s.ray, &s.P, &s.dir, &s.idir);
++  }
++  else {
++    bvh_instance_push(kg, s.object, &s.ray, &s.P, &s.dir, &s.idir);
++  }
++#else
++  bvh_instance_push(kg, s.object, &s.ray, &s.P, &s.dir, &s.idir);
++#endif
++  ++s.stack_ptr;
++  kernel_assert(s.stack_ptr < BVH_STACK_SIZE);
++  stack[s.stack_ptr] = bvh2df_entry(ENTRYPOINT_SENTINEL);
++  s.node_addr = kernel_data_fetch(object_node, s.object);
++}
++
++/* Leaf of a closest-hit ray (traversal.h); returns true on opaque-shadow early exit. */
++ccl_device_forceinline bool bvh2df_leaf_closest(KernelGlobals kg,
++                                                BVH2DFRay &s,
++                                                int prim_addr,
++                                                const int prim_addr2,
++                                                const uint type)
++{
++  const ccl_private Ray *ray = &s.ray;
++  Intersection *isect = &s.isect;
++  const float tmin = ray->tmin;
++  const uint visibility = s.visibility;
++  for (; prim_addr < prim_addr2; prim_addr++) {
++    const int prim_object = (s.object == OBJECT_NONE) ? kernel_data_fetch(prim_object, prim_addr) :
++                                                        s.object;
++    const int prim = kernel_data_fetch(prim_index, prim_addr);
++    if (intersection_skip_self_shadow(ray->self, prim_object, prim)) {
++      continue;
++    }
++#ifdef __SHADOW_LINKING__
++    if (intersection_skip_shadow_link(kg, ray->self, prim_object)) {
++      continue;
++    }
++#endif
++    switch (type & PRIMITIVE_ALL) {
++      case PRIMITIVE_TRIANGLE: {
++        if (triangle_intersect(
++                kg, isect, s.P, s.dir, tmin, isect->t, visibility, prim_object, prim, prim_addr))
++        {
++          if (visibility & PATH_RAY_VISIBILITY_SHADOW_OPAQUE) {
++            return true;
++          }
++        }
++        break;
++      }
++#ifdef __OBJECT_MOTION__
++      case PRIMITIVE_MOTION_TRIANGLE: {
++        if (motion_triangle_intersect(kg,
++                                      isect,
++                                      s.P,
++                                      s.dir,
++                                      tmin,
++                                      isect->t,
++                                      ray->time,
++                                      visibility,
++                                      prim_object,
++                                      prim,
++                                      prim_addr))
++        {
++          if (visibility & PATH_RAY_VISIBILITY_SHADOW_OPAQUE) {
++            return true;
++          }
++        }
++        break;
++      }
++#endif
++#ifdef __HAIR__
++      case PRIMITIVE_CURVE_THICK:
++      case PRIMITIVE_MOTION_CURVE_THICK:
++      case PRIMITIVE_CURVE_RIBBON:
++      case PRIMITIVE_MOTION_CURVE_RIBBON:
++      case PRIMITIVE_CURVE_THICK_LINEAR:
++      case PRIMITIVE_MOTION_CURVE_THICK_LINEAR: {
++        if ((type & PRIMITIVE_MOTION) && kernel_data.bvh.use_bvh_steps) {
++          const float2 prim_time = kernel_data_fetch(prim_time, prim_addr);
++          if (ray->time < prim_time.x || ray->time > prim_time.y) {
++            break;
++          }
++        }
++        const int curve_type = kernel_data_fetch(prim_type, prim_addr);
++        if (curve_intersect(
++                kg, isect, s.P, s.dir, tmin, isect->t, prim_object, prim, ray->time, curve_type))
++        {
++          if (visibility & PATH_RAY_VISIBILITY_SHADOW_OPAQUE) {
++            return true;
++          }
++        }
++        break;
++      }
++#endif
++#ifdef __POINTCLOUD__
++      case PRIMITIVE_POINT:
++      case PRIMITIVE_MOTION_POINT: {
++        if ((type & PRIMITIVE_MOTION) && kernel_data.bvh.use_bvh_steps) {
++          const float2 prim_time = kernel_data_fetch(prim_time, prim_addr);
++          if (ray->time < prim_time.x || ray->time > prim_time.y) {
++            break;
++          }
++        }
++        const int point_type = kernel_data_fetch(prim_type, prim_addr);
++        if (point_intersect(
++                kg, isect, s.P, s.dir, tmin, isect->t, prim_object, prim, ray->time, point_type))
++        {
++          if (visibility & PATH_RAY_VISIBILITY_SHADOW_OPAQUE) {
++            return true;
++          }
++        }
++        break;
++      }
++#endif
++#ifdef __GSPLATS__
++      case PRIMITIVE_GSPLAT:
++      case PRIMITIVE_MOTION_GSPLAT: {
++        if ((type & PRIMITIVE_MOTION) && kernel_data.bvh.use_bvh_steps) {
++          const float2 prim_time = kernel_data_fetch(prim_time, prim_addr);
++          if (ray->time < prim_time.x || ray->time > prim_time.y) {
++            break;
++          }
++        }
++        const int point_type = kernel_data_fetch(prim_type, prim_addr);
++        if (gsplat_intersect(
++                kg, isect, s.P, s.dir, tmin, isect->t, prim_object, prim, ray->time, point_type))
++        {
++          if (visibility & PATH_RAY_VISIBILITY_SHADOW_OPAQUE) {
++            return true;
++          }
++        }
++        break;
++      }
++#endif
++    }
++  }
++  return false;
++}
++
++#ifdef __TRANSPARENT_SHADOWS__
++/* Leaf of a transparent shadow ray (shadow_all.h); returns true when the ray ends blocked, i.e.
++ * when bvh_shadow_all_anyhit_filter stops the traversal (s.payload.throughput is then zero). */
++ccl_device_forceinline bool bvh2df_leaf_shadow_all(KernelGlobals kg,
++                                                   BVH2DFRay &s,
++                                                   int prim_addr,
++                                                   const int prim_addr2,
++                                                   const uint type)
++{
++  const ccl_private Ray *ray = &s.ray;
++  const float tmin = ray->tmin;
++  const float tmax = ray->tmax;
++  const uint visibility = s.visibility;
++  for (; prim_addr < prim_addr2; prim_addr++) {
++    kernel_assert((kernel_data_fetch(prim_type, prim_addr) & PRIMITIVE_ALL) ==
++                  (type & PRIMITIVE_ALL));
++    bool hit;
++    Intersection isect ccl_optional_struct_init;
++    const int prim_object = (s.object == OBJECT_NONE) ? kernel_data_fetch(prim_object, prim_addr) :
++                                                        s.object;
++    const int prim = kernel_data_fetch(prim_index, prim_addr);
++    if (intersection_skip_self_shadow(ray->self, prim_object, prim)) {
++      continue;
++    }
++#  ifdef __SHADOW_LINKING__
++    if (intersection_skip_shadow_link(kg, ray->self, prim_object)) {
++      continue;
++    }
++#  endif
++    switch (type & PRIMITIVE_ALL) {
++      case PRIMITIVE_TRIANGLE: {
++        hit = triangle_intersect(
++            kg, &isect, s.P, s.dir, tmin, tmax, visibility, prim_object, prim, prim_addr);
++        break;
++      }
++#  ifdef __OBJECT_MOTION__
++      case PRIMITIVE_MOTION_TRIANGLE: {
++        hit = motion_triangle_intersect(kg,
++                                        &isect,
++                                        s.P,
++                                        s.dir,
++                                        tmin,
++                                        tmax,
++                                        ray->time,
++                                        visibility,
++                                        prim_object,
++                                        prim,
++                                        prim_addr);
++        break;
++      }
++#  endif
++#  ifdef __HAIR__
++      case PRIMITIVE_CURVE_THICK:
++      case PRIMITIVE_MOTION_CURVE_THICK:
++      case PRIMITIVE_CURVE_RIBBON:
++      case PRIMITIVE_MOTION_CURVE_RIBBON:
++      case PRIMITIVE_CURVE_THICK_LINEAR:
++      case PRIMITIVE_MOTION_CURVE_THICK_LINEAR: {
++        if ((type & PRIMITIVE_MOTION) && kernel_data.bvh.use_bvh_steps) {
++          const float2 prim_time = kernel_data_fetch(prim_time, prim_addr);
++          if (ray->time < prim_time.x || ray->time > prim_time.y) {
++            hit = false;
++            break;
++          }
++        }
++        const int curve_type = kernel_data_fetch(prim_type, prim_addr);
++        hit = curve_intersect(
++            kg, &isect, s.P, s.dir, tmin, tmax, prim_object, prim, ray->time, curve_type);
++        break;
++      }
++#  endif
++#  ifdef __POINTCLOUD__
++      case PRIMITIVE_POINT:
++      case PRIMITIVE_MOTION_POINT: {
++        if ((type & PRIMITIVE_MOTION) && kernel_data.bvh.use_bvh_steps) {
++          const float2 prim_time = kernel_data_fetch(prim_time, prim_addr);
++          if (ray->time < prim_time.x || ray->time > prim_time.y) {
++            hit = false;
++            break;
++          }
++        }
++        const int point_type = kernel_data_fetch(prim_type, prim_addr);
++        hit = point_intersect(
++            kg, &isect, s.P, s.dir, tmin, tmax, prim_object, prim, ray->time, point_type);
++        break;
++      }
++#  endif
++#  ifdef __GSPLATS__
++      case PRIMITIVE_GSPLAT:
++      case PRIMITIVE_MOTION_GSPLAT: {
++        if ((type & PRIMITIVE_MOTION) && kernel_data.bvh.use_bvh_steps) {
++          const float2 prim_time = kernel_data_fetch(prim_time, prim_addr);
++          if (ray->time < prim_time.x || ray->time > prim_time.y) {
++            hit = false;
++            break;
++          }
++        }
++        const int point_type = kernel_data_fetch(prim_type, prim_addr);
++        hit = gsplat_intersect(
++            kg, &isect, s.P, s.dir, tmin, tmax, prim_object, prim, ray->time, point_type);
++        break;
++      }
++#  endif
++      default: {
++        hit = false;
++        break;
++      }
++    }
++
++    if (hit) {
++      if (!bvh_shadow_all_anyhit_filter<ISECT_TEST_NONE>(kg,
++                                                         s.payload.state,
++                                                         s.payload,
++                                                         BVH_PAYLOAD_BASE(s.payload).ray_self,
++                                                         BVH_PAYLOAD_BASE(s.payload).ray_visibility,
++                                                         isect))
++      {
++        return true;
++      }
++    }
++  }
++  return false;
++}
++#endif
++
++/* Advance one step; returns true when the ray is finished, with s.hit set the way the stock
++ * function's return value would be. */
++template<int Mode>
++ccl_device_forceinline bool bvh2df_step(KernelGlobals kg, BVH2DFRay &s, BVH2DFStackEntry *stack)
++{
++  const bool record_all = (Mode < 0) ? bool(s.mode) : (Mode == 1);
++  const float node_tmax = record_all ? s.ray.tmax : s.isect.t;
++#if CYCLES_BVH2DF_STEP == 0
++  if (s.node_addr >= 0 && s.node_addr != ENTRYPOINT_SENTINEL) {
++    bvh2df_node(kg, s, stack, node_tmax);
++    return false;
++  }
++#else
++  while (s.node_addr >= 0 && s.node_addr != ENTRYPOINT_SENTINEL) {
++    /* isect.t only changes in leaves, so the bound is constant inside this loop. */
++    bvh2df_node(kg, s, stack, node_tmax);
++  }
++#endif
++  if (s.node_addr < 0) {
++    const float4 leaf = kernel_data_fetch(bvh_leaf_nodes, (-s.node_addr - 1));
++    const int prim_addr = __float_as_int(leaf.x);
++    if (prim_addr >= 0) {
++      const int prim_addr2 = __float_as_int(leaf.y);
++      const uint type = __float_as_int(leaf.w);
++#ifdef CYCLES_BVH2DF_COUNT
++      s.count_leaves++;
++      s.count_prims += prim_addr2 - prim_addr;
++#endif
++      bvh2df_pop(s, stack);
++#ifdef __TRANSPARENT_SHADOWS__
++      const bool stop = record_all ?
++                            bvh2df_leaf_shadow_all(kg, s, prim_addr, prim_addr2, type) :
++                            bvh2df_leaf_closest(kg, s, prim_addr, prim_addr2, type);
++#else
++      const bool stop = bvh2df_leaf_closest(kg, s, prim_addr, prim_addr2, type);
++#endif
++      if (stop) {
++        s.hit = true;
++        return true;
++      }
++    }
++    else {
++      bvh2df_instance_push(kg, s, stack, prim_addr);
++    }
++  }
++  if (s.node_addr == ENTRYPOINT_SENTINEL) {
++    if (s.stack_ptr >= 0) {
++      kernel_assert(s.object != OBJECT_NONE);
++      bvh_instance_pop(&s.ray, &s.P, &s.dir, &s.idir);
++      s.object = OBJECT_NONE;
++      bvh2df_pop(s, stack);
++    }
++    if (s.node_addr == ENTRYPOINT_SENTINEL) {
++      s.hit = record_all ? false : (s.isect.prim != PRIM_NONE);
++      return true;
++    }
++  }
++  return false;
++}
++
++#ifdef __KERNEL_CUDA__
++/* Persistent-thread loop; every thread of the grid calls it once. */
++template<int Mode, class Work>
++ccl_device_forceinline void bvh2df_run(Work &work, uint *counter, const int work_size)
++{
++  BVH2DFRay s;
++#if CYCLES_BVH2DF_SPLITSTACK
++  BVH2DFStackEntry stack[BVH_STACK_SIZE];
++#else
++  BVH2DFStackEntry *stack = s.stack;
++#endif
++  const uint lane = threadIdx.x & 31;
++  const uint warp_mask = __activemask();
++  bool active = false;
++  bool exhausted = false;
++#  if CYCLES_BVH2DF_DEFER
++  bool pending = false;
++#  endif
++  int state = 0;
++#  if CYCLES_BVH2DF_CHUNK
++  /* Warp-uniform: the unused part [chunk_next, chunk_end) of this warp's current chunk. */
++  uint chunk_next = 0, chunk_end = 0;
++#  endif
++  while (true) {
++#  if CYCLES_BVH2DF_DEFER
++    if (pending) {
++      work.finish(state, s);
++      pending = false;
++    }
++#  endif
++    const bool idle = !active && !exhausted;
++    const uint fetch_mask = __ballot_sync(warp_mask, idle);
++    if (fetch_mask) {
++#  if CYCLES_BVH2DF_CHUNK
++      const uint need = __popc(fetch_mask);
++      const uint rank = __popc(fetch_mask & ((1u << lane) - 1));
++      const uint avail = chunk_end - chunk_next;
++      uint next = chunk_next + rank;
++      if (avail < need) {
++        const int leader = __ffs(fetch_mask) - 1;
++        uint base = 0;
++        if (lane == leader) {
++          base = atomicAdd(counter, uint(CYCLES_BVH2DF_CHUNK));
++        }
++        base = __shfl_sync(warp_mask, base, leader);
++        if (rank >= avail) {
++          next = base + (rank - avail);
++        }
++        chunk_next = base + (need - avail);
++        chunk_end = base + CYCLES_BVH2DF_CHUNK;
++      }
++      else {
++        chunk_next += need;
++      }
++      if (idle) {
++#  elif CYCLES_BVH2DF_FETCH == 0
++      const int leader = __ffs(fetch_mask) - 1;
++      uint base = 0;
++      if (lane == leader) {
++        base = atomicAdd(counter, uint(__popc(fetch_mask)));
++      }
++      base = __shfl_sync(warp_mask, base, leader);
++#  endif
++#  if !CYCLES_BVH2DF_CHUNK
++      if (idle) {
++#    if CYCLES_BVH2DF_FETCH == 0
++        const uint next = base + __popc(fetch_mask & ((1u << lane) - 1));
++#    else
++        const uint next = atomicAdd(counter, 1u);
++#    endif
++#  endif
++        exhausted = next >= uint(work_size);
++        if (!exhausted) {
++          state = work.state(int(next));
++          active = work.begin(state, s, stack);
++          if (!active) {
++            work.finish(state, s);
++          }
++        }
++      }
++    }
++    if (!__any_sync(warp_mask, active)) {
++      if (__all_sync(warp_mask, exhausted)) {
++        return;
++      }
++      continue;
++    }
++#  if CYCLES_BVH2DF_POLICY == 0
++    int lost_iterations = 0;
++#  endif
++    while (true) {
++      if (active) {
++        if (bvh2df_step<Mode>(nullptr, s, stack)) {
++#  if CYCLES_BVH2DF_DEFER
++          pending = true;
++#  else
++          work.finish(state, s);
++#  endif
++          active = false;
++        }
++      }
++      const uint live = __ballot_sync(warp_mask, active);
++      if (!live) {
++        break;
++      }
++#  if CYCLES_BVH2DF_POLICY == 0
++      lost_iterations += __popc(warp_mask & ~live) - CYCLES_BVH2DF_ND;
++      if (lost_iterations >= CYCLES_BVH2DF_NW) {
++        break;
++      }
++#  else
++      /* Refill only while rays remain; once the counter is exhausted keep stepping. */
++      if (__popc(live) < CYCLES_BVH2DF_MINLIVE && !__all_sync(warp_mask, exhausted || active)) {
++        break;
++      }
++#  endif
++    }
++  }
++}
++
++#  ifdef CYCLES_SSSDF
++/* The same fetch / refill / deferred-finish loop for per-lane work whose step is not a BVH2
++ * traversal step (the subsurface random walk: one bounce per step). Work provides
++ *   int state(int index); bool begin(int state)   (false: nothing to step, finish at once)
++ *   bool step(int state)  (true: finished);       void finish(int state)
++ * Policy knobs as above (CYCLES_BVH2DF_POLICY / _MINLIVE / _ND / _NW / _DEFER / _FETCH);
++ * CYCLES_BVH2DF_CHUNK is not applied here. */
++template<class Work>
++ccl_device_forceinline void bvh2df_run_work(Work &work, uint *counter, const int work_size)
++{
++  const uint lane = threadIdx.x & 31;
++  const uint warp_mask = __activemask();
++  bool active = false;
++  bool exhausted = false;
++#    if CYCLES_BVH2DF_DEFER
++  bool pending = false;
++#    endif
++  int state = 0;
++  while (true) {
++#    if CYCLES_BVH2DF_DEFER
++    if (pending) {
++      work.finish(state);
++      pending = false;
++    }
++#    endif
++    const bool idle = !active && !exhausted;
++    const uint fetch_mask = __ballot_sync(warp_mask, idle);
++    if (fetch_mask) {
++#    if CYCLES_BVH2DF_FETCH == 0
++      const int leader = __ffs(fetch_mask) - 1;
++      uint base = 0;
++      if (lane == leader) {
++        base = atomicAdd(counter, uint(__popc(fetch_mask)));
++      }
++      base = __shfl_sync(warp_mask, base, leader);
++#    endif
++      if (idle) {
++#    if CYCLES_BVH2DF_FETCH == 0
++        const uint next = base + __popc(fetch_mask & ((1u << lane) - 1));
++#    else
++        const uint next = atomicAdd(counter, 1u);
++#    endif
++        exhausted = next >= uint(work_size);
++        if (!exhausted) {
++          state = work.state(int(next));
++          active = work.begin(state);
++          if (!active) {
++            work.finish(state);
++          }
++        }
++      }
++    }
++    if (!__any_sync(warp_mask, active)) {
++      if (__all_sync(warp_mask, exhausted)) {
++        return;
++      }
++      continue;
++    }
++#    if CYCLES_BVH2DF_POLICY == 0
++    int lost_iterations = 0;
++#    endif
++    while (true) {
++      if (active) {
++        if (work.step(state)) {
++#    if CYCLES_BVH2DF_DEFER
++          pending = true;
++#    else
++          work.finish(state);
++#    endif
++          active = false;
++        }
++      }
++      const uint live = __ballot_sync(warp_mask, active);
++      if (!live) {
++        break;
++      }
++#    if CYCLES_BVH2DF_POLICY == 0
++      lost_iterations += __popc(warp_mask & ~live) - CYCLES_BVH2DF_ND;
++      if (lost_iterations >= CYCLES_BVH2DF_NW) {
++        break;
++      }
++#    else
++      if (__popc(live) < CYCLES_BVH2DF_MINLIVE && !__all_sync(warp_mask, exhausted || active)) {
++        break;
++      }
++#    endif
++    }
++  }
++}
++#  endif /* CYCLES_SSSDF */
++#endif
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/kernel/bvh/local.h b/intern/cycles/kernel/bvh/local.h
+index 1d25571..7aca1a8 100644
+--- a/intern/cycles/kernel/bvh/local.h
++++ b/intern/cycles/kernel/bvh/local.h
+@@ -22,7 +22,7 @@
+ #ifndef __KERNEL_GPU__
+ ccl_device
+ #else
+-ccl_device_inline
++ccl_device_hot
+ #endif
+     bool BVH_FUNCTION_FULL_NAME(BVH)(KernelGlobals kg,
+                                      const ccl_private Ray *ray,
+@@ -219,7 +219,7 @@ ccl_device_inline
+   return false;
+ }
+ 
+-ccl_device_inline bool BVH_FUNCTION_NAME(KernelGlobals kg,
++ccl_device_hot bool BVH_FUNCTION_NAME(KernelGlobals kg,
+                                          const ccl_private Ray *ray,
+                                          ccl_private LocalIntersection *local_isect,
+                                          const int local_object,
+diff --git a/intern/cycles/kernel/bvh/nodes.h b/intern/cycles/kernel/bvh/nodes.h
+index 7063a8b..3554ff6 100644
+--- a/intern/cycles/kernel/bvh/nodes.h
++++ b/intern/cycles/kernel/bvh/nodes.h
+@@ -39,6 +39,26 @@ ccl_device_forceinline int bvh_aligned_node_intersect(KernelGlobals kg,
+   float4 node1 = kernel_data_fetch(bvh_nodes, node_addr + 2);
+   float4 node2 = kernel_data_fetch(bvh_nodes, node_addr + 3);
+ 
++#ifdef CYCLES_BVH_FMA
++  const float pidx = P.x * idir.x, pidy = P.y * idir.y, pidz = P.z * idir.z;
++  float c0lox = fmaf(node0.x, idir.x, -pidx);
++  float c0hix = fmaf(node0.z, idir.x, -pidx);
++  float c0loy = fmaf(node1.x, idir.y, -pidy);
++  float c0hiy = fmaf(node1.z, idir.y, -pidy);
++  float c0loz = fmaf(node2.x, idir.z, -pidz);
++  float c0hiz = fmaf(node2.z, idir.z, -pidz);
++  float c0min = max4(tmin, min(c0lox, c0hix), min(c0loy, c0hiy), min(c0loz, c0hiz));
++  float c0max = min4(tmax, max(c0lox, c0hix), max(c0loy, c0hiy), max(c0loz, c0hiz));
++
++  float c1lox = fmaf(node0.y, idir.x, -pidx);
++  float c1hix = fmaf(node0.w, idir.x, -pidx);
++  float c1loy = fmaf(node1.y, idir.y, -pidy);
++  float c1hiy = fmaf(node1.w, idir.y, -pidy);
++  float c1loz = fmaf(node2.y, idir.z, -pidz);
++  float c1hiz = fmaf(node2.w, idir.z, -pidz);
++  float c1min = max4(tmin, min(c1lox, c1hix), min(c1loy, c1hiy), min(c1loz, c1hiz));
++  float c1max = min4(tmax, max(c1lox, c1hix), max(c1loy, c1hiy), max(c1loz, c1hiz));
++#else
+   /* intersect ray against child nodes */
+   float c0lox = (node0.x - P.x) * idir.x;
+   float c0hix = (node0.z - P.x) * idir.x;
+@@ -57,6 +77,7 @@ ccl_device_forceinline int bvh_aligned_node_intersect(KernelGlobals kg,
+   float c1hiz = (node2.w - P.z) * idir.z;
+   float c1min = max4(tmin, min(c1lox, c1hix), min(c1loy, c1hiy), min(c1loz, c1hiz));
+   float c1max = min4(tmax, max(c1lox, c1hix), max(c1loy, c1hiy), max(c1loz, c1hiz));
++#endif
+ 
+   dist[0] = c0min;
+   dist[1] = c1min;
+diff --git a/intern/cycles/kernel/closure/bsdf.h b/intern/cycles/kernel/closure/bsdf.h
+index b8d72a5..28922b1 100644
+--- a/intern/cycles/kernel/closure/bsdf.h
++++ b/intern/cycles/kernel/closure/bsdf.h
+@@ -170,7 +170,7 @@ ccl_device_inline bool bsdf_is_transmission(const ccl_private ShaderClosure *sc,
+   return dot(sc->N, wo) < 0.0f;
+ }
+ 
+-ccl_device_inline int bsdf_sample(KernelGlobals kg,
++ccl_device_hot int bsdf_sample(KernelGlobals kg,
+                                   ccl_private ShaderData *sd,
+                                   const ccl_private ShaderClosure *sc,
+                                   const float3 rand,
+@@ -549,7 +549,7 @@ ccl_device_inline int bsdf_label(const KernelGlobals kg,
+ #ifndef __KERNEL_CUDA__
+ ccl_device
+ #else
+-ccl_device_inline
++ccl_device_hot
+ #endif
+     Spectrum bsdf_eval(KernelGlobals kg,
+                        ccl_private ShaderData *sd,
+diff --git a/intern/cycles/kernel/closure/bsdf_microfacet.h b/intern/cycles/kernel/closure/bsdf_microfacet.h
+index b9261e4..2bcb2a2 100644
+--- a/intern/cycles/kernel/closure/bsdf_microfacet.h
++++ b/intern/cycles/kernel/closure/bsdf_microfacet.h
+@@ -1222,7 +1222,7 @@ ccl_device void bsdf_microfacet_blur(ccl_private ShaderClosure *sc, const float
+   bsdf->alpha_y = fmaxf(roughness, bsdf->alpha_y);
+ }
+ 
+-ccl_device Spectrum bsdf_microfacet_ggx_eval(KernelGlobals kg,
++ccl_device_hot Spectrum bsdf_microfacet_ggx_eval(KernelGlobals kg,
+                                              const ccl_private ShaderClosure *sc,
+                                              const float3 wi,
+                                              const float3 wo,
+@@ -1232,7 +1232,7 @@ ccl_device Spectrum bsdf_microfacet_ggx_eval(KernelGlobals kg,
+   return bsdf->energy_scale * bsdf_microfacet_eval<MicrofacetType::GGX>(kg, sc, wi, wo, pdf);
+ }
+ 
+-ccl_device int bsdf_microfacet_ggx_sample(KernelGlobals kg,
++ccl_device_hot int bsdf_microfacet_ggx_sample(KernelGlobals kg,
+                                           const ccl_private ShaderClosure *sc,
+                                           const float3 Ng,
+                                           const float3 wi,
+diff --git a/intern/cycles/kernel/device/cuda/compat.h b/intern/cycles/kernel/device/cuda/compat.h
+index fe130c3..3dd2fad 100644
+--- a/intern/cycles/kernel/device/cuda/compat.h
++++ b/intern/cycles/kernel/device/cuda/compat.h
+@@ -35,6 +35,19 @@ typedef unsigned long long uint64_t;
+ #define ccl_device_inline __device__ __inline__
+ #define ccl_device_forceinline __device__ __forceinline__
+ #define ccl_device_noinline __device__ __noinline__
++/* Ours: CYCLES_INLINE_HOT=1 force-inlines the hot BSDF, shader-setup, local-BVH and light-tree functions that
++ * nvcc inlines once SVM node pruning shrinks the interpreter; =2 also the surface_shader BSDF evaluators.
++ * Unset: the same qualifier as before (__inline__), so the cubin does not change. */
++#if defined(CYCLES_INLINE_HOT) && CYCLES_INLINE_HOT >= 1
++#  define ccl_device_hot __device__ __forceinline__
++#else
++#  define ccl_device_hot __device__ __inline__
++#endif
++#if defined(CYCLES_INLINE_HOT) && CYCLES_INLINE_HOT >= 2
++#  define ccl_device_hot2 __device__ __forceinline__
++#else
++#  define ccl_device_hot2 __device__ __inline__
++#endif
+ #define ccl_device_noinline_cpu ccl_device
+ #define ccl_device_inline_method ccl_device
+ #define ccl_device_template_spec template<> ccl_device_inline
+diff --git a/intern/cycles/kernel/device/cuda/config.h b/intern/cycles/kernel/device/cuda/config.h
+index 2fda2a6..a39501d 100644
+--- a/intern/cycles/kernel/device/cuda/config.h
++++ b/intern/cycles/kernel/device/cuda/config.h
+@@ -52,6 +52,54 @@
+                                                GPU_MULTIPRESSOR_MAX_REGISTERS / \
+                                                    (block_num_threads * thread_num_registers))
+ 
++#ifndef CYCLES_ISECT_BLOCK
++#  define CYCLES_ISECT_BLOCK GPU_KERNEL_BLOCK_NUM_THREADS
++#endif
++#ifndef CYCLES_ISECT_MINBLOCKS
++#  define CYCLES_ISECT_MINBLOCKS \
++    (GPU_MULTIPRESSOR_MAX_REGISTERS / (CYCLES_ISECT_BLOCK * GPU_KERNEL_MAX_REGISTERS))
++#endif
++#ifndef CYCLES_SHADE_BLOCK
++#  define CYCLES_SHADE_BLOCK GPU_KERNEL_BLOCK_NUM_THREADS
++#endif
++#ifndef CYCLES_SHADE_MINBLOCKS
++#  define CYCLES_SHADE_MINBLOCKS \
++    (GPU_MULTIPRESSOR_MAX_REGISTERS / (CYCLES_SHADE_BLOCK * GPU_KERNEL_MAX_REGISTERS))
++#endif
++#ifndef CYCLES_SSS_BLOCK
++#  define CYCLES_SSS_BLOCK CYCLES_ISECT_BLOCK
++#endif
++#ifndef CYCLES_SSS_MINBLOCKS
++#  define CYCLES_SSS_MINBLOCKS CYCLES_ISECT_MINBLOCKS
++#endif
++#ifndef CYCLES_NEE_BLOCK
++#  define CYCLES_NEE_BLOCK GPU_KERNEL_BLOCK_NUM_THREADS
++#endif
++#ifndef CYCLES_NEE_MINBLOCKS
++#  define CYCLES_NEE_MINBLOCKS \
++    (GPU_MULTIPRESSOR_MAX_REGISTERS / (CYCLES_NEE_BLOCK * GPU_KERNEL_MAX_REGISTERS))
++#endif
++#define ccl_gpu_kernel_isect \
++  extern "C" __global__ void __launch_bounds__(CYCLES_ISECT_BLOCK, CYCLES_ISECT_MINBLOCKS)
++/* Separate minimum blocks per SM (so register caps) for intersect_closest and intersect_shadow;
++ * the defaults keep CYCLES_ISECT_MINBLOCKS. */
++#ifndef CYCLES_CLOSEST_MINBLOCKS
++#  define CYCLES_CLOSEST_MINBLOCKS CYCLES_ISECT_MINBLOCKS
++#endif
++#ifndef CYCLES_SHADOW_MINBLOCKS
++#  define CYCLES_SHADOW_MINBLOCKS CYCLES_ISECT_MINBLOCKS
++#endif
++#define ccl_gpu_kernel_closest \
++  extern "C" __global__ void __launch_bounds__(CYCLES_ISECT_BLOCK, CYCLES_CLOSEST_MINBLOCKS)
++#define ccl_gpu_kernel_shadow \
++  extern "C" __global__ void __launch_bounds__(CYCLES_ISECT_BLOCK, CYCLES_SHADOW_MINBLOCKS)
++#define ccl_gpu_kernel_sss \
++  extern "C" __global__ void __launch_bounds__(CYCLES_SSS_BLOCK, CYCLES_SSS_MINBLOCKS)
++#define ccl_gpu_kernel_shade \
++  extern "C" __global__ void __launch_bounds__(CYCLES_SHADE_BLOCK, CYCLES_SHADE_MINBLOCKS)
++#define ccl_gpu_kernel_nee \
++  extern "C" __global__ void __launch_bounds__(CYCLES_NEE_BLOCK, CYCLES_NEE_MINBLOCKS)
++
+ #define ccl_gpu_kernel_threads(block_num_threads) \
+   extern "C" __global__ void __launch_bounds__(block_num_threads)
+ 
+diff --git a/intern/cycles/kernel/device/cuda/globals.h b/intern/cycles/kernel/device/cuda/globals.h
+index 68b1a41..0361617 100644
+--- a/intern/cycles/kernel/device/cuda/globals.h
++++ b/intern/cycles/kernel/device/cuda/globals.h
+@@ -38,6 +38,15 @@ struct KernelParamsCUDA {
+ __constant__ KernelParamsCUDA kernel_params;
+ #endif
+ 
++#ifdef CYCLES_NRC
++CCL_NAMESPACE_END
++#  include "kernel/integrator/nrc_types.h"
++CCL_NAMESPACE_BEGIN
++#  ifdef __KERNEL_GPU__
++__constant__ KernelNRC kernel_nrc;
++#  endif
++#endif
++
+ /* Abstraction macros */
+ #define kernel_data kernel_params.data
+ #define kernel_data_fetch(name, index) kernel_params.name[(index)]
+diff --git a/intern/cycles/kernel/device/gpu/kernel.h b/intern/cycles/kernel/device/gpu/kernel.h
+index 837d75c..d7a14bb 100644
+--- a/intern/cycles/kernel/device/gpu/kernel.h
++++ b/intern/cycles/kernel/device/gpu/kernel.h
+@@ -53,6 +53,17 @@
+ 
+ #include "kernel/film/read.h"
+ 
++/* Dynamic-fetch BVH2 traversal for intersect_closest (CYCLES_BVH2DF_CLOSEST=1) and
++ * intersect_shadow (CYCLES_BVH2DF_SHADOW=1); its own knobs are in kernel/bvh/bvh2_dynamic.h. */
++#if defined(__KERNEL_CUDA__) && !defined(__KERNEL_OPTIX__) && \
++    (defined(CYCLES_BVH2DF_CLOSEST) || defined(CYCLES_BVH2DF_SHADOW))
++#  include "kernel/integrator/intersect_dynamic.h"
++#endif
++/* Dynamic-fetch subsurface random walk for intersect_subsurface (CYCLES_SSSDF). */
++#if defined(__KERNEL_CUDA__) && !defined(__KERNEL_OPTIX__) && defined(CYCLES_SSSDF)
++#  include "kernel/integrator/intersect_subsurface_dynamic.h"
++#endif
++
+ /* --------------------------------------------------------------------
+  * Integrator.
+  */
+@@ -155,12 +166,35 @@ ccl_gpu_kernel_postfix
+ #    include "kernel/device/oneapi/context_intersect_begin.h"
+ #  endif
+ 
+-ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++#ifndef ccl_gpu_kernel_isect
++#  define ccl_gpu_kernel_isect ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++#endif
++#ifndef ccl_gpu_kernel_closest
++#  define ccl_gpu_kernel_closest ccl_gpu_kernel_isect
++#endif
++#ifndef ccl_gpu_kernel_shadow
++#  define ccl_gpu_kernel_shadow ccl_gpu_kernel_isect
++#endif
++#ifndef ccl_gpu_kernel_sss
++#  define ccl_gpu_kernel_sss ccl_gpu_kernel_isect
++#endif
++#ifndef ccl_gpu_kernel_shade
++#  define ccl_gpu_kernel_shade ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++#endif
++#ifndef ccl_gpu_kernel_nee
++#  define ccl_gpu_kernel_nee ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++#endif
++
++ccl_gpu_kernel_closest
+     ccl_gpu_kernel_signature(integrator_intersect_closest,
+                              const ccl_global int *path_index_array,
+                              ccl_global float *render_buffer,
+                              const int work_size)
+ {
++#if defined(__KERNEL_CUDA__) && !defined(__KERNEL_OPTIX__) && defined(CYCLES_BVH2DF_CLOSEST)
++  integrator_intersect_closest_df(path_index_array, render_buffer, work_size);
++  return;
++#endif
+   const int global_index = ccl_gpu_global_id_x();
+ 
+   if (ccl_gpu_kernel_within_bounds(global_index, work_size)) {
+@@ -170,11 +204,15 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+ }
+ ccl_gpu_kernel_postfix
+ 
+-ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++ccl_gpu_kernel_shadow
+     ccl_gpu_kernel_signature(integrator_intersect_shadow,
+                              const ccl_global int *path_index_array,
+                              const int work_size)
+ {
++#if defined(__KERNEL_CUDA__) && !defined(__KERNEL_OPTIX__) && defined(CYCLES_BVH2DF_SHADOW)
++  integrator_intersect_shadow_df(path_index_array, work_size);
++  return;
++#endif
+   const int global_index = ccl_gpu_global_id_x();
+ 
+   if (ccl_gpu_kernel_within_bounds(global_index, work_size)) {
+@@ -184,11 +222,16 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+ }
+ ccl_gpu_kernel_postfix
+ 
+-ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++ccl_gpu_kernel_sss
+     ccl_gpu_kernel_signature(integrator_intersect_subsurface,
+                              const ccl_global int *path_index_array,
+                              const int work_size)
+ {
++#if defined(__KERNEL_CUDA__) && !defined(__KERNEL_OPTIX__) && defined(CYCLES_SSSDF) && \
++    defined(__SUBSURFACE__)
++  integrator_intersect_subsurface_df(path_index_array, work_size);
++  return;
++#endif
+   const int global_index = ccl_gpu_global_id_x();
+ 
+   if (ccl_gpu_kernel_within_bounds(global_index, work_size)) {
+@@ -265,7 +308,7 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+ }
+ ccl_gpu_kernel_postfix
+ 
+-ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++ccl_gpu_kernel_nee
+     ccl_gpu_kernel_signature(integrator_shade_light_nee,
+                              const ccl_global int *path_index_array,
+                              ccl_global float *render_buffer,
+@@ -295,7 +338,7 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+ }
+ ccl_gpu_kernel_postfix
+ 
+-ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++ccl_gpu_kernel_shade
+     ccl_gpu_kernel_signature(integrator_shade_shadow,
+                              const ccl_global int *path_index_array,
+                              ccl_global float *render_buffer,
+@@ -310,7 +353,7 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+ }
+ ccl_gpu_kernel_postfix
+ 
+-ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++ccl_gpu_kernel_shade
+     ccl_gpu_kernel_signature(integrator_shade_surface,
+                              const ccl_global int *path_index_array,
+                              ccl_global float *render_buffer,
+@@ -1529,3 +1572,58 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+   }
+ }
+ ccl_gpu_kernel_postfix
++
++#ifdef CYCLES_NRC
++/* Ours: neural radiance cache kernels (kernel/integrator/nrc.h), launched by name from integrator/nrc.cpp. */
++ccl_gpu_kernel_threads(256) ccl_gpu_kernel_signature(nrc_collect, const int num)
++{
++  const int i = ccl_gpu_global_id_x();
++  if (i < num) {
++    ccl_gpu_kernel_call(nrc_collect(i));
++  }
++}
++ccl_gpu_kernel_postfix
++
++ccl_gpu_kernel_threads(256)
++    ccl_gpu_kernel_signature(nrc_resolve, ccl_global float *render_buffer, const int num)
++{
++  const int i = ccl_gpu_global_id_x();
++  if (i < num) {
++    ccl_gpu_kernel_call(nrc_resolve(render_buffer, i));
++  }
++}
++ccl_gpu_kernel_postfix
++
++ccl_gpu_kernel_threads(256) ccl_gpu_kernel_signature(nrc_pad, const int n0, const int num)
++{
++  const int i = ccl_gpu_global_id_x();
++  if (i < num) {
++    ccl_gpu_kernel_call(nrc_pad(n0, i));
++  }
++}
++ccl_gpu_kernel_postfix
++
++ccl_gpu_kernel_threads(256) ccl_gpu_kernel_signature(nrc_stub_train,
++                                                     const ccl_global unsigned short *in,
++                                                     const ccl_global float *target,
++                                                     const int num)
++{
++  const int i = ccl_gpu_global_id_x();
++  if (i < num) {
++    ccl_gpu_kernel_call(nrc_stub_train(in, target, i));
++  }
++}
++ccl_gpu_kernel_postfix
++
++ccl_gpu_kernel_threads(256) ccl_gpu_kernel_signature(nrc_stub_infer,
++                                                     const ccl_global unsigned short *in,
++                                                     ccl_global float *out,
++                                                     const int num)
++{
++  const int i = ccl_gpu_global_id_x();
++  if (i < num) {
++    ccl_gpu_kernel_call(nrc_stub_infer(in, out, i));
++  }
++}
++ccl_gpu_kernel_postfix
++#endif /* CYCLES_NRC */
+diff --git a/intern/cycles/kernel/film/light_passes.h b/intern/cycles/kernel/film/light_passes.h
+index 7e76c4e..e98a6ff 100644
+--- a/intern/cycles/kernel/film/light_passes.h
++++ b/intern/cycles/kernel/film/light_passes.h
+@@ -11,6 +11,10 @@
+ #include "kernel/sample/pattern.h"
+ #include "util/atomic.h"
+ 
++#ifdef CYCLES_NRC
++#  include "kernel/integrator/nrc.h"
++#endif
++
+ CCL_NAMESPACE_BEGIN
+ 
+ /* --------------------------------------------------------------------
+@@ -517,6 +521,9 @@ ccl_device_inline void film_write_direct_light(KernelGlobals kg,
+ 
+   /* Direct light shadow. */
+   film_write_combined_pass(kg, path_visibility, path_flag, sample, contribution, buffer);
++#ifdef CYCLES_NRC
++  nrc_record_shadow(state, INTEGRATOR_STATE(state, shadow_path, bounce), contribution);
++#endif
+ 
+ #ifdef __PASSES__
+   if (kernel_data.film.light_pass_flag & PASS_ANY) {
+@@ -648,6 +655,9 @@ ccl_device_inline void film_write_background(KernelGlobals kg,
+     const int sample = INTEGRATOR_STATE(state, path, sample);
+     film_write_combined_transparent_pass(
+         kg, path_visibility, path_flag, sample, contribution, transparent, buffer);
++#ifdef CYCLES_NRC
++    nrc_record_main(state, INTEGRATOR_STATE(state, path, bounce), contribution);
++#endif
+   }
+   film_write_emission_or_background_pass(kg,
+                                          state,
+@@ -673,6 +683,9 @@ ccl_device_inline void film_write_volume_emission(KernelGlobals kg,
+   const int sample = INTEGRATOR_STATE(state, path, sample);
+ 
+   film_write_combined_pass(kg, path_visibility, path_flag, sample, contribution, buffer);
++#ifdef CYCLES_NRC
++  nrc_record_main(state, INTEGRATOR_STATE(state, path, bounce), contribution);
++#endif
+   film_write_emission_or_background_pass(
+       kg, state, contribution, buffer, kernel_data.film.pass_emission, lightgroup);
+ }
+@@ -693,6 +706,9 @@ ccl_device_inline void film_write_surface_emission(KernelGlobals kg,
+   const int sample = INTEGRATOR_STATE(state, path, sample);
+ 
+   film_write_combined_pass(kg, path_visibility, path_flag, sample, contribution, buffer);
++#ifdef CYCLES_NRC
++  nrc_record_main(state, INTEGRATOR_STATE(state, path, bounce), contribution);
++#endif
+   film_write_emission_or_background_pass(
+       kg, state, contribution, buffer, kernel_data.film.pass_emission, lightgroup);
+ }
+diff --git a/intern/cycles/kernel/geom/shader_data.h b/intern/cycles/kernel/geom/shader_data.h
+index ed9525f..b2f4957 100644
+--- a/intern/cycles/kernel/geom/shader_data.h
++++ b/intern/cycles/kernel/geom/shader_data.h
+@@ -43,7 +43,7 @@ ccl_device void shader_setup_object_transforms(KernelGlobals kg,
+ #ifdef __KERNEL_HIP__
+ ccl_device_noinline
+ #else
+-ccl_device_inline
++ccl_device_hot
+ #endif
+     void shader_setup_from_ray(KernelGlobals kg,
+                                ccl_private ShaderData *ccl_restrict sd,
+diff --git a/intern/cycles/kernel/integrator/init_from_camera.h b/intern/cycles/kernel/integrator/init_from_camera.h
+index 948a83a..5b67765 100644
+--- a/intern/cycles/kernel/integrator/init_from_camera.h
++++ b/intern/cycles/kernel/integrator/init_from_camera.h
+@@ -137,6 +137,9 @@ ccl_device bool integrator_init_from_camera(KernelGlobals kg,
+     else {
+       integrator_path_init(state, DEVICE_KERNEL_INTEGRATOR_INTERSECT_CLOSEST);
+     }
++#ifdef CYCLES_NRC
++    nrc_path_begin(state, INTEGRATOR_STATE(state, path, render_pixel_index), uint(sample));
++#endif
+   }
+ 
+   return true;
+diff --git a/intern/cycles/kernel/integrator/intersect_dynamic.h b/intern/cycles/kernel/integrator/intersect_dynamic.h
+new file mode 100644
+index 0000000..5aeb6df
+--- /dev/null
++++ b/intern/cycles/kernel/integrator/intersect_dynamic.h
+@@ -0,0 +1,278 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++
++#pragma once
++
++/* Dynamic-fetch (persistent-thread) versions of the intersect_closest and intersect_shadow
++ * kernels, on kernel/bvh/bvh2_dynamic.h. Begin and finish are the code of
++ * integrator_intersect_closest and integrator_intersect_shadow before and after their
++ * scene_intersect* call, unchanged; only the traversal between them runs through the
++ * dynamic-fetch loop, which visits each ray's nodes and primitives in the stock order.
++ *
++ * Launch: the host's normal grid (one thread per path, no host change). Every block runs the
++ * fetch loop, blocks that start after the paths are all taken exit at once, and the last block to
++ * finish zeroes the kernel's counter for its next launch (launches on a queue's stream run one
++ * after another).
++ *
++ * Blender 5.3.0 port: begin and finish copy 5.3.0 integrator_intersect_closest,
++ * integrator_intersect_shadow, integrate_intersect_shadow_opaque/_transparent and the setup of
++ * scene_intersect_shadow_all (BVHShadowAllPayload). */
++
++#include "kernel/bvh/bvh2_dynamic.h"
++
++CCL_NAMESPACE_BEGIN
++
++struct IntersectClosestDFWork {
++  const ccl_global int *path_index_array;
++  ccl_global float *render_buffer;
++
++  ccl_device_forceinline int state(const int index)
++  {
++    return path_index_array ? path_index_array[index] : index;
++  }
++
++  ccl_device_forceinline bool begin(const int state, BVH2DFRay &s, BVH2DFStackEntry *stack)
++  {
++    KernelGlobals kg = nullptr;
++    Ray &ray = s.ray;
++    integrator_state_read_ray(state, &ray);
++    kernel_assert(ray.tmax != 0.0f);
++
++    const uint visibility = path_state_ray_visibility(state);
++    const int last_isect_prim = INTEGRATOR_STATE(state, isect, prim);
++    const int last_isect_object = INTEGRATOR_STATE(state, isect, object);
++
++    /* Trick to use short AO rays to approximate indirect light at the end of the path. */
++    if (path_state_ao_bounce(kg, state)) {
++      ray.tmax = kernel_data.integrator.ao_bounces_distance;
++
++      if (last_isect_object != OBJECT_NONE) {
++        const float object_ao_distance = kernel_data_fetch(objects, last_isect_object).ao_distance;
++        if (object_ao_distance != 0.0f) {
++          ray.tmax = object_ao_distance;
++        }
++      }
++    }
++
++    s.isect.object = OBJECT_NONE;
++    s.isect.prim = PRIM_NONE;
++    ray.self.object = last_isect_object;
++    ray.self.prim = last_isect_prim;
++    ray.self.light_object = OBJECT_NONE;
++    ray.self.light_prim = PRIM_NONE;
++    s.visibility = visibility;
++    s.mode = 0;
++    s.hit = false;
++    /* scene_intersect returns false for an invalid ray without touching isect. */
++    if (!intersection_ray_valid(&ray)) {
++      return false;
++    }
++    bvh2df_begin(kg, s, stack);
++    return true;
++  }
++
++  ccl_device_forceinline void finish(const int state, BVH2DFRay &s)
++  {
++    KernelGlobals kg = nullptr;
++    Ray &ray = s.ray;
++    Intersection &isect = s.isect;
++    bool hit = s.hit;
++    const int last_isect_prim = INTEGRATOR_STATE(state, isect, prim);
++    const int last_isect_object = INTEGRATOR_STATE(state, isect, object);
++
++    /* TODO: remove this and do it in the various intersection functions instead. */
++    if (!hit) {
++      isect.prim = PRIM_NONE;
++    }
++
++    /* Setup mnee flag to signal last intersection with a caster */
++    const PathRayVisibility path_visibility = INTEGRATOR_STATE(state, path, visibility);
++    const uint32_t path_flag = INTEGRATOR_STATE(state, path, flag);
++
++#ifdef __MNEE__
++    /* Path culling logic for MNEE (removes fireflies at the cost of bias) */
++    if (kernel_data.integrator.use_caustics) {
++      bool from_caustic_caster = false;
++      bool from_caustic_receiver = false;
++      if (!(path_visibility & PATH_RAY_VISIBILITY_CAMERA) && last_isect_object != OBJECT_NONE) {
++        const uint object_flags = kernel_data_fetch(object_flag, last_isect_object);
++        from_caustic_receiver = (object_flags & SD_OBJECT_CAUSTICS_RECEIVER);
++        from_caustic_caster = (object_flags & SD_OBJECT_CAUSTICS_CASTER);
++      }
++
++      const bool has_receiver_ancestor = INTEGRATOR_STATE(state, path, mnee) &
++                                         PATH_MNEE_RECEIVER_ANCESTOR;
++      INTEGRATOR_STATE_WRITE(state, path, mnee) &= ~PATH_MNEE_CULL_LIGHT_CONNECTION;
++      if (from_caustic_caster && has_receiver_ancestor) {
++        INTEGRATOR_STATE_WRITE(state, path, mnee) |= PATH_MNEE_CULL_LIGHT_CONNECTION;
++      }
++      if (from_caustic_receiver) {
++        INTEGRATOR_STATE_WRITE(state, path, mnee) |= PATH_MNEE_RECEIVER_ANCESTOR;
++      }
++    }
++#endif /* __MNEE__ */
++
++    /* Light intersection for MIS. */
++    if (kernel_data.integrator.use_light_mis && !integrator_intersect_skip_lights(kg, state)) {
++      const int last_type = INTEGRATOR_STATE(state, isect, type);
++      hit = lights_intersect(kg,
++                             state,
++                             &ray,
++                             &isect,
++                             last_isect_prim,
++                             last_isect_object,
++                             last_type,
++                             path_visibility,
++                             path_flag) ||
++            hit;
++    }
++
++    /* Write intersection result into global integrator state memory. */
++    integrator_state_write_isect(state, &isect);
++
++    /* Setup up next kernel to be executed. */
++    integrator_intersect_next_kernel<DEVICE_KERNEL_INTEGRATOR_INTERSECT_CLOSEST>(
++        kg, state, &isect, render_buffer, hit);
++  }
++};
++
++struct IntersectShadowDFWork {
++  const ccl_global int *path_index_array;
++
++  ccl_device_forceinline int state(const int index)
++  {
++    return path_index_array ? path_index_array[index] : index;
++  }
++
++  ccl_device_forceinline bool begin(const int state, BVH2DFRay &s, BVH2DFStackEntry *stack)
++  {
++    KernelGlobals kg = nullptr;
++    integrator_state_read_shadow_ray(state, &s.ray);
++    integrator_state_read_shadow_ray_self(state, &s.ray);
++    s.visibility = integrate_intersect_shadow_visibility(state);
++    s.hit = false;
++#ifdef __TRANSPARENT_SHADOWS__
++    s.mode = kernel_data.integrator.transparent_shadows ? 1 : 0;
++    if (s.mode) {
++      /* integrate_intersect_shadow_transparent and scene_intersect_shadow_all. The payload is set
++       * before the validity test: an invalid ray leaves it as initialized, with no recorded hits
++       * and throughput one, which is what scene_intersect_shadow_all returns for it. */
++      const uint max_transparent_hits = integrate_shadow_max_transparent_hits(kg, state);
++      s.payload = BVHShadowAllPayload();
++      BVH_PAYLOAD_BASE(s.payload).ray_self = s.ray.self;
++      BVH_PAYLOAD_BASE(s.payload).ray_visibility = s.visibility;
++      s.payload.state = state;
++      s.payload.max_transparent_hits = max_transparent_hits;
++      s.payload.max_record_isect_t = s.ray.tmax;
++    }
++    else
++#else
++    s.mode = 0;
++#endif
++    {
++      /* integrate_intersect_shadow_opaque */
++      constexpr const uint opaque_mask = SHADOW_CATCHER_VISIBILITY_SHIFT(
++                                             PATH_RAY_VISIBILITY_SHADOW_OPAQUE) |
++                                         PATH_RAY_VISIBILITY_SHADOW_OPAQUE;
++      s.visibility &= opaque_mask;
++    }
++    /* scene_intersect_shadow / scene_intersect_shadow_all: an invalid ray hits nothing, with no
++     * recorded hits and throughput one. */
++    if (!intersection_ray_valid(&s.ray)) {
++      return false;
++    }
++    bvh2df_begin(kg, s, stack);
++    return true;
++  }
++
++  ccl_device_forceinline void finish(const int state, BVH2DFRay &s)
++  {
++    bool opaque_hit = s.hit;
++#ifdef __TRANSPARENT_SHADOWS__
++    if (s.mode) {
++      /* Rest of integrate_intersect_shadow_transparent. */
++      const uint num_hits = s.payload.num_recorded_hits;
++      const float3 throughput = s.payload.throughput;
++
++      opaque_hit = is_zero(throughput);
++
++      if (!isequal(throughput, one_float3())) {
++        INTEGRATOR_STATE_WRITE(state, shadow_path, throughput) *= throughput;
++      }
++
++      if (!opaque_hit) {
++        const uint num_recorded_hits = min(num_hits, (uint)INTEGRATOR_SHADOW_ISECT_SIZE);
++
++        if (num_recorded_hits > 0) {
++          sort_shadow_intersections(state, num_recorded_hits);
++        }
++
++        INTEGRATOR_STATE_WRITE(state, shadow_path, packed_num_hits) = num_hits;
++      }
++      else {
++        INTEGRATOR_STATE_WRITE(state, shadow_path, packed_num_hits) = 0;
++      }
++    }
++    else
++#endif
++        if (!opaque_hit)
++    {
++      /* Rest of integrate_intersect_shadow_opaque. */
++      INTEGRATOR_STATE_WRITE(state, shadow_path, packed_num_hits) = 0;
++    }
++
++    if (opaque_hit) {
++      /* Hit an opaque surface, shadow path ends here. */
++      integrator_shadow_path_terminate(state, DEVICE_KERNEL_INTEGRATOR_INTERSECT_SHADOW);
++      return;
++    }
++    integrator_shadow_path_next(
++        state, DEVICE_KERNEL_INTEGRATOR_INTERSECT_SHADOW, DEVICE_KERNEL_INTEGRATOR_SHADE_SHADOW);
++  }
++};
++
++/* Per kernel: [0] the fetch counter, [1] blocks finished in the current launch. */
++extern "C" __device__ uint bvh2df_closest_counters[2];
++extern "C" __device__ uint bvh2df_shadow_counters[2];
++__device__ uint bvh2df_closest_counters[2] = {0, 0};
++__device__ uint bvh2df_shadow_counters[2] = {0, 0};
++
++ccl_device_forceinline void bvh2df_block_done(uint *counters)
++{
++  __syncthreads();
++  if (threadIdx.x == 0) {
++    __threadfence();
++    if (atomicAdd(&counters[1], 1u) == gridDim.x - 1) {
++      counters[0] = 0;
++      counters[1] = 0;
++      __threadfence();
++    }
++  }
++}
++
++ccl_device_forceinline void integrator_intersect_closest_df(const ccl_global int *path_index_array,
++                                                            ccl_global float *render_buffer,
++                                                            const int work_size)
++{
++  IntersectClosestDFWork work{path_index_array, render_buffer};
++  bvh2df_run<0>(work, &bvh2df_closest_counters[0], work_size);
++  bvh2df_block_done(bvh2df_closest_counters);
++}
++
++ccl_device_forceinline void integrator_intersect_shadow_df(const ccl_global int *path_index_array,
++                                                           const int work_size)
++{
++  IntersectShadowDFWork work{path_index_array};
++#ifdef __TRANSPARENT_SHADOWS__
++  /* Uniform for the launch: one loop per leaf type. */
++  if (kernel_data.integrator.transparent_shadows) {
++    bvh2df_run<1>(work, &bvh2df_shadow_counters[0], work_size);
++  }
++  else
++#endif
++  {
++    bvh2df_run<0>(work, &bvh2df_shadow_counters[0], work_size);
++  }
++  bvh2df_block_done(bvh2df_shadow_counters);
++}
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/kernel/integrator/intersect_subsurface_dynamic.h b/intern/cycles/kernel/integrator/intersect_subsurface_dynamic.h
+new file mode 100644
+index 0000000..0649495
+--- /dev/null
++++ b/intern/cycles/kernel/integrator/intersect_subsurface_dynamic.h
+@@ -0,0 +1,153 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++
++#pragma once
++
++/* Dynamic-fetch version of the intersect_subsurface kernel (CYCLES_SSSDF), Blender 5.3.0: random
++ * walks advance one bounce per step through bvh2df_run_work, and a lane whose walk ends takes the
++ * next path, so warps stay full. Begin, step and end are subsurface_random_walk's own code
++ * (subsurface_walk_steps.h); the rest is subsurface_scatter / integrator_intersect_subsurface,
++ * unchanged. Every walk runs to its end inside the launch. Paths that do not take a random walk
++ * (disk BSSRDF) run the stock kernel body.
++ *
++ * Launch: the host's normal grid, no host change; the last block to finish resets the counter. */
++
++#include "kernel/bvh/bvh2_dynamic.h"
++#include "kernel/integrator/subsurface_walk_steps.h"
++
++CCL_NAMESPACE_BEGIN
++
++#ifdef __SUBSURFACE__
++
++/* subsurface_scatter after subsurface_random_walk returned true. */
++ccl_device_forceinline void subsurface_scatter_exit(KernelGlobals kg,
++                                                    IntegratorState state,
++                                                    ccl_private Ray &ray,
++                                                    const ccl_private Intersection &exit_isect)
++{
++#  ifdef __VOLUME__
++  /* Update volume stack if needed. */
++  if (kernel_data.integrator.use_volumes) {
++    const int object = exit_isect.object;
++    const uint object_flag = kernel_data_fetch(object_flag, object);
++
++    if (object_flag & SD_OBJECT_INTERSECTS_VOLUME) {
++      const float3 P = INTEGRATOR_STATE(state, ray, P);
++
++      integrator_volume_stack_update_for_subsurface(kg, state, P, ray.P);
++    }
++  }
++#  endif /* __VOLUME__ */
++
++  /* Pretend ray is coming from the outside towards the exit point. This ensures
++   * correct front/back facing normals.
++   * TODO: find a more elegant solution? */
++  ray.P += ray.D * ray.tmax * 2.0f;
++  ray.D = -ray.D;
++
++  integrator_state_write_isect(state, &exit_isect);
++  integrator_state_write_ray(state, &ray);
++
++  /* Advance random number offset for bounce. */
++  INTEGRATOR_STATE_WRITE(state, path, rng_offset) += PRNG_BOUNCE_NUM;
++
++  const int shader = intersection_get_shader(kg, &exit_isect);
++  const int shader_flags = kernel_data_fetch(shaders, shader).flags;
++  const uint object_flags = intersection_get_object_flags(kg, &exit_isect);
++  const bool use_caustics = kernel_data.integrator.use_caustics &&
++                            (object_flags & SD_OBJECT_CAUSTICS_RECEIVER);
++  const bool use_raytrace_kernel = (shader_flags & SD_HAS_RAYTRACE);
++
++  if (use_caustics) {
++    integrator_path_next(state,
++                         DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE,
++                         DEVICE_KERNEL_INTEGRATOR_INTERSECT_MNEE);
++  }
++  else if (use_raytrace_kernel) {
++    integrator_path_next_sorted(kg,
++                                state,
++                                DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE,
++                                DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE,
++                                shader);
++  }
++  else {
++    integrator_path_next_sorted(kg,
++                                state,
++                                DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE,
++                                DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE,
++                                shader);
++  }
++}
++
++struct IntersectSubsurfaceDFWork {
++  const ccl_global int *path_index_array;
++  SSSWalk w;
++  /* 0: walk returned false before its loop, 1: walk loop ended, 2: not a random walk (stock
++   * kernel body). */
++  int status;
++
++  ccl_device_forceinline int state(const int index)
++  {
++    return path_index_array ? path_index_array[index] : index;
++  }
++
++  ccl_device_forceinline bool begin(const int state)
++  {
++    if (!(INTEGRATOR_STATE(state, path, flag) & PATH_RAY_SUBSURFACE_RANDOM_WALK)) {
++      status = 2;
++      return false;
++    }
++    /* subsurface_scatter: rng_state is loaded before the walk, which takes a copy. */
++    path_state_rng_load(state, &w.rng_state);
++    if (!sss_walk_begin(nullptr, state, w)) {
++      status = 0;
++      return false;
++    }
++    status = 1;
++    return true;
++  }
++
++  ccl_device_forceinline bool step(const int state)
++  {
++    return sss_walk_step(nullptr, state, w);
++  }
++
++  ccl_device_forceinline void finish(const int state)
++  {
++    KernelGlobals kg = nullptr;
++    if (status == 2) {
++      integrator_intersect_subsurface(kg, state);
++      return;
++    }
++    if (status == 1 && sss_walk_end(kg, state, w)) {
++      subsurface_scatter_exit(kg, state, w.ray, w.ss_isect.hits[0]);
++      return;
++    }
++    /* integrator_intersect_subsurface after subsurface_scatter returned false. */
++    integrator_path_terminate(kg, state, nullptr, DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE);
++  }
++};
++
++/* [0] the fetch counter, [1] blocks finished in the current launch. */
++extern "C" __device__ uint sssdf_counters[2];
++__device__ uint sssdf_counters[2] = {0, 0};
++
++ccl_device_forceinline void integrator_intersect_subsurface_df(
++    const ccl_global int *path_index_array, const int work_size)
++{
++  IntersectSubsurfaceDFWork work;
++  work.path_index_array = path_index_array;
++  bvh2df_run_work(work, &sssdf_counters[0], work_size);
++  __syncthreads();
++  if (threadIdx.x == 0) {
++    __threadfence();
++    if (atomicAdd(&sssdf_counters[1], 1u) == gridDim.x - 1) {
++      sssdf_counters[0] = 0;
++      sssdf_counters[1] = 0;
++      __threadfence();
++    }
++  }
++}
++
++#endif /* __SUBSURFACE__ */
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/kernel/integrator/nrc.h b/intern/cycles/kernel/integrator/nrc.h
+new file mode 100644
+index 0000000..ac2e72d
+--- /dev/null
++++ b/intern/cycles/kernel/integrator/nrc.h
+@@ -0,0 +1,300 @@
++/* SPDX-FileCopyrightText: 2026 cycles-h100
++ *
++ * SPDX-License-Identifier: Apache-2.0 */
++
++/* Ours: neural radiance cache (NRC), CUDA only, compiled only with -DCYCLES_NRC.
++ *
++ * Path bookkeeping (this file, included from state_flow.h):
++ * - init_from_camera tags a path as a training path with probability train_threshold / 2^32 and gives it a
++ *   slot. A slot holds per-vertex features and throughputs, and radiance bins by bounce.
++ * - Every film write of a training path (emission, background, direct light through its shadow paths) also
++ *   goes into bin min(bounce, NV - 1) of its slot.
++ * - A slot is done when its main path and all its shadow paths have ended (reference count). Done slots go
++ *   into done_list; nrc_collect turns them into (input, target) records.
++ * The query side (features, termination, resolve) is below, guarded by NRC_SHADE (shade_surface.h). */
++
++#pragma once
++
++#ifdef CYCLES_NRC
++
++#  include "kernel/globals.h"
++#  include "kernel/types.h"
++#  include "util/atomic.h"
++#  include "util/hash.h"
++
++CCL_NAMESPACE_BEGIN
++
++ccl_device_forceinline ccl_global float *nrc_bin(const int slot, const int k)
++{
++  return kernel_nrc.slot_bins + ((size_t)slot * CYCLES_NRC_NV + k) * 3;
++}
++
++ccl_device_inline void nrc_slot_release(const int slot)
++{
++  if (atomicSub((unsigned int *)&kernel_nrc.slots[slot].ref, 1u) == 1u) {
++    kernel_nrc.slots[slot].status = NRC_SLOT_DONE;
++    const unsigned int i = atomicAdd(&kernel_nrc.ctrl->done_count, 1u);
++    kernel_nrc.done_list[i] = slot;
++  }
++}
++
++/* init_from_camera, after the path is set up and queued. */
++ccl_device_inline void nrc_path_begin(const int state, const uint pixel, const uint sample)
++{
++  if (!kernel_nrc.enabled) {
++    return;
++  }
++  kernel_nrc.main_spread[2 * state + 0] = 0.0f;
++  kernel_nrc.main_spread[2 * state + 1] = 0.0f;
++  int slot = -1;
++  if (kernel_nrc.ctrl->train && hash_uint2(pixel, sample) < kernel_nrc.train_threshold) {
++    const int h = int(atomicAdd(&kernel_nrc.ctrl->slot_head, 1u) % uint(kernel_nrc.num_slots));
++    if (atomicCAS(&kernel_nrc.slots[h].status, NRC_SLOT_FREE, NRC_SLOT_ACTIVE) == NRC_SLOT_FREE) {
++      kernel_nrc.slots[h].ref = 1;
++      kernel_nrc.slots[h].mask = 0;
++      for (int i = 0; i < CYCLES_NRC_NV * 3; i++) {
++        kernel_nrc.slot_bins[(size_t)h * CYCLES_NRC_NV * 3 + i] = 0.0f;
++      }
++      slot = h;
++      atomicAdd(&kernel_nrc.ctrl->tagged, 1u);
++    }
++  }
++  kernel_nrc.main_slot[state] = slot;
++}
++
++/* integrator_path_terminate. */
++ccl_device_forceinline void nrc_path_end(const int state)
++{
++  if (!kernel_nrc.enabled) {
++    return;
++  }
++  const int slot = kernel_nrc.main_slot[state];
++  if (slot >= 0) {
++    kernel_nrc.main_slot[state] = -1;
++    nrc_slot_release(slot);
++  }
++}
++
++/* integrator_shadow_path_init. */
++ccl_device_forceinline void nrc_shadow_begin(const int state, const int shadow_state)
++{
++  if (!kernel_nrc.enabled) {
++    return;
++  }
++  const int slot = kernel_nrc.main_slot[state];
++  kernel_nrc.shadow_slot[shadow_state] = slot;
++  if (slot >= 0) {
++    atomicAdd((unsigned int *)&kernel_nrc.slots[slot].ref, 1u);
++  }
++}
++
++/* integrator_shadow_path_terminate. */
++ccl_device_forceinline void nrc_shadow_end(const int shadow_state)
++{
++  if (!kernel_nrc.enabled) {
++    return;
++  }
++  const int slot = kernel_nrc.shadow_slot[shadow_state];
++  if (slot >= 0) {
++    kernel_nrc.shadow_slot[shadow_state] = -1;
++    nrc_slot_release(slot);
++  }
++}
++
++/* State compaction. */
++ccl_device_forceinline void nrc_state_move(const int to_state, const int from_state)
++{
++  if (!kernel_nrc.enabled) {
++    return;
++  }
++  kernel_nrc.main_slot[to_state] = kernel_nrc.main_slot[from_state];
++  kernel_nrc.main_slot[from_state] = -1;
++  kernel_nrc.main_spread[2 * to_state + 0] = kernel_nrc.main_spread[2 * from_state + 0];
++  kernel_nrc.main_spread[2 * to_state + 1] = kernel_nrc.main_spread[2 * from_state + 1];
++}
++
++ccl_device_forceinline void nrc_shadow_state_move(const int to_state, const int from_state)
++{
++  if (!kernel_nrc.enabled) {
++    return;
++  }
++  kernel_nrc.shadow_slot[to_state] = kernel_nrc.shadow_slot[from_state];
++  kernel_nrc.shadow_slot[from_state] = -1;
++}
++
++/* Film writes (after clamping), main path and shadow path. */
++ccl_device_inline void nrc_add_bin(const int slot, const int bounce, const float3 L)
++{
++  if (bounce < 1) {
++    return;
++  }
++  ccl_global float *bin = nrc_bin(slot, min(bounce, CYCLES_NRC_NV - 1));
++  atomicAdd(bin + 0, L.x);
++  atomicAdd(bin + 1, L.y);
++  atomicAdd(bin + 2, L.z);
++}
++
++ccl_device_forceinline void nrc_record_main(const int state, const int bounce, const float3 L)
++{
++  if (!kernel_nrc.enabled) {
++    return;
++  }
++  const int slot = kernel_nrc.main_slot[state];
++  if (slot >= 0) {
++    nrc_add_bin(slot, bounce, L);
++  }
++}
++
++ccl_device_forceinline void nrc_record_shadow(const int shadow_state, const int bounce, const float3 L)
++{
++  if (!kernel_nrc.enabled) {
++    return;
++  }
++  const int slot = kernel_nrc.shadow_slot[shadow_state];
++  if (slot >= 0) {
++    nrc_add_bin(slot, bounce, L);
++  }
++}
++
++/* nrc_collect: one thread per done slot. Target at vertex k = (sum of bins k .. NV-1) / T_k: the radiance the
++ * path brought back from the bounce at vertex k on, per unit throughput after that bounce. */
++ccl_device void nrc_collect(const int i)
++{
++  const int slot = kernel_nrc.done_list[i];
++  const unsigned int mask = kernel_nrc.slots[slot].mask;
++  float3 suffix = zero_float3();
++  for (int k = CYCLES_NRC_NV - 1; k >= 1; k--) {
++    const ccl_global float *bin = nrc_bin(slot, k);
++    suffix += make_float3(bin[0], bin[1], bin[2]);
++    if (!(mask & (1u << k))) {
++      continue;
++    }
++    const ccl_global float *T = kernel_nrc.slot_T + ((size_t)slot * CYCLES_NRC_NV + k) * 3;
++    const float3 t = make_float3(
++        (T[0] > 1e-8f) ? suffix.x / T[0] : 0.0f,
++        (T[1] > 1e-8f) ? suffix.y / T[1] : 0.0f,
++        (T[2] > 1e-8f) ? suffix.z / T[2] : 0.0f);
++    /* Throughput-weighted regression without per-record weights in the engine interface: a record of
++     * throughput T is written floor(mean(T) / tau + u) times, tau = mean throughput of earlier records. The
++     * network then learns sum(T * target) / sum(T), which times a query's T is the cell's expected tail even when
++     * T and radiance correlate (clamping, glossy lobes). */
++    int copies = 1;
++    const float Tm = (T[0] + T[1] + T[2]) * (1.0f / 3.0f);
++    if (kernel_nrc.train_weight) {
++      atomicAdd(&kernel_nrc.ctrl->T_sum, Tm);
++      atomicAdd(&kernel_nrc.ctrl->T_count, 1u);
++      const float tau = kernel_nrc.ctrl->tau;
++      if (tau > 0.0f) {
++        const float u = float(hash_uint3(uint(slot), uint(k), kernel_nrc.ctrl->T_count) >> 8) *
++                        (1.0f / 16777216.0f);
++        copies = min(int(Tm / tau + u), 16);
++      }
++    }
++    const float3 tf = ensure_finite(t);
++    const ccl_global uint4 *src = (const ccl_global uint4 *)(kernel_nrc.slot_feat +
++                                                             ((size_t)slot * CYCLES_NRC_NV + k) *
++                                                                 NRC_IN_FEATURES);
++    for (int j = 0; j < copies; j++) {
++      const unsigned int r = atomicAdd(&kernel_nrc.ctrl->record_count, 1u);
++      if (r >= (unsigned int)kernel_nrc.record_cap) {
++        break;
++      }
++      ccl_global uint4 *dst = (ccl_global uint4 *)(kernel_nrc.rec_in + (size_t)r * NRC_IN_FEATURES);
++      dst[0] = src[0];
++      dst[1] = src[1];
++      kernel_nrc.rec_T[(size_t)r * 3 + 0] = T[0];
++      kernel_nrc.rec_T[(size_t)r * 3 + 1] = T[1];
++      kernel_nrc.rec_T[(size_t)r * 3 + 2] = T[2];
++      kernel_nrc.rec_target[(size_t)r * 3 + 0] = tf.x;
++      kernel_nrc.rec_target[(size_t)r * 3 + 1] = tf.y;
++      kernel_nrc.rec_target[(size_t)r * 3 + 2] = tf.z;
++    }
++  }
++  kernel_nrc.slots[slot].status = NRC_SLOT_FREE;
++}
++
++/* nrc_resolve: one thread per query; adds throughput x prediction to the Combined pass. */
++ccl_device void nrc_resolve(ccl_global float *render_buffer, const int i)
++{
++  const NRCQueryMeta m = kernel_nrc.query_meta[i];
++  const ccl_global float *o = kernel_nrc.query_out + (size_t)i * 3;
++  float3 L = make_float3(m.r * fmaxf(o[0], 0.0f), m.g * fmaxf(o[1], 0.0f), m.b * fmaxf(o[2], 0.0f));
++  L = ensure_finite(L);
++  if (is_zero(L)) {
++    return;
++  }
++  if (kernel_data.film.light_pass_flag & PASSMASK(COMBINED)) {
++    ccl_global float *buffer = render_buffer +
++                               (uint64_t)m.pixel * kernel_data.film.pass_stride +
++                               kernel_data.film.pass_combined;
++    atomicAdd(buffer + 0, L.x);
++    atomicAdd(buffer + 1, L.y);
++    atomicAdd(buffer + 2, L.z);
++  }
++}
++
++/* Zero the inputs of rows [n0, n1) (the engine may run on a padded batch). */
++ccl_device void nrc_pad(const int n0, const int i)
++{
++  ccl_global uint4 *dst = (ccl_global uint4 *)(kernel_nrc.query_in +
++                                               (size_t)(n0 + i) * NRC_IN_FEATURES);
++  dst[0] = make_uint4(0, 0, 0, 0);
++  dst[1] = make_uint4(0, 0, 0, 0);
++}
++
++/* Stub cache (until the engine lands): per hash cell of (position grid, normal bin, bounce budgets), the
++ * throughput-weighted mean target sum(T * target) / sum(T) per channel. Training and query vertices come from the
++ * same path distribution, so sum over queries of T_q * mean = the expected tail of the cell's queries; a plain mean
++ * would miss the covariance of T and radiance inside a cell. */
++ccl_device_inline uint nrc_stub_cell(const ccl_global unsigned short *in)
++{
++  const int res = kernel_nrc.stub_res;
++  const int ix = clamp(int(half_to_float(in[0]) * res), 0, res - 1);
++  const int iy = clamp(int(half_to_float(in[1]) * res), 0, res - 1);
++  const int iz = clamp(int(half_to_float(in[2]) * res), 0, res - 1);
++  const int nt = clamp(int(half_to_float(in[5]) * 4.0f), 0, 3);
++  const int np = clamp(int(half_to_float(in[6]) * 4.0f), 0, 3);
++  uint key = uint(nt * 4 + np);
++  if (kernel_nrc.budget_feature) {
++    const int bd = clamp(int(half_to_float(in[14]) * 8.0f + 0.5f), 0, 8);
++    const int bg = clamp(int(half_to_float(in[15]) * 8.0f + 0.5f), 0, 8);
++    key += 16u * uint(1 + bd * 9 + bg);
++  }
++  if (kernel_nrc.stub_dir) {
++    const int dt = clamp(int(half_to_float(in[3]) * 4.0f), 0, 3);
++    const int dp = clamp(int(half_to_float(in[4]) * 8.0f), 0, 7);
++    key = key * 32u + uint(dt * 8 + dp) + 1u;
++  }
++  key = hash_uint2(key, 0x9e3779b9u);
++  return hash_uint3(uint(ix) ^ key, uint(iy), uint(iz) + 977u * key) &
++         ((1u << kernel_nrc.stub_log2) - 1u);
++}
++
++ccl_device void nrc_stub_train(const ccl_global unsigned short *in,
++                               const ccl_global float *target,
++                               const int i)
++{
++  const uint c = nrc_stub_cell(in + (size_t)i * NRC_IN_FEATURES);
++  ccl_global float *t = kernel_nrc.stub_table + (size_t)c * 8;
++  const ccl_global float *T = kernel_nrc.rec_T + (size_t)i * 3;
++  atomicAdd(t + 0, T[0] * target[(size_t)i * 3 + 0]);
++  atomicAdd(t + 1, T[1] * target[(size_t)i * 3 + 1]);
++  atomicAdd(t + 2, T[2] * target[(size_t)i * 3 + 2]);
++  atomicAdd(t + 3, T[0]);
++  atomicAdd(t + 4, T[1]);
++  atomicAdd(t + 5, T[2]);
++  atomicAdd(t + 6, 1.0f);
++}
++
++ccl_device void nrc_stub_infer(const ccl_global unsigned short *in, ccl_global float *out, const int i)
++{
++  const uint c = nrc_stub_cell(in + (size_t)i * NRC_IN_FEATURES);
++  const ccl_global float *t = kernel_nrc.stub_table + (size_t)c * 8;
++  out[(size_t)i * 3 + 0] = (t[3] > 0.0f) ? t[0] / t[3] : 0.0f;
++  out[(size_t)i * 3 + 1] = (t[4] > 0.0f) ? t[1] / t[4] : 0.0f;
++  out[(size_t)i * 3 + 2] = (t[5] > 0.0f) ? t[2] / t[5] : 0.0f;
++}
++
++CCL_NAMESPACE_END
++
++#endif /* CYCLES_NRC */
+diff --git a/intern/cycles/kernel/integrator/nrc_types.h b/intern/cycles/kernel/integrator/nrc_types.h
+new file mode 100644
+index 0000000..ff7065b
+--- /dev/null
++++ b/intern/cycles/kernel/integrator/nrc_types.h
+@@ -0,0 +1,96 @@
++/* SPDX-FileCopyrightText: 2026 cycles-h100
++ *
++ * SPDX-License-Identifier: Apache-2.0 */
++
++/* Ours: neural radiance cache (NRC) shared layout. Included by the kernel (only with -DCYCLES_NRC) and by the
++ * host (integrator/nrc.cpp); the two copies of this file (tree53-nrc and blender-src-v5.3.0-svm) must stay
++ * identical. Every pointer is a device pointer; the host fills the struct and copies it to the cubin's
++ * __constant__ kernel_nrc symbol. */
++
++#pragma once
++
++#ifndef CYCLES_NRC_NV
++/* Vertices per training path: bins 1 .. NV-1 hold radiance by bounce, contributions at bounce >= NV-1 go to the
++ * last bin, vertices 1 .. NV-1 are stashed. */
++#  define CYCLES_NRC_NV 8
++#endif
++
++#define NRC_IN_FEATURES 16 /* = NRC_IN of nrc/include/cycles_nrc.h */
++#define NRC_SLOT_FREE 0
++#define NRC_SLOT_ACTIVE 1
++#define NRC_SLOT_DONE 2
++
++CCL_NAMESPACE_BEGIN
++
++/* Dynamic counters and flags, in device memory (written by kernels, read and reset by the host between
++ * kernel launches, stream-ordered). */
++struct NRCControl {
++  unsigned int query_count;  /* queries written (may exceed query_cap: extra ones are not written) */
++  unsigned int done_count;   /* entries in done_list */
++  unsigned int record_count; /* training records written by nrc_collect */
++  unsigned int slot_head;    /* ring allocator for training slots */
++  int terminate;             /* 1: non-training paths may end in the cache (0 during warm-up) */
++  int train;                 /* 1: tag training paths */
++  unsigned int dropped_queries;
++  unsigned int tagged;       /* training paths tagged (stats) */
++  float tau;                 /* record weighting: mean throughput of earlier records (0: no weighting yet) */
++  float T_sum;               /* sum of mean(T) over the records of this collect */
++  unsigned int T_count;
++  unsigned int pad;
++};
++
++/* Per training path (slot). */
++struct NRCSlot {
++  int status;    /* NRC_SLOT_* */
++  int ref;       /* main path + live shadow paths */
++  unsigned int mask; /* bit k: vertex k stashed */
++  int pad;
++};
++
++/* Query record metadata (inputs are a separate n x 16 fp16 array, outputs n x 3 fp32). */
++struct NRCQueryMeta {
++  unsigned int pixel; /* render_pixel_index */
++  float r, g, b;      /* path throughput after the bounce at the query vertex */
++};
++
++struct KernelNRC {
++  /* Static parameters. */
++  int enabled;
++  int min_bounce;           /* smallest bounce index (after the bounce) where a path may end */
++  float c;                  /* area-spread constant: end when spread^2 >= c * a0 */
++  int skip_singular;        /* never end after a singular (mirror/glass) bounce */
++  unsigned int train_threshold; /* tag when hash(pixel, sample) < threshold */
++  int num_slots;
++  int query_cap;
++  int record_cap;
++  float box_lo[4];
++  float box_scale[4]; /* 1 / extent */
++  int stub_log2;      /* stub hash table size log2 */
++  int stub_res;       /* stub grid resolution per axis */
++  int stub_dir;       /* stub: also key cells on the scattered direction (4 x 8 bins) */
++  int budget_feature; /* 1: features 14, 15 = remaining diffuse / glossy bounces (min with total) / 8 */
++  int train_match;    /* 1: a training path stashes only the vertex where a normal path would have ended */
++  int train_weight;   /* 1: write each record floor(mean(T) / tau + u) times (throughput-weighted regression) */
++  int diffuse_only;   /* nrc-bake: 1 = a path may end only after a diffuse bounce (label & LABEL_DIFFUSE) */
++  int pad[1];
++
++  /* Device arrays. */
++  ccl_global NRCControl *ctrl;
++  ccl_global int *main_slot;          /* [max_num_paths], -1 = not a training path */
++  ccl_global float *main_spread;      /* [max_num_paths * 2]: sqrt-sum S, a0 */
++  ccl_global int *shadow_slot;        /* [max_num_paths] */
++  ccl_global unsigned short *query_in; /* [query_cap * 16] fp16 */
++  ccl_global NRCQueryMeta *query_meta; /* [query_cap] */
++  ccl_global float *query_out;        /* [query_cap * 3] */
++  ccl_global NRCSlot *slots;          /* [num_slots] */
++  ccl_global unsigned short *slot_feat; /* [num_slots * NV * 16] fp16 */
++  ccl_global float *slot_T;           /* [num_slots * NV * 3] throughput after the bounce at vertex k */
++  ccl_global float *slot_bins;        /* [num_slots * NV * 3] radiance written with bounce k */
++  ccl_global int *done_list;          /* [num_slots] */
++  ccl_global unsigned short *rec_in;  /* [record_cap * 16] fp16 */
++  ccl_global float *rec_target;       /* [record_cap * 3] */
++  ccl_global float *rec_T;            /* [record_cap * 3] throughput of the record (stub weights) */
++  ccl_global float *stub_table;       /* [2^stub_log2 * 8]: sum T*target rgb, sum T rgb, count, 0 */
++};
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/kernel/integrator/shade_surface.h b/intern/cycles/kernel/integrator/shade_surface.h
+index f260790..9916791 100644
+--- a/intern/cycles/kernel/integrator/shade_surface.h
++++ b/intern/cycles/kernel/integrator/shade_surface.h
+@@ -763,6 +763,143 @@ ccl_device_forceinline void integrate_surface_ao(KernelGlobals kg,
+ }
+ #endif /* defined(__AO__) */
+ 
++#ifdef CYCLES_NRC
++/* Ours (NRC): the 16 cache inputs of NRC_IN (nrc/include/cycles_nrc.h) at this vertex, as fp16: position in
++ * the scene box [0,1]^3, scattered direction and shading normal (theta/pi, phi/2pi + 0.5), roughness
++ * 1 - exp(-r), diffuse albedo, specular albedo (closure weights), and (budget_feature) the remaining diffuse and
++ * glossy bounces (each min with the remaining total) / 8: stock paths stop at the bounce limits, so the radiance
++ * a path brings back depends on its budget (classroom: 2 diffuse bounces). */
++ccl_device_forceinline float2 nrc_sph(const float3 d)
++{
++  return make_float2(acosf(clamp(d.z, -1.0f, 1.0f)) * M_1_PI_F,
++                     atan2f(d.y, d.x) * (0.5f * M_1_PI_F) + 0.5f);
++}
++
++ccl_device_forceinline uint nrc_h2(const float a, const float b)
++{
++  return uint(float_to_half(a)) | (uint(float_to_half(b)) << 16);
++}
++
++ccl_device_noinline void nrc_write_features(ConstIntegratorState state,
++                                            const ccl_private ShaderData *sd,
++                                            const float3 wo,
++                                            ccl_global unsigned short *out)
++{
++  float bd = 0.0f, bg = 0.0f;
++  if (kernel_nrc.budget_feature) {
++    const int rt = kernel_data.integrator.max_bounce - INTEGRATOR_STATE(state, path, bounce);
++    const int rd = kernel_data.integrator.max_diffuse_bounce -
++                   INTEGRATOR_STATE(state, path, diffuse_bounce);
++    const int rg = kernel_data.integrator.max_glossy_bounce -
++                   INTEGRATOR_STATE(state, path, glossy_bounce);
++    bd = float(clamp(min(rt, rd), 0, 8)) * 0.125f;
++    bg = float(clamp(min(rt, rg), 0, 8)) * 0.125f;
++  }
++  float3 diff = zero_float3();
++  float3 spec = zero_float3();
++  for (int i = 0; i < sd->num_closure; i++) {
++    const ccl_private ShaderClosure *sc = &sd->closure[i];
++    if (CLOSURE_IS_BSDF_DIFFUSE(sc->type) || CLOSURE_IS_BSSRDF(sc->type)) {
++      diff += sc->weight;
++    }
++    else if (CLOSURE_IS_BSDF_GLOSSY(sc->type) || CLOSURE_IS_BSDF_TRANSMISSION(sc->type) ||
++             CLOSURE_IS_GLASS(sc->type))
++    {
++      spec += sc->weight;
++    }
++  }
++  diff = saturate(diff);
++  spec = saturate(spec);
++  const float r = 1.0f - expf(-surface_shader_average_roughness(sd));
++  const float px = saturatef((sd->P.x - kernel_nrc.box_lo[0]) * kernel_nrc.box_scale[0]);
++  const float py = saturatef((sd->P.y - kernel_nrc.box_lo[1]) * kernel_nrc.box_scale[1]);
++  const float pz = saturatef((sd->P.z - kernel_nrc.box_lo[2]) * kernel_nrc.box_scale[2]);
++  const float2 dw = nrc_sph(wo);
++  const float2 dn = nrc_sph(sd->N);
++  ccl_global uint4 *dst = (ccl_global uint4 *)out;
++  dst[0] = make_uint4(nrc_h2(px, py), nrc_h2(pz, dw.x), nrc_h2(dw.y, dn.x), nrc_h2(dn.y, r));
++  dst[1] = make_uint4(
++      nrc_h2(diff.x, diff.y), nrc_h2(diff.z, spec.x), nrc_h2(spec.y, spec.z), nrc_h2(bd, bg));
++}
++
++/* Before the bounce at this vertex: grow the path's area spread (Mueller et al. 2021, eq. 3),
++ * a0 = d0^2 / (4 pi |cos|) at x1, S += sqrt(d^2 / (pdf |cos|)) at x2 and later. */
++ccl_device_forceinline float2 nrc_spread_update(ConstIntegratorState state,
++                                                const ccl_private ShaderData *sd)
++{
++  ccl_global float *sp = kernel_nrc.main_spread + 2 * state;
++  float S = sp[0], a0 = sp[1];
++  const float cosv = fmaxf(fabsf(dot(sd->N, sd->wi)), 1e-4f);
++  const float d2 = sqr(sd->ray_length);
++  if (INTEGRATOR_STATE(state, path, bounce) == 0) {
++    a0 = d2 * (0.25f * M_1_PI_F) / cosv;
++  }
++  else {
++    const float pdf = INTEGRATOR_STATE(state, path, mis_ray_pdf);
++    S += sqrtf(d2 / fmaxf(pdf * cosv, 1e-12f));
++  }
++  sp[0] = S;
++  sp[1] = a0;
++  return make_float2(S, a0);
++}
++
++/* After the bounce: a training path stashes the vertex; another path may end here, writing a query whose
++ * answer (incident radiance along the sampled direction) the resolve kernel adds to the Combined pass times the
++ * throughput after the bounce. Returns true when the path ends. */
++ccl_device_noinline bool nrc_after_bounce(ConstIntegratorState state,
++                                          const ccl_private ShaderData *sd,
++                                          const int label,
++                                          const float2 spread)
++{
++  if (!(label & (LABEL_REFLECT | LABEL_TRANSMIT)) ||
++      (label & (LABEL_TRANSPARENT | LABEL_SUBSURFACE_SCATTER | LABEL_RAY_PORTAL)))
++  {
++    return false;
++  }
++  const int k = INTEGRATOR_STATE(state, path, bounce);
++  /* Would a normal path end here (warm-up flag and buffer space aside)? */
++  const bool end_here = k >= kernel_nrc.min_bounce &&
++                        !(kernel_nrc.skip_singular && (label & LABEL_SINGULAR)) &&
++                        !(kernel_nrc.diffuse_only && !(label & LABEL_DIFFUSE)) &&
++                        spread.x * spread.x >= kernel_nrc.c * spread.y &&
++                        !(INTEGRATOR_STATE(state, path, flag) & PATH_RAY_SHADOW_CATCHER_PASS);
++  const int slot = kernel_nrc.main_slot[state];
++  if (slot >= 0) {
++    if (k >= 1 && k < CYCLES_NRC_NV &&
++        (!kernel_nrc.train_match || (end_here && kernel_nrc.slots[slot].mask == 0)))
++    {
++      const size_t v = (size_t)slot * CYCLES_NRC_NV + k;
++      nrc_write_features(
++          state, sd, INTEGRATOR_STATE(state, ray, D), kernel_nrc.slot_feat + v * NRC_IN_FEATURES);
++      const Spectrum T = INTEGRATOR_STATE(state, path, throughput);
++      kernel_nrc.slot_T[v * 3 + 0] = T.x;
++      kernel_nrc.slot_T[v * 3 + 1] = T.y;
++      kernel_nrc.slot_T[v * 3 + 2] = T.z;
++      kernel_nrc.slots[slot].mask |= (1u << k);
++    }
++    return false;
++  }
++  if (!end_here || !kernel_nrc.ctrl->terminate) {
++    return false;
++  }
++  const unsigned int q = atomicAdd(&kernel_nrc.ctrl->query_count, 1u);
++  if (q >= (unsigned int)kernel_nrc.query_cap) {
++    atomicAdd(&kernel_nrc.ctrl->dropped_queries, 1u);
++    return false;
++  }
++  nrc_write_features(
++      state, sd, INTEGRATOR_STATE(state, ray, D), kernel_nrc.query_in + (size_t)q * NRC_IN_FEATURES);
++  const Spectrum T = INTEGRATOR_STATE(state, path, throughput);
++  NRCQueryMeta m;
++  m.pixel = INTEGRATOR_STATE(state, path, render_pixel_index);
++  m.r = T.x;
++  m.g = T.y;
++  m.b = T.z;
++  kernel_nrc.query_meta[q] = m;
++  return true;
++}
++#endif /* CYCLES_NRC */
++
+ template<uint64_t node_feature_mask>
+ ccl_device int integrate_surface(KernelGlobals kg,
+                                  IntegratorState state,
+@@ -879,7 +1016,20 @@ ccl_device int integrate_surface(KernelGlobals kg,
+ #endif
+ 
+     PROFILING_EVENT(PROFILING_SHADE_SURFACE_INDIRECT_LIGHT);
++#ifdef CYCLES_NRC
++    float2 nrc_spread = zero_float2();
++    if (kernel_nrc.enabled) {
++      nrc_spread = nrc_spread_update(state, &sd);
++    }
++#endif
+     continue_path_label = integrate_surface_bsdf_bssrdf_bounce(kg, state, &sd, &rng_state);
++#ifdef CYCLES_NRC
++    if (kernel_nrc.enabled && continue_path_label != LABEL_NONE &&
++        nrc_after_bounce(state, &sd, continue_path_label, nrc_spread))
++    {
++      return LABEL_NONE;
++    }
++#endif
+ #ifdef __VOLUME__
+   }
+   else {
+diff --git a/intern/cycles/kernel/integrator/state_flow.h b/intern/cycles/kernel/integrator/state_flow.h
+index c8939b2..6e350f5 100644
+--- a/intern/cycles/kernel/integrator/state_flow.h
++++ b/intern/cycles/kernel/integrator/state_flow.h
+@@ -15,6 +15,11 @@
+ #  include "util/atomic.h"
+ #endif
+ 
++#ifdef CYCLES_NRC
++#  include "util/hash.h"
++#  include "kernel/integrator/nrc.h"
++#endif
++
+ CCL_NAMESPACE_BEGIN
+ 
+ /* Control Flow
+@@ -71,7 +76,7 @@ ccl_device_inline void write_optical_depth(KernelGlobals kg,
+ ccl_device_forceinline void integrator_path_init(IntegratorState state,
+                                                  const DeviceKernel next_kernel)
+ {
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.queue_counter->num_queued[next_kernel], 1);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.queue_counter->num_queued[next_kernel]);
+   INTEGRATOR_STATE_WRITE(state, path, queued_kernel) = next_kernel;
+ }
+ 
+@@ -79,9 +84,8 @@ ccl_device_forceinline void integrator_path_next(IntegratorState state,
+                                                  const DeviceKernel current_kernel,
+                                                  const DeviceKernel next_kernel)
+ {
+-  atomic_fetch_and_sub_uint32(&kernel_integrator_state.queue_counter->num_queued[current_kernel],
+-                              1);
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.queue_counter->num_queued[next_kernel], 1);
++  CYCLES_COUNTER_SUB1(&kernel_integrator_state.queue_counter->num_queued[current_kernel]);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.queue_counter->num_queued[next_kernel]);
+   INTEGRATOR_STATE_WRITE(state, path, queued_kernel) = next_kernel;
+ }
+ 
+@@ -91,9 +95,11 @@ ccl_device_forceinline void integrator_path_terminate(KernelGlobals kg,
+                                                       const DeviceKernel current_kernel)
+ {
+   write_optical_depth(kg, state, render_buffer);
++#ifdef CYCLES_NRC
++  nrc_path_end(state);
++#endif
+ 
+-  atomic_fetch_and_sub_uint32(&kernel_integrator_state.queue_counter->num_queued[current_kernel],
+-                              1);
++  CYCLES_COUNTER_SUB1(&kernel_integrator_state.queue_counter->num_queued[current_kernel]);
+   INTEGRATOR_STATE_WRITE(state, path, queued_kernel) = 0;
+ }
+ 
+@@ -115,16 +121,18 @@ ccl_device_forceinline void integrator_path_cache_miss_sorted(IntegratorState st
+   }
+ 
+   const int key_ = INTEGRATOR_STATE_WRITE(state, path, shader_sort_key);
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.sort_key_counter[current_kernel][key_], 1);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.sort_key_counter[current_kernel][key_]);
+ }
+ 
+ ccl_device_forceinline IntegratorShadowState integrator_shadow_path_init(
+     KernelGlobals kg, IntegratorState state, const DeviceKernel next_kernel, const bool is_ao)
+ {
+-  IntegratorShadowState shadow_state = atomic_fetch_and_add_uint32(
+-      &kernel_integrator_state.next_shadow_path_index[0], 1);
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.queue_counter->num_queued[next_kernel], 1);
++  IntegratorShadowState shadow_state = CYCLES_COUNTER_FETCH_INC(&kernel_integrator_state.next_shadow_path_index[0]);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.queue_counter->num_queued[next_kernel]);
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, queued_kernel) = next_kernel;
++#  ifdef CYCLES_NRC
++  nrc_shadow_begin(state, shadow_state);
++#  endif
+ #  if defined(__PATH_GUIDING__)
+   if ((kernel_data.kernel_features & KERNEL_FEATURE_PATH_GUIDING)) {
+     INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, path_segment) = nullptr;
+@@ -137,17 +145,18 @@ ccl_device_forceinline void integrator_shadow_path_next(IntegratorShadowState st
+                                                         const DeviceKernel current_kernel,
+                                                         const DeviceKernel next_kernel)
+ {
+-  atomic_fetch_and_sub_uint32(&kernel_integrator_state.queue_counter->num_queued[current_kernel],
+-                              1);
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.queue_counter->num_queued[next_kernel], 1);
++  CYCLES_COUNTER_SUB1(&kernel_integrator_state.queue_counter->num_queued[current_kernel]);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.queue_counter->num_queued[next_kernel]);
+   INTEGRATOR_STATE_WRITE(state, shadow_path, queued_kernel) = next_kernel;
+ }
+ 
+ ccl_device_forceinline void integrator_shadow_path_terminate(IntegratorShadowState state,
+                                                              const DeviceKernel current_kernel)
+ {
+-  atomic_fetch_and_sub_uint32(&kernel_integrator_state.queue_counter->num_queued[current_kernel],
+-                              1);
++#ifdef CYCLES_NRC
++  nrc_shadow_end(state);
++#endif
++  CYCLES_COUNTER_SUB1(&kernel_integrator_state.queue_counter->num_queued[current_kernel]);
+   INTEGRATOR_STATE_WRITE(state, shadow_path, queued_kernel) = 0;
+ }
+ 
+@@ -168,7 +177,7 @@ ccl_device_forceinline void integrator_path_init_sorted(KernelGlobals kg,
+                                                         const uint32_t key)
+ {
+   const int key_ = INTEGRATOR_SORT_KEY(key, state);
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.queue_counter->num_queued[next_kernel], 1);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.queue_counter->num_queued[next_kernel]);
+   INTEGRATOR_STATE_WRITE(state, path, queued_kernel) = next_kernel;
+   INTEGRATOR_STATE_WRITE(state, path, shader_sort_key) = key_;
+ 
+@@ -176,7 +185,7 @@ ccl_device_forceinline void integrator_path_init_sorted(KernelGlobals kg,
+     return;
+   }
+ 
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.sort_key_counter[next_kernel][key_], 1);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.sort_key_counter[next_kernel][key_]);
+ }
+ 
+ ccl_device_forceinline void integrator_path_next_sorted(KernelGlobals kg,
+@@ -186,9 +195,8 @@ ccl_device_forceinline void integrator_path_next_sorted(KernelGlobals kg,
+                                                         const uint32_t key)
+ {
+   const int key_ = INTEGRATOR_SORT_KEY(key, state);
+-  atomic_fetch_and_sub_uint32(&kernel_integrator_state.queue_counter->num_queued[current_kernel],
+-                              1);
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.queue_counter->num_queued[next_kernel], 1);
++  CYCLES_COUNTER_SUB1(&kernel_integrator_state.queue_counter->num_queued[current_kernel]);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.queue_counter->num_queued[next_kernel]);
+   INTEGRATOR_STATE_WRITE(state, path, queued_kernel) = next_kernel;
+   INTEGRATOR_STATE_WRITE(state, path, shader_sort_key) = key_;
+ 
+@@ -196,7 +204,7 @@ ccl_device_forceinline void integrator_path_next_sorted(KernelGlobals kg,
+     return;
+   }
+ 
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.sort_key_counter[next_kernel][key_], 1);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.sort_key_counter[next_kernel][key_]);
+ }
+ 
+ #else
+diff --git a/intern/cycles/kernel/integrator/state_util.h b/intern/cycles/kernel/integrator/state_util.h
+index d46f032..3d03c71 100644
+--- a/intern/cycles/kernel/integrator/state_util.h
++++ b/intern/cycles/kernel/integrator/state_util.h
+@@ -18,6 +18,10 @@
+ #  include "util/atomic.h"
+ #endif
+ 
++#ifdef CYCLES_NRC
++#  include "kernel/integrator/nrc.h"
++#endif
++
+ CCL_NAMESPACE_BEGIN
+ 
+ /* Ray */
+@@ -539,6 +543,9 @@ ccl_device_inline void integrator_state_move(KernelGlobals kg,
+                                              ConstIntegratorState state)
+ {
+   integrator_state_copy_only(kg, to_state, state);
++#  ifdef CYCLES_NRC
++  nrc_state_move(to_state, state);
++#  endif
+ 
+   INTEGRATOR_STATE_WRITE(state, path, queued_kernel) = 0;
+ 
+@@ -614,6 +621,9 @@ ccl_device_inline void integrator_shadow_state_move(KernelGlobals kg,
+                                                     ConstIntegratorState state)
+ {
+   integrator_shadow_state_copy_only(kg, to_state, state);
++#  ifdef CYCLES_NRC
++  nrc_shadow_state_move(to_state, state);
++#  endif
+ 
+   INTEGRATOR_STATE_WRITE(state, shadow_path, queued_kernel) = 0;
+ 
+@@ -639,6 +649,11 @@ ccl_device_inline IntegratorState integrator_state_shadow_catcher_split(KernelGl
+       &kernel_integrator_state.next_main_path_index[0], 1);
+ 
+   integrator_state_copy_only(kg, to_state, state);
++#  ifdef CYCLES_NRC
++  if (kernel_nrc.enabled) {
++    kernel_nrc.main_slot[to_state] = -1; /* the split copy is not a training path */
++  }
++#  endif
+ #else
+   IntegratorStateCPU *ccl_restrict to_state = state + 1;
+ 
+diff --git a/intern/cycles/kernel/integrator/subsurface.h b/intern/cycles/kernel/integrator/subsurface.h
+index 0a92c27..2b6ae78 100644
+--- a/intern/cycles/kernel/integrator/subsurface.h
++++ b/intern/cycles/kernel/integrator/subsurface.h
+@@ -169,7 +169,7 @@ ccl_device void subsurface_shader_data_setup(KernelGlobals kg, ccl_private Shade
+   bsdf_diffuse_setup(sd, N, weight);
+ }
+ 
+-ccl_device_inline bool subsurface_scatter(KernelGlobals kg, IntegratorState state)
++ccl_device_hot bool subsurface_scatter(KernelGlobals kg, IntegratorState state)
+ {
+   RNGState rng_state;
+   path_state_rng_load(state, &rng_state);
+diff --git a/intern/cycles/kernel/integrator/subsurface_walk_steps.h b/intern/cycles/kernel/integrator/subsurface_walk_steps.h
+new file mode 100644
+index 0000000..0c34544
+--- /dev/null
++++ b/intern/cycles/kernel/integrator/subsurface_walk_steps.h
+@@ -0,0 +1,311 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++
++#pragma once
++
++/* subsurface_random_walk (kernel/integrator/subsurface_random_walk.h, Blender 5.3.0) split into
++ * begin / one bounce / end, so that a dynamic-fetch loop can advance many walks one bounce at a
++ * time (CYCLES_SSSDF). The code of each part is the stock function's own, in the same order, with
++ * the same random numbers; only the variables the bounce loop carries live in SSSWalk instead of
++ * locals. The stock function is left as it is. Each walk runs to its end inside one launch (no
++ * split walk on 5.3.0).
++ *
++ *   sss_walk_begin  the function up to the bounce loop; false = it returns false before the loop
++ *   sss_walk_step   one iteration of the bounce loop; true = the loop ended (exit hit, small
++ *                   throughput or BSSRDF_MAX_BOUNCES)
++ *   sss_walk_end    the function after the loop; returns its result (true: exit hit)
++ */
++
++#ifdef __SUBSURFACE__
++
++#  ifndef SUBSURFACE_RANDOM_WALK_SIMILARITY_LEVEL
++#    error "subsurface_walk_steps.h mirrors 5.3.0 with SUBSURFACE_RANDOM_WALK_SIMILARITY_LEVEL set"
++#  endif
++
++CCL_NAMESPACE_BEGIN
++
++struct SSSWalk {
++  Ray ray;
++  /* subsurface_scatter's ss_isect, as stock carries it through the walk. A local per bounce
++   * instead (only hits[0] kept) gives the same results but spills more (dfsss10: 384 vs 82 B). */
++  LocalIntersection ss_isect;
++  RNGState rng_state;
++  /* The walk's constants (stock locals P, D, N, object, albedo, alpha, diffusion_length,
++   * phase_log; sigma_t, sigma_s, anisotropy, guided_fraction are the stock *_org values). */
++  float3 P, D, N;
++  int object;
++  Spectrum albedo, alpha, sigma_t, sigma_s, sigma_t_star, sigma_s_star;
++  float anisotropy, guided_fraction, diffusion_length, phase_log;
++  /* Loop-carried. */
++  Spectrum throughput;
++  float opposite_distance;
++  int bounce;
++  bool hit, have_opposite_interface;
++};
++
++/* rng_state must hold path_state_rng_load(state) on entry, as subsurface_scatter passes it. */
++ccl_device_forceinline bool sss_walk_begin(KernelGlobals kg, IntegratorState state, SSSWalk &w)
++{
++  Ray &ray = w.ray;
++  RNGState &rng_state = w.rng_state;
++
++  w.P = INTEGRATOR_STATE(state, ray, P);
++  w.D = INTEGRATOR_STATE(state, ray, D);
++  const float ray_dP = INTEGRATOR_STATE(state, ray, dP);
++  const float time = INTEGRATOR_STATE(state, ray, time);
++  w.N = INTEGRATOR_STATE(state, subsurface, N);
++  w.object = INTEGRATOR_STATE(state, isect, object);
++  const int prim = INTEGRATOR_STATE(state, isect, prim);
++
++  /* Setup ray. */
++  ray.P = w.P;
++  ray.D = w.D;
++  ray.tmin = 0.0f;
++  ray.tmax = FLT_MAX;
++  ray.time = time;
++  ray.dP = ray_dP;
++  ray.dD = differential_zero_compact();
++  ray.self.object = w.object;
++  ray.self.prim = prim;
++  ray.self.light_object = OBJECT_NONE;
++  ray.self.light_prim = PRIM_NONE;
++
++  /* Convert subsurface to volume coefficients. */
++  w.albedo = INTEGRATOR_STATE(state, subsurface, albedo);
++  const Spectrum radius = INTEGRATOR_STATE(state, subsurface, radius);
++  float anisotropy = INTEGRATOR_STATE(state, subsurface, anisotropy);
++
++  bool van_de_hulst;
++  if (anisotropy >= 1.0f) {
++    /* Legacy random walk was mapped from (-1, 1) to (1, 3) when stored in integrator state. */
++    anisotropy -= 2.0f;
++    van_de_hulst = anisotropy < 0.0f;
++  }
++  else {
++    van_de_hulst = true;
++  }
++
++  Spectrum sigma_t;
++  Spectrum alpha;
++  Spectrum throughput = INTEGRATOR_STATE(state, path, throughput);
++  subsurface_random_walk_coefficients(
++      w.albedo, radius, anisotropy, van_de_hulst, &sigma_t, &alpha, &throughput);
++  const Spectrum sigma_s = sigma_t * alpha;
++
++  const float diffusion_length = diffusion_length_dwivedi(reduce_max(alpha));
++
++  if (diffusion_length == 1.0f) {
++    return false;
++  }
++
++  /* Precompute term for phase sampling. */
++  w.phase_log = logf((diffusion_length + 1.0f) / (diffusion_length - 1.0f));
++
++  /* Modify state for RNGs, decorrelated from other paths. */
++  path_state_rng_scramble(&rng_state, 0xdeadbeef);
++
++  /* Random walk until we hit the surface again. */
++  w.hit = false;
++  w.have_opposite_interface = false;
++  w.opposite_distance = 0.0f;
++
++  const float guided_fraction = 1.0f - fmaxf(0.5f, powf(fabsf(anisotropy), 0.125f));
++
++  w.sigma_s_star = sigma_s * (1.0f - anisotropy);
++  w.sigma_t_star = sigma_t - sigma_s + w.sigma_s_star;
++  w.sigma_t = sigma_t;
++  w.sigma_s = sigma_s;
++  w.anisotropy = anisotropy;
++  w.guided_fraction = guided_fraction;
++
++  w.alpha = alpha;
++  w.throughput = throughput;
++  w.diffusion_length = diffusion_length;
++  w.bounce = 0;
++  return true;
++}
++
++/* One iteration of the bounce loop, for bounce w.bounce; true when the loop has ended. */
++ccl_device_forceinline bool sss_walk_step(KernelGlobals kg, IntegratorState state, SSSWalk &w)
++{
++  Ray &ray = w.ray;
++  RNGState &rng_state = w.rng_state;
++  const int bounce = w.bounce;
++  const float3 P = w.P;
++  const float3 N = w.N;
++  const float diffusion_length = w.diffusion_length;
++  const float phase_log = w.phase_log;
++  LocalIntersection &ss_isect = w.ss_isect;
++  bool hit;
++
++  /* Advance random number offset. */
++  rng_state.rng_offset += PRNG_BOUNCE_NUM;
++
++  float anisotropy;
++  float guided_fraction;
++  Spectrum sigma_s;
++  Spectrum sigma_t;
++  if (bounce <= SUBSURFACE_RANDOM_WALK_SIMILARITY_LEVEL) {
++    anisotropy = w.anisotropy;
++    guided_fraction = w.guided_fraction;
++    sigma_t = w.sigma_t;
++    sigma_s = w.sigma_s;
++  }
++  else {
++    anisotropy = 0.0f;
++    guided_fraction = 0.75f;  // back to isotropic heuristic from Blender
++    sigma_t = w.sigma_t_star;
++    sigma_s = w.sigma_s_star;
++  }
++
++  /* Sample color channel, use MIS with balance heuristic. */
++  float rchannel = path_state_rng_1D(kg, &rng_state, PRNG_SUBSURFACE_COLOR_CHANNEL);
++  Spectrum channel_pdf;
++  const int channel = volume_sample_channel(w.alpha, w.throughput, &rchannel, &channel_pdf);
++  float sample_sigma_t = volume_channel_get(sigma_t, channel);
++  const float randt = path_state_rng_1D(kg, &rng_state, PRNG_SUBSURFACE_SCATTER_DISTANCE);
++
++  float backward_fraction = 0.0f;
++  float forward_pdf_factor = 0.0f;
++  float forward_stretching = 1.0f;
++  float backward_pdf_factor = 0.0f;
++  float backward_stretching = 1.0f;
++
++  /* For the initial ray, we already know the direction, so just do classic distance sampling. */
++  if (bounce > 0) {
++    /* Decide whether we should use guided or classic sampling. */
++    const bool guided = (path_state_rng_1D(kg, &rng_state, PRNG_SUBSURFACE_GUIDE_STRATEGY) <
++                         guided_fraction);
++
++    bool guide_backward = false;
++    if (w.have_opposite_interface) {
++      const float x = clamp(dot(ray.P - P, -N), 0.0f, w.opposite_distance);
++      backward_fraction = 1.0f /
++                          (1.0f + expf((w.opposite_distance - 2.0f * x) / diffusion_length));
++      guide_backward = path_state_rng_1D(kg, &rng_state, PRNG_SUBSURFACE_GUIDE_DIRECTION) <
++                       backward_fraction;
++    }
++
++    /* Sample scattering direction. */
++    const float2 rand_scatter = path_state_rng_2D(kg, &rng_state, PRNG_SUBSURFACE_BSDF);
++    float cos_theta;
++    float hg_pdf;
++    if (guided) {
++      cos_theta = sample_phase_dwivedi(diffusion_length, phase_log, rand_scatter.x);
++      if (guide_backward) {
++        cos_theta = -cos_theta;
++      }
++      const float3 newD = direction_from_cosine(N, cos_theta, rand_scatter.y);
++      hg_pdf = phase_henyey_greenstein(dot(ray.D, newD), anisotropy);
++      ray.D = newD;
++    }
++    else {
++      const float3 newD = phase_henyey_greenstein_sample(ray.D, anisotropy, rand_scatter, &hg_pdf);
++      cos_theta = dot(newD, N);
++      ray.D = newD;
++    }
++
++    forward_pdf_factor = M_1_2PI_F * eval_phase_dwivedi(diffusion_length, phase_log, cos_theta) /
++                         hg_pdf;
++    backward_pdf_factor = M_1_2PI_F *
++                          eval_phase_dwivedi(diffusion_length, phase_log, -cos_theta) / hg_pdf;
++
++    forward_stretching = (1.0f - cos_theta / diffusion_length);
++    backward_stretching = (1.0f + cos_theta / diffusion_length);
++    if (guided) {
++      sample_sigma_t *= guide_backward ? backward_stretching : forward_stretching;
++    }
++  }
++
++  /* Sample distance along ray. */
++  float t = -logf(1.0f - randt) / sample_sigma_t;
++
++  if (bounce == 0) {
++    ray.tmax = max(t, 10.0f / (reduce_min(sigma_t)));
++  }
++  else {
++    ray.tmax = t;
++    /* After the first bounce the object can intersect the same surface again */
++    ray.self.object = OBJECT_NONE;
++    ray.self.prim = PRIM_NONE;
++  }
++  scene_intersect_local<true>(kg, &ray, &ss_isect, w.object, nullptr, 1);
++  hit = (ss_isect.num_hits > 0);
++
++  if (hit) {
++    ray.tmax = ss_isect.hits[0].t;
++  }
++
++  if (bounce == 0) {
++    /* Check if we hit the opposite side. */
++    if (hit) {
++      w.have_opposite_interface = true;
++      w.opposite_distance = dot(ray.P + ray.tmax * ray.D - P, -N);
++    }
++    hit = ray.tmax < t;
++  }
++
++  /* Use the distance to the exit point for the throughput update if we found one. */
++  if (hit) {
++    t = ray.tmax;
++  }
++
++  /* Advance to new scatter location. */
++  ray.P += t * ray.D;
++
++  Spectrum transmittance;
++  Spectrum pdf = subsurface_random_walk_pdf(sigma_t, t, hit, &transmittance);
++  if (bounce > 0) {
++    Spectrum guided_pdf = subsurface_random_walk_pdf(
++        forward_stretching * sigma_t, t, hit, nullptr);
++
++    if (w.have_opposite_interface) {
++      const Spectrum back_pdf = subsurface_random_walk_pdf(
++          backward_stretching * sigma_t, t, hit, nullptr);
++      guided_pdf = mix(
++          guided_pdf * forward_pdf_factor, back_pdf * backward_pdf_factor, backward_fraction);
++    }
++    else {
++      guided_pdf *= forward_pdf_factor;
++    }
++
++    pdf = mix(pdf, guided_pdf, guided_fraction);
++  }
++
++  w.throughput *= (hit ? transmittance : sigma_s * transmittance) / dot(channel_pdf, pdf);
++  w.hit = hit;
++
++  if (hit) {
++    /* If we hit the surface, we are done. */
++    return true;
++  }
++  if (reduce_max(w.throughput) < VOLUME_THROUGHPUT_EPSILON) {
++    return true;
++  }
++  w.bounce = bounce + 1;
++  return w.bounce >= BSSRDF_MAX_BOUNCES;
++}
++
++/* The function after its bounce loop; returns its result. */
++ccl_device_forceinline bool sss_walk_end(KernelGlobals kg, IntegratorState state, SSSWalk &w)
++{
++  if (w.hit) {
++    kernel_assert(isfinite_safe(w.throughput));
++
++    guiding_record_bssrdf_bounce(
++        kg,
++        state,
++        1.0f,
++        w.N,
++        w.D,
++        safe_divide_color(w.throughput, INTEGRATOR_STATE(state, path, throughput)),
++        w.albedo);
++
++    INTEGRATOR_STATE_WRITE(state, path, throughput) = w.throughput;
++  }
++
++  return w.hit;
++}
++
++CCL_NAMESPACE_END
++
++#endif /* __SUBSURFACE__ */
+diff --git a/intern/cycles/kernel/integrator/surface_shader.h b/intern/cycles/kernel/integrator/surface_shader.h
+index 43b8662..2d34ec0 100644
+--- a/intern/cycles/kernel/integrator/surface_shader.h
++++ b/intern/cycles/kernel/integrator/surface_shader.h
+@@ -274,7 +274,7 @@ ccl_device_forceinline bool _surface_shader_exclude(ClosureType type,
+   return false;
+ }
+ 
+-ccl_device_inline float _surface_shader_bsdf_eval_mis(KernelGlobals kg,
++ccl_device_hot2 float _surface_shader_bsdf_eval_mis(KernelGlobals kg,
+                                                       ccl_private ShaderData *sd,
+                                                       const float3 wo,
+                                                       const ccl_private ShaderClosure *skip_sc,
+@@ -384,7 +384,7 @@ ccl_device_inline float surface_shader_bsdf_eval_pdfs(const KernelGlobals kg,
+ #ifndef __KERNEL_CUDA__
+ ccl_device
+ #else
+-ccl_device_inline
++ccl_device_hot2
+ #endif
+     float surface_shader_bsdf_eval(KernelGlobals kg,
+                                    ccl_attr_maybe_unused IntegratorState state,
+@@ -975,7 +975,7 @@ ccl_device int surface_shader_bsdf_guided_sample_closure(
+ 
+ /* Sample direction for picked BSDF, and return evaluation and pdf for all
+  * BSDFs combined using MIS. */
+-ccl_device int surface_shader_bsdf_sample_closure(KernelGlobals kg,
++ccl_device_hot2 int surface_shader_bsdf_sample_closure(KernelGlobals kg,
+                                                   ccl_private ShaderData *sd,
+                                                   const ccl_private ShaderClosure *sc,
+                                                   const float3 rand_bsdf,
+@@ -1273,6 +1273,11 @@ ccl_device void surface_shader_eval(KernelGlobals kg,
+   }
+   else {
+     max_closures = use_caustics_storage ? CAUSTICS_MAX_CLOSURE : kernel_data.max_closures;
++#ifdef __MAX_CLOSURE__
++    /* Ours: a per-scene build with a smaller closure array (-D__MAX_CLOSURE__ >= the scene's count) never
++     * writes past it, even if the host asks for more. */
++    max_closures = min(max_closures, MAX_CLOSURE);
++#endif
+   }
+ 
+   sd->num_closure = 0;
+diff --git a/intern/cycles/kernel/light/tree.h b/intern/cycles/kernel/light/tree.h
+index e20208a..4b030f4 100644
+--- a/intern/cycles/kernel/light/tree.h
++++ b/intern/cycles/kernel/light/tree.h
+@@ -811,7 +811,7 @@ ccl_device bool light_tree_sample(KernelGlobals kg,
+ 
+ /* We need to be able to find the probability of selecting a given light for MIS. */
+ template<bool in_volume_segment>
+-ccl_device float light_tree_pdf(KernelGlobals kg,
++ccl_device_hot float light_tree_pdf(KernelGlobals kg,
+                                 float3 P,
+                                 float3 N,
+                                 const float dt,
+diff --git a/intern/cycles/kernel/svm/svm.h b/intern/cycles/kernel/svm/svm.h
+index 9fd2fcf..c26694f 100644
+--- a/intern/cycles/kernel/svm/svm.h
++++ b/intern/cycles/kernel/svm/svm.h
+@@ -94,6 +94,15 @@ CCL_NAMESPACE_BEGIN
+     case node: \
+       if (!kernel_data_svm_usage_##node) \
+         break;
++#elif defined(CYCLES_SVM_NODES_USED)
++/* Ours: per-scene build. svm_nodes_used.h (jobs/svm_nodes_header.py, from the host's "SVM nodes used" log
++ * line) defines CYCLES_SVM_USED_<node> as 1 for every node type the scene's shaders use and 0 otherwise, so
++ * the cases of unused node types compile to nothing, as Metal does with function constants. */
++#  include "svm_nodes_used.h"
++#  define SVM_CASE(node) \
++    case node: \
++      if (!CYCLES_SVM_USED_##node) \
++        break;
+ #else
+ #  define SVM_CASE(node) case node:
+ #endif
+diff --git a/intern/cycles/scene/scene.cpp b/intern/cycles/scene/scene.cpp
+index fe56ce4..12e1cba 100644
+--- a/intern/cycles/scene/scene.cpp
++++ b/intern/cycles/scene/scene.cpp
+@@ -688,6 +688,8 @@ bool Scene::update_camera_resolution(Progress &progress, int width, int height)
+ static void log_kernel_features(const uint64_t features)
+ {
+   LOG_INFO << "Requested features:";
++  /* Ours (logging only): the numeric mask, to compile a per-scene kernel with -D__KERNEL_FEATURES__. */
++  LOG_INFO << "Kernel features mask " << features;
+   LOG_INFO << "Use BSDF " << string_from_bool(features & KERNEL_FEATURE_NODE_BSDF);
+   LOG_INFO << "Use Emission " << string_from_bool(features & KERNEL_FEATURE_NODE_EMISSION);
+   LOG_INFO << "Use Volume " << string_from_bool(features & KERNEL_FEATURE_NODE_VOLUME);
+diff --git a/intern/cycles/util/atomic.h b/intern/cycles/util/atomic.h
+index 697df94..4db699b 100644
+--- a/intern/cycles/util/atomic.h
++++ b/intern/cycles/util/atomic.h
+@@ -327,4 +327,40 @@ ccl_device_inline int atomic_load_local(int *p)
+ 
+ #  endif /* __KERNEL_ONEAPI__ */
+ 
++/* Ours, CYCLES_WARP_ATOMICS (final4's warp-aggregated atomics, Zhifei Li, ported to 5.3.0): the lanes of a warp
++ * that update the same queue counter combine their updates into one atomic by the lowest such lane. A counter
++ * ends with the same value as with one atomic per lane; only which lane gets which returned index changes, and
++ * that order was already decided by atomic arrival order. Unset: the stock calls, unchanged. */
++#  if defined(CYCLES_WARP_ATOMICS) && defined(__KERNEL_CUDA__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
++ccl_device_forceinline void atomic_add_aggregated_uint32(ccl_global uint *p, const uint x)
++{
++  const unsigned int mask = __activemask();
++  const unsigned int peers = __match_any_sync(mask, (unsigned long long)p);
++  const unsigned int sum = __reduce_add_sync(peers, x);
++  if ((threadIdx.x & 31) == (__ffs(peers) - 1)) {
++    atomicAdd((unsigned int *)p, sum);
++  }
++}
++ccl_device_forceinline uint atomic_fetch_add_one_aggregated_uint32(ccl_global uint *p)
++{
++  const unsigned int mask = __activemask();
++  const unsigned int peers = __match_any_sync(mask, (unsigned long long)p);
++  const int leader = __ffs(peers) - 1;
++  const unsigned int lane = threadIdx.x & 31;
++  unsigned int base = 0;
++  if (lane == leader) {
++    base = atomicAdd((unsigned int *)p, __popc(peers));
++  }
++  base = __shfl_sync(peers, base, leader);
++  return base + __popc(peers & ((1u << lane) - 1u));
++}
++#    define CYCLES_COUNTER_ADD1(p) atomic_add_aggregated_uint32((ccl_global uint *)(p), 1u)
++#    define CYCLES_COUNTER_SUB1(p) atomic_add_aggregated_uint32((ccl_global uint *)(p), (uint)-1)
++#    define CYCLES_COUNTER_FETCH_INC(p) atomic_fetch_add_one_aggregated_uint32((ccl_global uint *)(p))
++#  else
++#    define CYCLES_COUNTER_ADD1(p) atomic_fetch_and_add_uint32((p), 1)
++#    define CYCLES_COUNTER_SUB1(p) atomic_fetch_and_sub_uint32((p), 1)
++#    define CYCLES_COUNTER_FETCH_INC(p) atomic_fetch_and_add_uint32((p), 1)
++#  endif
++
+ #endif /* __KERNEL_GPU__ */

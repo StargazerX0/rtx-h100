@@ -1,0 +1,47 @@
+{
+ "network": {
+  "otype": "FullyFusedMLP",
+  "activation": "ReLU",
+  "output_activation": "None",
+  "n_neurons": 64,
+  "n_hidden_layers": 5
+ },
+ "optimizer": {
+  "otype": "EMA",
+  "decay": 0.99,
+  "nested": {
+   "otype": "Adam",
+   "learning_rate": 0.01,
+   "beta1": 0.9,
+   "beta2": 0.99,
+   "epsilon": 1e-15,
+   "l2_reg": 1e-06
+  }
+ },
+ "nrc": {
+  "warmup_infer_batch": 2097152,
+  "warmup_train_batch": 262144
+ },
+ "encoding": {
+  "otype": "Composite",
+  "nested": [
+   {
+    "n_dims_to_encode": 3,
+    "otype": "HashGrid",
+    "n_levels": 16,
+    "n_features_per_level": 2,
+    "log2_hashmap_size": 24,
+    "base_resolution": 128,
+    "per_level_scale": 1.203025
+   },
+   {
+    "n_dims_to_encode": 5,
+    "otype": "OneBlob",
+    "n_bins": 4
+   },
+   {
+    "otype": "Identity"
+   }
+  ]
+ }
+}

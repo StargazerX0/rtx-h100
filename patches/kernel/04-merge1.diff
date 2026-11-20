@@ -1,0 +1,940 @@
+diff --git a/intern/cycles/kernel/closure/bsdf_microfacet.h b/intern/cycles/kernel/closure/bsdf_microfacet.h
+index 2bcb2a2..4ae4500 100644
+--- a/intern/cycles/kernel/closure/bsdf_microfacet.h
++++ b/intern/cycles/kernel/closure/bsdf_microfacet.h
+@@ -103,6 +103,16 @@ struct FresnelF82Tint {
+   Spectrum b;
+ };
+ 
++#ifdef CYCLES_SH2_FRESNEL
++#  define SH2_FRESNEL_PTR(T, b) \
++    ((ccl_private T *)((ccl_private char *)(b) + (b)->fresnel_ofs))
++#  define SH2_FRESNEL_SET(b, f) \
++    ((b)->fresnel_ofs = (int)((ccl_private char *)(f) - (ccl_private char *)(b)))
++#else
++#  define SH2_FRESNEL_PTR(T, b) ((ccl_private T *)(b)->fresnel)
++#  define SH2_FRESNEL_SET(b, f) ((b)->fresnel = (f))
++#endif
++
+ struct MicrofacetBsdf {
+   SHADER_CLOSURE_BASE;
+ 
+@@ -117,7 +127,13 @@ struct MicrofacetBsdf {
+   /* Fresnel model to apply, as well as the extra data for it.
+    * For NONE and DIELECTRIC, no extra storage is needed, so the pointer is nullptr for them. */
+   int fresnel_type;
++#ifdef CYCLES_SH2_FRESNEL
++  /* Byte offset of the extra data from this closure: the extra lives in the same local closure
++   * array, so loads through it stay local (LDL) instead of generic. */
++  int fresnel_ofs;
++#else
+   ccl_private void *fresnel;
++#endif
+ 
+   float3 T;
+ };
+@@ -454,7 +470,7 @@ ccl_device_forceinline FresnelCoeff microfacet_fresnel(KernelGlobals kg,
+     if (!has_reflection) {
+       return {zero_spectrum(), zero_spectrum()};
+     }
+-    ccl_private FresnelConductor *fresnel = (ccl_private FresnelConductor *)bsdf->fresnel;
++    ccl_private FresnelConductor *fresnel = SH2_FRESNEL_PTR(FresnelConductor, bsdf);
+     if (fresnel->thin_film.thickness > THINFILM_THICKNESS_CUTOFF) {
+       /* One channel at a time to reduce GPU register pressure. */
+       FOREACH_SPECTRUM_CHANNEL (i) {
+@@ -481,7 +497,7 @@ ccl_device_forceinline FresnelCoeff microfacet_fresnel(KernelGlobals kg,
+     /* F82-Tint model, described in "Novel aspects of the Adobe Standard Material" by Kutz et al.
+      * Essentially, this is the usual Schlick Fresnel with an additional cosI*(1-cosI)^6
+      * term which modulates the reflectivity around acos(1/7) degrees (ca. 82°). */
+-    ccl_private FresnelF82Tint *fresnel = (ccl_private FresnelF82Tint *)bsdf->fresnel;
++    ccl_private FresnelF82Tint *fresnel = SH2_FRESNEL_PTR(FresnelF82Tint, bsdf);
+ 
+     if (fresnel->thin_film.thickness > THINFILM_THICKNESS_CUTOFF) {
+       /* Estimate n and k by reinterpreting F0 and F82 as r and g from "Artist Friendly Metallic
+@@ -505,8 +521,7 @@ ccl_device_forceinline FresnelCoeff microfacet_fresnel(KernelGlobals kg,
+     }
+   }
+   else if (bsdf->fresnel_type == MicrofacetFresnel::GENERALIZED_SCHLICK) {
+-    ccl_private FresnelGeneralizedSchlick *fresnel = (ccl_private FresnelGeneralizedSchlick *)
+-                                                         bsdf->fresnel;
++    ccl_private FresnelGeneralizedSchlick *fresnel = SH2_FRESNEL_PTR(FresnelGeneralizedSchlick, bsdf);
+     coeff *= generalized_schlick_fresnel(kg, fresnel, bsdf->ior, cos_theta_i, r_cos_theta_t);
+   }
+   else if (bsdf->fresnel_type == MicrofacetFresnel::NONE) {
+@@ -518,8 +533,7 @@ ccl_device_forceinline FresnelCoeff microfacet_fresnel(KernelGlobals kg,
+   }
+   else if (bsdf->fresnel_type == MicrofacetFresnel::DIELECTRIC_TINT) {
+     Spectrum F;
+-    ccl_private FresnelDielectricTint *fresnel = (ccl_private FresnelDielectricTint *)
+-                                                     bsdf->fresnel;
++    ccl_private FresnelDielectricTint *fresnel = SH2_FRESNEL_PTR(FresnelDielectricTint, bsdf);
+     if (fresnel->thin_film.thickness > THINFILM_THICKNESS_CUTOFF) {
+       FOREACH_SPECTRUM_CHANNEL (i) {
+         GET_SPECTRUM_CHANNEL(F, i) = fresnel_iridescence_channel<false>(
+@@ -530,7 +544,7 @@ ccl_device_forceinline FresnelCoeff microfacet_fresnel(KernelGlobals kg,
+       F = make_spectrum(fresnel_dielectric(cos_theta_i, bsdf->ior, r_cos_theta_t));
+     }
+     coeff *= F;
+-    coeff *= ((ccl_private FresnelDielectricTint *)bsdf->fresnel)->tint;
++    coeff *= (SH2_FRESNEL_PTR(FresnelDielectricTint, bsdf))->tint;
+   }
+   else {
+     /* Transmissive dielectric. */
+@@ -623,8 +637,7 @@ ccl_device Spectrum bsdf_microfacet_estimate_albedo(KernelGlobals kg,
+    * Note that even if the reflectance or transmittance would evaluate to zero for
+    * #microfacet_fresnel, we still compute it because this contributes to albedo passes. */
+   if (bsdf->fresnel_type == MicrofacetFresnel::GENERALIZED_SCHLICK) {
+-    ccl_private FresnelGeneralizedSchlick *fresnel = (ccl_private FresnelGeneralizedSchlick *)
+-                                                         bsdf->fresnel;
++    ccl_private FresnelGeneralizedSchlick *fresnel = SH2_FRESNEL_PTR(FresnelGeneralizedSchlick, bsdf);
+ 
+     if (fresnel->thin_film.thickness > THINFILM_THICKNESS_CUTOFF) {
+       /* Precomputing LUTs for thin-film iridescence isn't viable, so fall back to the specular
+@@ -662,7 +675,7 @@ ccl_device Spectrum bsdf_microfacet_estimate_albedo(KernelGlobals kg,
+     }
+   }
+   else if (bsdf->fresnel_type == MicrofacetFresnel::F82_TINT) {
+-    ccl_private FresnelF82Tint *fresnel = (ccl_private FresnelF82Tint *)bsdf->fresnel;
++    ccl_private FresnelF82Tint *fresnel = SH2_FRESNEL_PTR(FresnelF82Tint, bsdf);
+ 
+     if (fresnel->thin_film.thickness > THINFILM_THICKNESS_CUTOFF) {
+       /* Precomputing LUTs for thin-film iridescence isn't viable, so fall back to the specular
+@@ -685,7 +698,7 @@ ccl_device Spectrum bsdf_microfacet_estimate_albedo(KernelGlobals kg,
+     }
+   }
+   if (bsdf->fresnel_type == MicrofacetFresnel::DIELECTRIC_TINT &&
+-      ((ccl_private FresnelDielectricTint *)bsdf->fresnel)->thin_film.thickness >
++      (SH2_FRESNEL_PTR(FresnelDielectricTint, bsdf))->thin_film.thickness >
+           THINFILM_THICKNESS_CUTOFF)
+   {
+     /* Precomputing LUTs for thin-film iridescence isn't viable, so fall back to the specular
+@@ -721,7 +734,7 @@ ccl_device Spectrum bsdf_microfacet_estimate_albedo(KernelGlobals kg,
+ 
+     /* Tinted dielectric. */
+     if (bsdf->fresnel_type == MicrofacetFresnel::DIELECTRIC_TINT) {
+-      coeff *= ((ccl_private FresnelDielectricTint *)bsdf->fresnel)->tint;
++      coeff *= (SH2_FRESNEL_PTR(FresnelDielectricTint, bsdf))->tint;
+       return coeff.sum();
+     }
+ 
+@@ -1073,7 +1086,7 @@ ccl_device void bsdf_microfacet_setup_fresnel_conductor(KernelGlobals kg,
+                                                         const bool preserve_energy)
+ {
+   bsdf->fresnel_type = MicrofacetFresnel::CONDUCTOR;
+-  bsdf->fresnel = fresnel;
++  SH2_FRESNEL_SET(bsdf, fresnel);
+   bsdf->sample_weight *= average(bsdf_microfacet_estimate_albedo(kg, wi, bsdf, true, true));
+ 
+   if (preserve_energy) {
+@@ -1090,7 +1103,7 @@ ccl_device void bsdf_microfacet_setup_fresnel_generalized_schlick(
+ {
+   fresnel->f0 = saturate(fresnel->f0);
+   bsdf->fresnel_type = MicrofacetFresnel::GENERALIZED_SCHLICK;
+-  bsdf->fresnel = fresnel;
++  SH2_FRESNEL_SET(bsdf, fresnel);
+   bsdf->sample_weight *= average(bsdf_microfacet_estimate_albedo(kg, wi, bsdf, true, true));
+ 
+   if (preserve_energy) {
+@@ -1135,7 +1148,7 @@ ccl_device void bsdf_microfacet_setup_fresnel_f82_tint(KernelGlobals kg,
+   }
+ 
+   bsdf->fresnel_type = MicrofacetFresnel::F82_TINT;
+-  bsdf->fresnel = fresnel;
++  SH2_FRESNEL_SET(bsdf, fresnel);
+   bsdf->sample_weight *= average(bsdf_microfacet_estimate_albedo(kg, wi, bsdf, true, true));
+ 
+   if (preserve_energy) {
+@@ -1335,7 +1348,7 @@ ccl_device void bsdf_dielectric_tint_setup(KernelGlobals kg,
+   }
+ 
+   bsdf->fresnel_type = MicrofacetFresnel::DIELECTRIC_TINT;
+-  bsdf->fresnel = fresnel;
++  SH2_FRESNEL_SET(bsdf, fresnel);
+   bsdf->sample_weight *= average(bsdf_microfacet_estimate_albedo(kg, sd->wi, bsdf, true, true));
+ 
+   if (!preserve_energy) {
+diff --git a/intern/cycles/kernel/device/gpu/kernel.h b/intern/cycles/kernel/device/gpu/kernel.h
+index ed0d375..3bef29d 100644
+--- a/intern/cycles/kernel/device/gpu/kernel.h
++++ b/intern/cycles/kernel/device/gpu/kernel.h
+@@ -5,6 +5,11 @@
+ /* Common GPU kernels. */
+ 
+ #include "kernel/device/gpu/parallel_active_index.h"
++
++#if defined(CYCLES_BOOK_FILL) && defined(__KERNEL_CUDA__)
++/* Ours: tells the host that integrator_init_from_camera takes a path index array in tile mode. */
++extern "C" __device__ int kernel_book_fill = 1;
++#endif
+ #include "kernel/device/gpu/parallel_prefix_sum.h"
+ #include "kernel/device/gpu/parallel_sorted_index.h"
+ 
+@@ -105,7 +110,15 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+       return;
+     }
+ 
++#if defined(CYCLES_BOOK_FILL) && defined(__KERNEL_CUDA__)
++    /* Ours (CYCLES_BOOK_FILL): with a path index array the tile's paths go to the free states it lists (host
++     * env CYCLES_MAIN_COMPACT_FACTOR, which reads kernel_book_fill below), instead of the dense range after
++     * compaction. Stock: the host passes no array here. */
++    const int slot = tile->path_index_offset + tile_work_index;
++    const int state = (path_index_array) ? path_index_array[slot] : slot;
++#else
+     const int state = tile->path_index_offset + tile_work_index;
++#endif
+ 
+     uint x, y, sample;
+     ccl_gpu_kernel_call(get_work_pixel(tile, tile_work_index, &x, &y, &sample));
+diff --git a/intern/cycles/kernel/device/gpu/parallel_active_index.h b/intern/cycles/kernel/device/gpu/parallel_active_index.h
+index b0eed6d..4297c81 100644
+--- a/intern/cycles/kernel/device/gpu/parallel_active_index.h
++++ b/intern/cycles/kernel/device/gpu/parallel_active_index.h
+@@ -18,7 +18,85 @@ CCL_NAMESPACE_BEGIN
+  * `ccl_gpu_thread_warp`, `ccl_gpu_warp_index`, `ccl_gpu_num_warps` for all devices
+  * and keep device specific code in `compat.h`. */
+ 
+-#ifdef __KERNEL_ONEAPI__
++#if defined(CYCLES_BOOK_SCAN) && defined(__KERNEL_CUDA__) && !defined(__HIP__)
++
++/* Ours (CYCLES_BOOK_SCAN=K, CUDA only): each warp tests K * 32 consecutive states in K coalesced chunks of 32,
++ * warp 0 scans the per-warp counts with shuffles, and one atomic per block reserves the block's output range,
++ * so a block covers K * blocksize states and the host launches ceil(num_states / (K * blocksize)) blocks
++ * (host env CYCLES_BOOK_SCAN=1, which reads kernel_book_scan_k below). Indices increase within a block, as in
++ * stock; the set of indices is the same. A launch with the stock grid is also correct (surplus blocks find no
++ * state). Needs sizeof(int) * 32 bytes of the dynamic shared memory the host already passes. */
++#  if CYCLES_BOOK_SCAN < 1 || CYCLES_BOOK_SCAN > 32
++#    error "CYCLES_BOOK_SCAN must be in 1..32"
++#  endif
++extern "C" __device__ int kernel_book_scan_k = CYCLES_BOOK_SCAN;
++
++template<typename IsActiveOp>
++__device__ void gpu_parallel_active_index_array_impl(const uint num_states,
++                                                     ccl_global int *indices,
++                                                     ccl_global int *num_indices,
++                                                     IsActiveOp is_active_op)
++{
++  constexpr int K = CYCLES_BOOK_SCAN;
++  extern ccl_gpu_shared int warp_offset[];
++
++  const uint lane = ccl_gpu_thread_idx_x & 31;
++  const uint warp_index = ccl_gpu_thread_idx_x >> 5;
++  const uint num_warps = ccl_gpu_block_dim_x >> 5;
++  const uint warp_base = (ccl_gpu_block_idx_x * num_warps + warp_index) * uint(K * 32);
++
++  uint mask[K];
++  uint count = 0;
++#  pragma unroll
++  for (int k = 0; k < K; k++) {
++    const uint state_index = warp_base + uint(k * 32) + lane;
++    const uint is_active = (state_index < num_states) ? is_active_op(state_index) : 0;
++    mask[k] = __ballot_sync(0xFFFFFFFF, is_active);
++    count += __popc(mask[k]);
++  }
++
++  if (lane == 0) {
++    warp_offset[warp_index] = count;
++  }
++  __syncthreads();
++
++  if (warp_index == 0) {
++    const uint num = (lane < num_warps) ? warp_offset[lane] : 0;
++    uint inclusive = num;
++#  pragma unroll
++    for (int d = 1; d < 32; d <<= 1) {
++      const uint other = __shfl_up_sync(0xFFFFFFFF, inclusive, d);
++      if (lane >= d) {
++        inclusive += other;
++      }
++    }
++    uint block_offset = 0;
++    if (lane == 31 && inclusive != 0) {
++      block_offset = atomic_fetch_and_add_uint32(num_indices, inclusive);
++    }
++    block_offset = __shfl_sync(0xFFFFFFFF, block_offset, 31);
++    if (lane < num_warps) {
++      warp_offset[lane] = block_offset + inclusive - num;
++    }
++  }
++  __syncthreads();
++
++  uint offset = warp_offset[warp_index];
++  const uint lane_mask_lt = (1u << lane) - 1u;
++#  pragma unroll
++  for (int k = 0; k < K; k++) {
++    if ((mask[k] >> lane) & 1u) {
++      indices[offset + __popc(mask[k] & lane_mask_lt)] = warp_base + uint(k * 32) + lane;
++    }
++    offset += __popc(mask[k]);
++  }
++}
++
++#  define gpu_parallel_active_index_array gpu_parallel_active_index_array_impl
++
++#else /* Stock. */
++
++#  ifdef __KERNEL_ONEAPI__
+ 
+ template<typename IsActiveOp>
+ void gpu_parallel_active_index_array_impl(const uint num_states,
+@@ -170,4 +248,6 @@ __device__
+ 
+ #endif
+ 
++#endif /* CYCLES_BOOK_SCAN */
++
+ CCL_NAMESPACE_END
+diff --git a/intern/cycles/kernel/integrator/path_state.h b/intern/cycles/kernel/integrator/path_state.h
+index 2585b23..c56b062 100644
+--- a/intern/cycles/kernel/integrator/path_state.h
++++ b/intern/cycles/kernel/integrator/path_state.h
+@@ -243,6 +243,137 @@ ccl_device_inline void path_state_next(KernelGlobals kg,
+   INTEGRATOR_STATE_WRITE(state, path, rng_offset) += PRNG_BOUNCE_NUM;
+ }
+ 
++#ifdef CYCLES_SH2_BOUNCEPREF
++/* path_state_next with the main-path fields it reads loaded by the caller before its first state
++ * store (path_state_preload), so the loads do not wait behind stores the compiler cannot
++ * disambiguate. Same arithmetic as path_state_next; only the counter the label selects is loaded. */
++struct PathStatePre {
++  uint32_t flag;
++  int bounce;
++  int counter; /* transparent, diffuse, glossy or transmission bounce, as the label selects */
++  uint32_t rng_offset;
++};
++
++ccl_device_forceinline PathStatePre path_state_preload(ConstIntegratorState state, const int label)
++{
++  PathStatePre pre;
++  pre.flag = INTEGRATOR_STATE(state, path, flag);
++  pre.rng_offset = INTEGRATOR_STATE(state, path, rng_offset);
++  pre.bounce = INTEGRATOR_STATE(state, path, bounce);
++  if (label & (LABEL_TRANSPARENT | LABEL_RAY_PORTAL)) {
++    pre.counter = INTEGRATOR_STATE(state, path, transparent_bounce);
++  }
++  else if (label & LABEL_REFLECT) {
++    pre.counter = (label & LABEL_DIFFUSE) ? INTEGRATOR_STATE(state, path, diffuse_bounce) :
++                                            INTEGRATOR_STATE(state, path, glossy_bounce);
++  }
++  else {
++    pre.counter = INTEGRATOR_STATE(state, path, transmission_bounce);
++  }
++  return pre;
++}
++
++ccl_device_inline void path_state_next_pre(KernelGlobals kg,
++                                           IntegratorState state,
++                                           const int label,
++                                           const int runtime_flag,
++                                           const PathStatePre pre)
++{
++  uint32_t flag = pre.flag;
++
++  if (label & (LABEL_TRANSPARENT | LABEL_RAY_PORTAL)) {
++    const int transparent_bounce = pre.counter + 1;
++
++    flag |= PATH_RAY_TRANSPARENT;
++    if (transparent_bounce >= kernel_data.integrator.transparent_max_bounce) {
++      flag |= PATH_RAY_TERMINATE_ON_NEXT_SURFACE;
++    }
++
++    if (runtime_flag & SR_RAY_PORTAL) {
++      flag |= PATH_RAY_MIS_SKIP;
++      INTEGRATOR_STATE_WRITE(
++          state, path, portal_bounce) = INTEGRATOR_STATE(state, path, portal_bounce) + 1;
++    }
++
++    INTEGRATOR_STATE_WRITE(state, path, flag) = flag;
++    INTEGRATOR_STATE_WRITE(state, path, transparent_bounce) = transparent_bounce;
++    INTEGRATOR_STATE_WRITE(state, path, rng_offset) = pre.rng_offset + PRNG_BOUNCE_NUM;
++    return;
++  }
++
++  const int bounce = pre.bounce + 1;
++  if (bounce >= kernel_data.integrator.max_bounce) {
++    flag |= PATH_RAY_TERMINATE_AFTER_TRANSPARENT;
++  }
++
++  PathRayVisibility visibility = PATH_RAY_VISIBILITY_NONE;
++  flag &= ~(PATH_RAY_REFLECT | PATH_RAY_SINGULAR | PATH_RAY_TRANSPARENT |
++            PATH_RAY_IMPORTANCE_BAKE | PATH_RAY_MIS_SKIP | PATH_RAY_MIS_HAD_TRANSMISSION);
++
++  /* Surface reflection/transmission (callers are surface bounces: no volume scatter label). */
++  if (label & LABEL_REFLECT) {
++    flag |= PATH_RAY_REFLECT;
++    flag &= ~PATH_RAY_TRANSPARENT_BACKGROUND;
++
++    if (label & LABEL_DIFFUSE) {
++      const int diffuse_bounce = pre.counter + 1;
++      INTEGRATOR_STATE_WRITE(state, path, diffuse_bounce) = diffuse_bounce;
++      if (diffuse_bounce >= kernel_data.integrator.max_diffuse_bounce) {
++        flag |= PATH_RAY_TERMINATE_AFTER_TRANSPARENT;
++      }
++    }
++    else {
++      const int glossy_bounce = pre.counter + 1;
++      INTEGRATOR_STATE_WRITE(state, path, glossy_bounce) = glossy_bounce;
++      if (glossy_bounce >= kernel_data.integrator.max_glossy_bounce) {
++        flag |= PATH_RAY_TERMINATE_AFTER_TRANSPARENT;
++      }
++    }
++  }
++  else {
++    kernel_assert(label & LABEL_TRANSMIT);
++
++    visibility |= PATH_RAY_VISIBILITY_TRANSMIT;
++
++    if (!(label & LABEL_TRANSMIT_TRANSPARENT)) {
++      flag &= ~PATH_RAY_TRANSPARENT_BACKGROUND;
++    }
++
++    const int transmission_bounce = pre.counter + 1;
++    INTEGRATOR_STATE_WRITE(state, path, transmission_bounce) = transmission_bounce;
++    if (transmission_bounce >= kernel_data.integrator.max_transmission_bounce) {
++      flag |= PATH_RAY_TERMINATE_AFTER_TRANSPARENT;
++    }
++  }
++
++  if (label & LABEL_DIFFUSE) {
++    visibility |= PATH_RAY_VISIBILITY_DIFFUSE;
++    flag |= PATH_RAY_DIFFUSE_ANCESTOR;
++  }
++  else if (label & LABEL_GLOSSY) {
++    visibility |= PATH_RAY_VISIBILITY_GLOSSY;
++  }
++  else {
++    kernel_assert(label & LABEL_SINGULAR);
++    visibility |= PATH_RAY_VISIBILITY_GLOSSY;
++    flag |= PATH_RAY_SINGULAR | PATH_RAY_MIS_SKIP;
++  }
++
++  if (runtime_flag & SR_BSDF_HAS_TRANSMISSION) {
++    flag |= PATH_RAY_MIS_HAD_TRANSMISSION;
++  }
++
++  if (!(flag & PATH_RAY_ANY_PASS) && !(flag & PATH_RAY_TRANSPARENT_BACKGROUND)) {
++    flag |= PATH_RAY_SURFACE_PASS;
++  }
++
++  INTEGRATOR_STATE_WRITE(state, path, visibility) = visibility;
++  INTEGRATOR_STATE_WRITE(state, path, flag) = flag;
++  INTEGRATOR_STATE_WRITE(state, path, bounce) = bounce;
++  INTEGRATOR_STATE_WRITE(state, path, rng_offset) = pre.rng_offset + PRNG_BOUNCE_NUM;
++}
++#endif
++
+ #ifdef __VOLUME__
+ ccl_device_inline bool path_state_volume_next(IntegratorState state)
+ {
+@@ -303,7 +434,17 @@ ccl_device_inline float path_state_continuation_probability(KernelGlobals kg,
+     throughput *= INTEGRATOR_STATE(state, path, unguided_throughput);
+   }
+ #endif
++#if defined(CYCLES_RR_EXP100)
++  /* Ours (approximate track): continuation probability max(throughput)^(CYCLES_RR_EXP100 / 100) instead of the
++   * square root: paths end earlier. Unbiased (survivors are divided by it); more noise. */
++#  if CYCLES_RR_EXP100 == 100
++  return min(reduce_max(fabs(throughput)), 1.0f);
++#  else
++  return min(powf(reduce_max(fabs(throughput)), float(CYCLES_RR_EXP100) * 0.01f), 1.0f);
++#  endif
++#else
+   return min(sqrtf(reduce_max(fabs(throughput))), 1.0f);
++#endif
+ }
+ 
+ ccl_device_inline bool path_state_ao_bounce(KernelGlobals kg, ConstIntegratorState state)
+diff --git a/intern/cycles/kernel/integrator/shade_dedicated_light.h b/intern/cycles/kernel/integrator/shade_dedicated_light.h
+index 695cb2b..bd4a3c9 100644
+--- a/intern/cycles/kernel/integrator/shade_dedicated_light.h
++++ b/intern/cycles/kernel/integrator/shade_dedicated_light.h
+@@ -218,7 +218,7 @@ ccl_device void shadow_linking_shade(KernelGlobals kg, IntegratorState state)
+ 
+ #  if defined(__PATH_GUIDING__)
+   if (kernel_data.integrator.train_guiding) {
+-    INTEGRATOR_STATE(shadow_state, shadow_path, guiding_light_linking_mis_weight) = mis_weight;
++    INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, guiding_light_linking_mis_weight) = mis_weight;
+   }
+ #  endif
+ }
+diff --git a/intern/cycles/kernel/integrator/shade_light.h b/intern/cycles/kernel/integrator/shade_light.h
+index ed54cf2..4d9753e 100644
+--- a/intern/cycles/kernel/integrator/shade_light.h
++++ b/intern/cycles/kernel/integrator/shade_light.h
+@@ -242,7 +242,7 @@ ccl_device ShaderEvalResult integrate_light_nee(KernelGlobals kg, IntegratorShad
+   }
+ 
+   /* Update throughput. */
+-  INTEGRATOR_STATE(state, shadow_path, throughput) *= eval;
++  INTEGRATOR_STATE_WRITE(state, shadow_path, throughput) *= eval;
+ 
+   return SHADER_EVAL_OK;
+ }
+diff --git a/intern/cycles/kernel/integrator/shade_surface.h b/intern/cycles/kernel/integrator/shade_surface.h
+index f260790..7f2e35b 100644
+--- a/intern/cycles/kernel/integrator/shade_surface.h
++++ b/intern/cycles/kernel/integrator/shade_surface.h
+@@ -219,6 +219,23 @@ integrate_direct_light_shadow_init_common(KernelGlobals kg,
+                                        DEVICE_KERNEL_INTEGRATOR_INTERSECT_SHADOW :
+                                        DEVICE_KERNEL_INTEGRATOR_SHADE_LIGHT_NEE;
+ 
++#ifdef CYCLES_SH2_SHADOWCOPY
++  /* Read every main-path field before the first shadow-state store: the SoA arrays are global
++   * pointers the compiler cannot disambiguate, so interleaved load/store pairs serialize one
++   * global round trip each. Nothing below writes these main-path fields, so the values match. */
++  const auto sc_render_pixel_index = INTEGRATOR_STATE(state, path, render_pixel_index);
++  const auto sc_rng_offset = INTEGRATOR_STATE(state, path, rng_offset);
++  const auto sc_rng_pixel = INTEGRATOR_STATE(state, path, rng_pixel);
++  const auto sc_sample = INTEGRATOR_STATE(state, path, sample);
++  const auto sc_transparent_bounce = INTEGRATOR_STATE(state, path, transparent_bounce);
++  const auto sc_volume_bounds_bounce = INTEGRATOR_STATE(state, path, volume_bounds_bounce);
++  const auto sc_glossy_bounce = INTEGRATOR_STATE(state, path, glossy_bounce);
++  const auto sc_transmission_bounce = INTEGRATOR_STATE(state, path, transmission_bounce);
++  const auto sc_diffuse_bounce = INTEGRATOR_STATE(state, path, diffuse_bounce);
++  const auto sc_bounce = INTEGRATOR_STATE(state, path, bounce);
++  const Spectrum sc_unlit_throughput = INTEGRATOR_STATE(state, path, throughput);
++#endif
++
+   /* Branch off shadow kernel. */
+   IntegratorShadowState shadow_state;
+ #ifdef __MNEE__
+@@ -243,6 +260,43 @@ integrate_direct_light_shadow_init_common(KernelGlobals kg,
+   integrator_state_write_shadow_ray(shadow_state, ray);
+   integrator_state_write_shadow_ray_self(shadow_state, ray);
+ 
++#ifdef CYCLES_SH2_SHADOWCOPY
++  const Spectrum unlit_throughput = sc_unlit_throughput;
++  const Spectrum throughput = unlit_throughput * bsdf_spectrum;
++
++  if (!(kernel_data.kernel_features & KERNEL_FEATURE_LIGHT_TREE)) {
++    INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, bsdf_eval_average) = average(bsdf_spectrum);
++  }
++
++  INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, render_pixel_index) = sc_render_pixel_index;
++  INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, rng_offset) = sc_rng_offset;
++  INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, rng_pixel) = sc_rng_pixel;
++  INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, sample) = sc_sample;
++  INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, transparent_bounce) = sc_transparent_bounce;
++  INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, volume_bounds_bounce) = sc_volume_bounds_bounce;
++  INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, glossy_bounce) = sc_glossy_bounce;
++  INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, throughput) = throughput;
++
++  if ((kernel_data.kernel_features & KERNEL_FEATURE_NODE_PORTAL)) {
++    INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, portal_bounce) = INTEGRATOR_STATE(
++        state, path, portal_bounce);
++  }
++
++#  ifdef __MNEE__
++  if (mnee_vertex_count > 0) {
++    INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, transmission_bounce) =
++        sc_transmission_bounce + mnee_vertex_count - 1;
++    INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, diffuse_bounce) = sc_diffuse_bounce + 1;
++    INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, bounce) = sc_bounce + mnee_vertex_count;
++  }
++  else
++#  endif
++  {
++    INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, transmission_bounce) = sc_transmission_bounce;
++    INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, diffuse_bounce) = sc_diffuse_bounce;
++    INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, bounce) = sc_bounce;
++  }
++#else
+   /* Copy state from main path to shadow path. */
+   const Spectrum unlit_throughput = INTEGRATOR_STATE(state, path, throughput);
+   const Spectrum throughput = unlit_throughput * bsdf_spectrum;
+@@ -295,6 +349,8 @@ integrate_direct_light_shadow_init_common(KernelGlobals kg,
+         state, path, bounce);
+   }
+ 
++#endif
++
+   /* Write Light-group, +1 as light-group is int but we need to encode into a uint8_t. */
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, lightgroup) = light_group + 1;
+ 
+@@ -303,7 +359,7 @@ integrate_direct_light_shadow_init_common(KernelGlobals kg,
+     INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, unlit_throughput) = unlit_throughput;
+     INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, path_segment) = INTEGRATOR_STATE(
+         state, guiding, path_segment);
+-    INTEGRATOR_STATE(shadow_state, shadow_path, guiding_light_linking_mis_weight) = 0.0f;
++    INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, guiding_light_linking_mis_weight) = 0.0f;
+   }
+ #endif
+ 
+@@ -448,6 +504,11 @@ ccl_device
+     ray.P = integrate_surface_ray_offset(kg, sd, ray.P, ray.D);
+   }
+ 
++#ifdef CYCLES_SH2_SHADOWCOPY
++  /* Main-path fields read after the shadow-state stores below, loaded before them. */
++  const uint32_t sc_flag = INTEGRATOR_STATE(state, path, flag);
++  const auto sc_visibility = INTEGRATOR_STATE(state, path, visibility);
++#endif
+   /* Branch off shadow kernel. */
+   IntegratorShadowState shadow_state = integrate_direct_light_shadow_init_common(
+       kg,
+@@ -464,7 +525,11 @@ ccl_device
+ #endif
+   }
+ 
++#ifdef CYCLES_SH2_SHADOWCOPY
++  uint32_t shadow_flag = sc_flag;
++#else
+   uint32_t shadow_flag = INTEGRATOR_STATE(state, path, flag);
++#endif
+ 
+   if (kernel_data.kernel_features & KERNEL_FEATURE_LIGHT_PASSES) {
+     PackedSpectrum pass_diffuse_weight;
+@@ -486,8 +551,12 @@ ccl_device
+     INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, pass_glossy_weight) = pass_glossy_weight;
+   }
+ 
++#ifdef CYCLES_SH2_SHADOWCOPY
++  INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, visibility) = sc_visibility;
++#else
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, visibility) = INTEGRATOR_STATE(
+       state, path, visibility);
++#endif
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, flag) = shadow_flag;
+ 
+   return SHADER_EVAL_OK;
+@@ -577,6 +646,57 @@ ccl_device_forceinline int integrate_surface_bsdf_bssrdf_bounce(
+     unguided_bsdf_pdf = bsdf_pdf;
+   }
+ 
++#ifdef CYCLES_SH2_BOUNCEPREF
++  /* Every main-path field read below, loaded before the first state store (see path_state_preload). */
++  const PathStatePre pre = path_state_preload(state, label);
++  const Spectrum pre_throughput = INTEGRATOR_STATE(state, path, throughput);
++  const float pre_min_ray_pdf = INTEGRATOR_STATE(state, path, min_ray_pdf);
++#  ifdef __RAY_DIFFERENTIALS__
++  const float pre_dD = INTEGRATOR_STATE(state, ray, dD);
++#  endif
++
++  if (label & LABEL_TRANSPARENT) {
++    INTEGRATOR_STATE_WRITE(state, ray, tmin) = intersection_t_offset(sd->ray_length);
++  }
++  else {
++    const float3 D = normalize(bsdf_wo);
++    INTEGRATOR_STATE_WRITE(state, ray, P) = integrate_surface_ray_offset(kg, sd, sd->P, D);
++    INTEGRATOR_STATE_WRITE(state, ray, D) = D;
++    INTEGRATOR_STATE_WRITE(state, ray, tmin) = 0.0f;
++    INTEGRATOR_STATE_WRITE(state, ray, tmax) = FLT_MAX;
++#  ifdef __RAY_DIFFERENTIALS__
++    INTEGRATOR_STATE_WRITE(state, ray, dP) = differential_make_compact(sd->dP);
++    const float dD = bsdf_widen_dD(kg, pre_dD, bsdf_avg_roughness_squared);
++    INTEGRATOR_STATE_WRITE(state, ray, dD) = dD;
++#  endif
++  }
++
++  const Spectrum bsdf_weight = bsdf_eval_sum(&bsdf_eval) / bsdf_pdf;
++  INTEGRATOR_STATE_WRITE(state, path, throughput) = pre_throughput * bsdf_weight;
++
++  if (kernel_data.kernel_features & KERNEL_FEATURE_LIGHT_PASSES) {
++    if (pre.bounce == 0) {
++      INTEGRATOR_STATE_WRITE(state, path, pass_diffuse_weight) = bsdf_eval_pass_diffuse_weight(
++          &bsdf_eval);
++      INTEGRATOR_STATE_WRITE(state, path, pass_glossy_weight) = bsdf_eval_pass_glossy_weight(
++          &bsdf_eval);
++    }
++  }
++
++  if (!(label & LABEL_TRANSPARENT)) {
++    INTEGRATOR_STATE_WRITE(state, path, mis_ray_pdf) = mis_pdf;
++    INTEGRATOR_STATE_WRITE(state, path, mis_origin_n) = sd->N;
++    INTEGRATOR_STATE_WRITE(state, path, min_ray_pdf) = fminf(unguided_bsdf_pdf, pre_min_ray_pdf);
++
++#  ifdef __LIGHT_LINKING__
++    if (kernel_data.kernel_features & KERNEL_FEATURE_LIGHT_LINKING) {
++      INTEGRATOR_STATE_WRITE(state, path, mis_ray_object) = sd->object;
++    }
++#  endif
++  }
++
++  path_state_next_pre(kg, state, label, sd->runtime_flag, pre);
++#else
+   if (label & LABEL_TRANSPARENT) {
+     /* Only need to modify start distance for transparent. */
+     INTEGRATOR_STATE_WRITE(state, ray, tmin) = intersection_t_offset(sd->ray_length);
+@@ -628,6 +748,8 @@ ccl_device_forceinline int integrate_surface_bsdf_bssrdf_bounce(
+ 
+   path_state_next(kg, state, label, sd->runtime_flag);
+ 
++#endif
++
+   guiding_record_surface_bounce(kg,
+                                 state,
+                                 bsdf_weight,
+diff --git a/intern/cycles/kernel/integrator/shade_volume.h b/intern/cycles/kernel/integrator/shade_volume.h
+index 6e999bf..527de78 100644
+--- a/intern/cycles/kernel/integrator/shade_volume.h
++++ b/intern/cycles/kernel/integrator/shade_volume.h
+@@ -2598,7 +2598,7 @@ ccl_device_forceinline void integrate_volume_direct_light(
+     INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, unlit_throughput) = unlit_throughput;
+     INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, path_segment) = INTEGRATOR_STATE(
+         state, guiding, path_segment);
+-    INTEGRATOR_STATE(shadow_state, shadow_path, guiding_light_linking_mis_weight) = 0.0f;
++    INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, guiding_light_linking_mis_weight) = 0.0f;
+   }
+ #  endif
+ 
+diff --git a/intern/cycles/kernel/integrator/state.h b/intern/cycles/kernel/integrator/state.h
+index 9677663..81c3cf2 100644
+--- a/intern/cycles/kernel/integrator/state.h
++++ b/intern/cycles/kernel/integrator/state.h
+@@ -269,6 +269,54 @@ using ConstIntegratorBakeState = IntegratorBakeState;
+       kernel_integrator_state.nested_struct.member##_fn()[state].member
+ #    define INTEGRATOR_STATE_ARRAY(state, nested_struct, array_index, member) \
+       kernel_integrator_state.nested_struct[array_index].member##_fn()[state].member
++#  elif defined(CYCLES_STATE_LDCG) && defined(__KERNEL_CUDA__)
++/* Ours: path-state reads are used once per kernel; load them with an L1-bypassing cache hint so they do not push
++ * the threads' local frames (ShaderData, closures, SVM stack) out of L1. CYCLES_STATE_LDCG=1: ld.global.cg (L2
++ * only), =2: ld.global.cs (evict first). Same values; writes unchanged. */
++#    if CYCLES_STATE_LDCG == 2
++#      define CCL_STATE_LD __ldcs
++#    else
++#      define CCL_STATE_LD __ldcg
++#    endif
++template<typename T> ccl_device_forceinline T ccl_state_load(const ccl_global T *p)
++{
++  T v;
++  if constexpr (sizeof(T) == 16 && alignof(T) >= 16) {
++    const uint4 w = CCL_STATE_LD(reinterpret_cast<const uint4 *>(p));
++    memcpy(&v, &w, 16);
++  }
++  else if constexpr (sizeof(T) == 8 && alignof(T) >= 8) {
++    const uint2 w = CCL_STATE_LD(reinterpret_cast<const uint2 *>(p));
++    memcpy(&v, &w, 8);
++  }
++  else if constexpr (sizeof(T) % 4 == 0 && alignof(T) >= 4) {
++    unsigned int w[sizeof(T) / 4];
++    for (int i = 0; i < int(sizeof(T) / 4); i++) {
++      w[i] = CCL_STATE_LD(reinterpret_cast<const unsigned int *>(p) + i);
++    }
++    memcpy(&v, w, sizeof(T));
++  }
++  else if constexpr (sizeof(T) == 2) {
++    const unsigned short w = CCL_STATE_LD(reinterpret_cast<const unsigned short *>(p));
++    memcpy(&v, &w, 2);
++  }
++  else if constexpr (sizeof(T) == 1) {
++    const unsigned char w = CCL_STATE_LD(reinterpret_cast<const unsigned char *>(p));
++    memcpy(&v, &w, 1);
++  }
++  else {
++    v = *p;
++  }
++  return v;
++}
++#    define INTEGRATOR_STATE(state, nested_struct, member) \
++      ccl_state_load(&kernel_integrator_state.nested_struct.member[state])
++#    define INTEGRATOR_STATE_ARRAY(state, nested_struct, array_index, member) \
++      ccl_state_load(&kernel_integrator_state.nested_struct[array_index].member[state])
++#    define INTEGRATOR_STATE_WRITE(state, nested_struct, member) \
++      kernel_integrator_state.nested_struct.member[state]
++#    define INTEGRATOR_STATE_ARRAY_WRITE(state, nested_struct, array_index, member) \
++      kernel_integrator_state.nested_struct[array_index].member[state]
+ #  else
+ #    define INTEGRATOR_STATE(state, nested_struct, member) \
+       kernel_integrator_state.nested_struct.member[state]
+@@ -276,10 +324,12 @@ using ConstIntegratorBakeState = IntegratorBakeState;
+       kernel_integrator_state.nested_struct[array_index].member[state]
+ #  endif
+ 
+-#  define INTEGRATOR_STATE_WRITE(state, nested_struct, member) \
+-    INTEGRATOR_STATE(state, nested_struct, member)
+-#  define INTEGRATOR_STATE_ARRAY_WRITE(state, nested_struct, array_index, member) \
+-    INTEGRATOR_STATE_ARRAY(state, nested_struct, array_index, member)
++#  ifndef INTEGRATOR_STATE_WRITE
++#    define INTEGRATOR_STATE_WRITE(state, nested_struct, member) \
++      INTEGRATOR_STATE(state, nested_struct, member)
++#    define INTEGRATOR_STATE_ARRAY_WRITE(state, nested_struct, array_index, member) \
++      INTEGRATOR_STATE_ARRAY(state, nested_struct, array_index, member)
++#  endif
+ 
+ #endif /* !__KERNEL_GPU__ */
+ 
+diff --git a/intern/cycles/kernel/integrator/state_util.h b/intern/cycles/kernel/integrator/state_util.h
+index d46f032..7098b67 100644
+--- a/intern/cycles/kernel/integrator/state_util.h
++++ b/intern/cycles/kernel/integrator/state_util.h
+@@ -609,11 +609,95 @@ ccl_device_inline void integrator_shadow_state_copy_only(KernelGlobals kg,
+ #  undef KERNEL_STRUCT_VOLUME_STACK_SIZE
+ }
+ 
++#  if defined(CYCLES_BOOK_SHADOW_MOVE) && defined(__KERNEL_CUDA__)
++/* Ours (CYCLES_BOOK_SHADOW_MOVE): shadow state copy without the shadow_isect array, for a state queued for
++ * intersect_shadow. That kernel writes every shadow_isect entry it later reads (the hit records; the
++ * tmax_hits search runs only once all INTEGRATOR_SHADOW_ISECT_SIZE entries are written in the same call),
++ * except the ray self object/prim kept in the last entry (integrator_state_write_shadow_ray_self), which is
++ * copied here. */
++#    define BOOK_COPY_shadow_isect 0
++#    define BOOK_COPY_shadow_volume_stack 1
++ccl_device_inline void integrator_shadow_state_copy_no_isect(KernelGlobals kg,
++                                                             ConstIntegratorShadowState to_state,
++                                                             ConstIntegratorShadowState state)
++{
++  int index;
++
++#    define KERNEL_STRUCT_BEGIN(name) \
++      index = 0; \
++      do {
++
++#    define KERNEL_STRUCT_MEMBER(parent_struct, type, name, feature) \
++      if (kernel_integrator_state.parent_struct.name != nullptr) { \
++        kernel_integrator_state.parent_struct.name[to_state] = \
++            kernel_integrator_state.parent_struct.name[state]; \
++      }
++
++#    ifdef __INTEGRATOR_GPU_PACKED_STATE__
++#      define KERNEL_STRUCT_BEGIN_PACKED(parent_struct, feature) \
++        KERNEL_STRUCT_BEGIN(parent_struct) \
++        KERNEL_STRUCT_MEMBER(parent_struct, type, packed, feature)
++#      define KERNEL_STRUCT_MEMBER_PACKED(parent_struct, type, name, feature)
++#    else
++#      define KERNEL_STRUCT_MEMBER_PACKED KERNEL_STRUCT_MEMBER
++#      define KERNEL_STRUCT_BEGIN_PACKED(parent_struct, feature) KERNEL_STRUCT_BEGIN(parent_struct)
++#    endif
++
++#    define KERNEL_STRUCT_ARRAY_MEMBER(parent_struct, type, name, feature) \
++      if (BOOK_COPY_##parent_struct && kernel_integrator_state.parent_struct[index].name != nullptr) { \
++        kernel_integrator_state.parent_struct[index].name[to_state] = \
++            kernel_integrator_state.parent_struct[index].name[state]; \
++      }
++
++#    define KERNEL_STRUCT_END(name) \
++      } \
++      while (false) \
++        ;
++
++#    define KERNEL_STRUCT_END_ARRAY(name, cpu_array_size, gpu_array_size) \
++      ++index; \
++      } \
++      while (index < gpu_array_size) \
++        ;
++
++#    define KERNEL_STRUCT_VOLUME_STACK_SIZE kernel_data.volume_stack_size
++
++#    include "kernel/integrator/shadow_state_template.h"
++
++#    undef KERNEL_STRUCT_BEGIN
++#    undef KERNEL_STRUCT_BEGIN_PACKED
++#    undef KERNEL_STRUCT_MEMBER
++#    undef KERNEL_STRUCT_MEMBER_PACKED
++#    undef KERNEL_STRUCT_ARRAY_MEMBER
++#    undef KERNEL_STRUCT_END
++#    undef KERNEL_STRUCT_END_ARRAY
++#    undef KERNEL_STRUCT_VOLUME_STACK_SIZE
++
++  INTEGRATOR_STATE_ARRAY_WRITE(to_state, shadow_isect, INTEGRATOR_SHADOW_ISECT_SIZE - 1, object) =
++      INTEGRATOR_STATE_ARRAY(state, shadow_isect, INTEGRATOR_SHADOW_ISECT_SIZE - 1, object);
++  INTEGRATOR_STATE_ARRAY_WRITE(to_state, shadow_isect, INTEGRATOR_SHADOW_ISECT_SIZE - 1, prim) =
++      INTEGRATOR_STATE_ARRAY(state, shadow_isect, INTEGRATOR_SHADOW_ISECT_SIZE - 1, prim);
++}
++#    undef BOOK_COPY_shadow_isect
++#    undef BOOK_COPY_shadow_volume_stack
++#  endif
++
+ ccl_device_inline void integrator_shadow_state_move(KernelGlobals kg,
+                                                     ConstIntegratorState to_state,
+                                                     ConstIntegratorState state)
+ {
++#  if defined(CYCLES_BOOK_SHADOW_MOVE) && defined(__KERNEL_CUDA__)
++  if (INTEGRATOR_STATE(state, shadow_path, queued_kernel) ==
++      DEVICE_KERNEL_INTEGRATOR_INTERSECT_SHADOW)
++  {
++    integrator_shadow_state_copy_no_isect(kg, to_state, state);
++  }
++  else {
++    integrator_shadow_state_copy_only(kg, to_state, state);
++  }
++#  else
+   integrator_shadow_state_copy_only(kg, to_state, state);
++#  endif
+ 
+   INTEGRATOR_STATE_WRITE(state, shadow_path, queued_kernel) = 0;
+ 
+diff --git a/intern/cycles/kernel/integrator/subsurface_walk_steps.h b/intern/cycles/kernel/integrator/subsurface_walk_steps.h
+index 0c34544..ea3042a 100644
+--- a/intern/cycles/kernel/integrator/subsurface_walk_steps.h
++++ b/intern/cycles/kernel/integrator/subsurface_walk_steps.h
+@@ -281,8 +281,29 @@ ccl_device_forceinline bool sss_walk_step(KernelGlobals kg, IntegratorState stat
+   if (reduce_max(w.throughput) < VOLUME_THROUGHPUT_EPSILON) {
+     return true;
+   }
++#  if defined(CYCLES_SSS_WALK_RR_Q)
++  /* Ours (approximate track): after CYCLES_SSS_WALK_RR_K0 steps, continue with probability q = Q/1000 and divide
++   * the throughput by q: unbiased. Walks that would reach the step cap (1.24% of monster's walks, 20.9% of its
++   * steps) contribute nothing in stock, so ending them early costs no variance. The random number is a hash of
++   * this walk's RNG state and step, outside the walk's own sample dimensions, so surviving walks draw the same
++   * numbers as stock. */
++  if (bounce + 1 >= CYCLES_SSS_WALK_RR_K0) {
++    const float q = float(CYCLES_SSS_WALK_RR_Q) * 0.001f;
++    const float u = hash_uint4_to_float(
++        w.rng_state.rng_pixel, uint(w.rng_state.sample), w.rng_state.rng_offset, uint(bounce) ^ 0x5bd1e995u);
++    if (u >= q) {
++      return true; /* w.hit is false: the walk ends without an exit, as at the cap */
++    }
++    w.throughput /= q;
++  }
++#  endif
+   w.bounce = bounce + 1;
++#  if defined(CYCLES_SSS_STEP_CAP)
++  /* Ours (approximate track): a lower step cap than BSSRDF_MAX_BOUNCES (biased: late exits are lost). */
++  return w.bounce >= min(CYCLES_SSS_STEP_CAP, BSSRDF_MAX_BOUNCES);
++#  else
+   return w.bounce >= BSSRDF_MAX_BOUNCES;
++#  endif
+ }
+ 
+ /* The function after its bounce loop; returns its result. */
+diff --git a/intern/cycles/kernel/light/distribution.h b/intern/cycles/kernel/light/distribution.h
+index 82900ab..188f2a8 100644
+--- a/intern/cycles/kernel/light/distribution.h
++++ b/intern/cycles/kernel/light/distribution.h
+@@ -22,6 +22,47 @@ ccl_device int light_distribution_sample(KernelGlobals kg, const float rand)
+   int first = 0;
+   int len = kernel_data.integrator.num_distribution + 1;
+ 
++#ifdef CYCLES_SH2_LIGHTDIST
++  /* Two steps of the same search per round: the probe of this step and both possible probes of
++   * the next step load together, so the dependent global-load chain halves. Same comparisons,
++   * same result; only indices the original search could visit are loaded. */
++  while (len > 1) {
++    const int half_len = len >> 1;
++    const int middle = first + half_len;
++    const int len_r = len - half_len - 1;
++    const float v_m = kernel_data_fetch(light_distribution, middle).totarea;
++    const float v_l = kernel_data_fetch(light_distribution, first + (half_len >> 1)).totarea;
++    const float v_r = (len_r > 0) ?
++                          kernel_data_fetch(light_distribution, middle + 1 + (len_r >> 1)).totarea :
++                          0.0f;
++    if (rand < v_m) {
++      /* Next step on [first, first + half_len); half_len >= 1 here. */
++      const int h2 = half_len >> 1;
++      if (rand < v_l) {
++        len = h2;
++      }
++      else {
++        first = first + h2 + 1;
++        len = half_len - h2 - 1;
++      }
++    }
++    else {
++      first = middle + 1;
++      len = len_r;
++      if (len > 0) {
++        const int h2 = len >> 1;
++        if (rand < v_r) {
++          len = h2;
++        }
++        else {
++          first = first + h2 + 1;
++          len = len - h2 - 1;
++        }
++      }
++    }
++  }
++  if (len > 0)
++#endif
+   do {
+     const int half_len = len >> 1;
+     const int middle = first + half_len;

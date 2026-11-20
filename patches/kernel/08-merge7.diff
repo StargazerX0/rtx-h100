@@ -1,0 +1,989 @@
+diff --git a/intern/cycles/kernel/integrator/path_state.h b/intern/cycles/kernel/integrator/path_state.h
+index 625c929..2e88d3c 100644
+--- a/intern/cycles/kernel/integrator/path_state.h
++++ b/intern/cycles/kernel/integrator/path_state.h
+@@ -154,6 +154,9 @@ ccl_device_inline void path_state_next(KernelGlobals kg,
+ 
+   visibility = PATH_RAY_VISIBILITY_NONE;
+   flag &= ~(PATH_RAY_REFLECT | PATH_RAY_SINGULAR | PATH_RAY_TRANSPARENT |
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++            PATH_RAY_APPROX_NEE_SKIP |
++#endif
+             PATH_RAY_IMPORTANCE_BAKE | PATH_RAY_MIS_SKIP | PATH_RAY_MIS_HAD_TRANSMISSION);
+ 
+ #ifdef __VOLUME__
+@@ -238,6 +241,18 @@ ccl_device_inline void path_state_next(KernelGlobals kg,
+     if (!(flag & PATH_RAY_ANY_PASS) && !(flag & PATH_RAY_TRANSPARENT_BACKGROUND)) {
+       flag |= PATH_RAY_SURFACE_PASS;
+     }
++
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++    if ((bounce - 1) >= (CYCLES_APPROX_NEE_BOUNCE) && kernel_data.integrator.use_direct_light
++#  ifdef __MNEE__
++        && !((kernel_data.kernel_features & KERNEL_FEATURE_MNEE) &&
++             (INTEGRATOR_STATE(state, path, mnee) & PATH_MNEE_SAMPLED))
++#  endif
++    )
++    {
++      flag |= PATH_RAY_APPROX_NEE_SKIP;
++    }
++#endif
+   }
+ 
+   INTEGRATOR_STATE_WRITE(state, path, visibility) = visibility;
+@@ -313,6 +328,9 @@ ccl_device_inline void path_state_next_pre(KernelGlobals kg,
+ 
+   PathRayVisibility visibility = PATH_RAY_VISIBILITY_NONE;
+   flag &= ~(PATH_RAY_REFLECT | PATH_RAY_SINGULAR | PATH_RAY_TRANSPARENT |
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++            PATH_RAY_APPROX_NEE_SKIP |
++#endif
+             PATH_RAY_IMPORTANCE_BAKE | PATH_RAY_MIS_SKIP | PATH_RAY_MIS_HAD_TRANSMISSION);
+ 
+   /* Surface reflection/transmission (callers are surface bounces: no volume scatter label). */
+@@ -372,6 +390,18 @@ ccl_device_inline void path_state_next_pre(KernelGlobals kg,
+     flag |= PATH_RAY_SURFACE_PASS;
+   }
+ 
++#  ifdef CYCLES_APPROX_NEE_BOUNCE
++  if (pre.bounce >= (CYCLES_APPROX_NEE_BOUNCE) && kernel_data.integrator.use_direct_light
++#    ifdef __MNEE__
++      && !((kernel_data.kernel_features & KERNEL_FEATURE_MNEE) &&
++           (INTEGRATOR_STATE(state, path, mnee) & PATH_MNEE_SAMPLED))
++#    endif
++  )
++  {
++    flag |= PATH_RAY_APPROX_NEE_SKIP;
++  }
++#  endif
++
+   INTEGRATOR_STATE_WRITE(state, path, visibility) = visibility;
+   INTEGRATOR_STATE_WRITE(state, path, flag) = flag;
+   INTEGRATOR_STATE_WRITE(state, path, bounce) = bounce;
+diff --git a/intern/cycles/kernel/integrator/shade_dedicated_light.h b/intern/cycles/kernel/integrator/shade_dedicated_light.h
+index bd4a3c9..b711cb3 100644
+--- a/intern/cycles/kernel/integrator/shade_dedicated_light.h
++++ b/intern/cycles/kernel/integrator/shade_dedicated_light.h
+@@ -45,8 +45,18 @@ ccl_device_inline float shadow_linking_light_sample_mis_weight(
+         kg, state, path_visibility, path_flag, object_id, light_sample_pdf);
+   }
+ 
+-  return light_sample_mis_weight_forward_lamp(
+-      kg, state, path_visibility, path_flag, object_id, light_sample_pdf, P);
++  return light_sample_mis_weight_forward_lamp(kg,
++                                              state,
++                                              path_visibility,
++                                              path_flag,
++                                              object_id,
++                                              light_sample_pdf,
++                                              P
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++                                              ,
++                                              light_id
++#endif
++  );
+ }
+ 
+ /* Setup ray for the shadow path.
+diff --git a/intern/cycles/kernel/integrator/shade_light.h b/intern/cycles/kernel/integrator/shade_light.h
+index 4d9753e..11710cd 100644
+--- a/intern/cycles/kernel/integrator/shade_light.h
++++ b/intern/cycles/kernel/integrator/shade_light.h
+@@ -64,8 +64,18 @@ ccl_device_inline ShaderEvalResult integrate_light_forward(
+   }
+ 
+   /* MIS weighting. */
+-  const float mis_weight = light_sample_mis_weight_forward_lamp(
+-      kg, state, path_visibility, path_flag, isect.object, light_eval.pdf, ray_P);
++  const float mis_weight = light_sample_mis_weight_forward_lamp(kg,
++                                                                state,
++                                                                path_visibility,
++                                                                path_flag,
++                                                                isect.object,
++                                                                light_eval.pdf,
++                                                                ray_P
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++                                                                ,
++                                                                isect.prim
++#endif
++  );
+ 
+   /* Write to render buffer. */
+   guiding_record_surface_emission(kg, state, eval, mis_weight);
+diff --git a/intern/cycles/kernel/integrator/shade_surface.h b/intern/cycles/kernel/integrator/shade_surface.h
+index b7c8a76..70fd35d 100644
+--- a/intern/cycles/kernel/integrator/shade_surface.h
++++ b/intern/cycles/kernel/integrator/shade_surface.h
+@@ -376,6 +376,86 @@ integrate_direct_light_shadow_init_common(KernelGlobals kg,
+   return shadow_state;
+ }
+ 
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++ccl_device_inline void integrate_direct_light_write_unshadowed(
++    KernelGlobals kg,
++    ConstIntegratorState state,
++    ccl_global float *ccl_restrict render_buffer,
++    const ccl_private BsdfEval *ccl_restrict bsdf_eval,
++    const int light_group)
++{
++  const int bounce = INTEGRATOR_STATE(state, path, bounce);
++  Spectrum contribution = INTEGRATOR_STATE(state, path, throughput) * bsdf_eval_sum(bsdf_eval);
++#if defined(CYCLES_RR_CLAMP_AWARE)
++  film_clamp_light(kg, &contribution, bounce, INTEGRATOR_STATE(state, path, optical_depth));
++#else
++  film_clamp_light(kg, &contribution, bounce);
++#endif
++
++  ccl_global float *buffer = film_pass_pixel_render_buffer(kg, state, render_buffer);
++  const PathRayVisibility path_visibility = INTEGRATOR_STATE(state, path, visibility);
++  uint32_t shadow_flag = INTEGRATOR_STATE(state, path, flag);
++  const int sample = INTEGRATOR_STATE(state, path, sample);
++
++  film_write_combined_pass(kg, path_visibility, shadow_flag, sample, contribution, buffer);
++
++#  ifdef __PASSES__
++  if (kernel_data.film.light_pass_flag & PASS_ANY) {
++    if (shadow_flag & PATH_RAY_SHADOW_CATCHER_HIT) {
++      return;
++    }
++    if (light_group != LIGHTGROUP_NONE && kernel_data.film.pass_lightgroup != PASS_UNUSED) {
++      film_write_pass_spectrum(buffer + kernel_data.film.pass_lightgroup + 3 * light_group,
++                               contribution);
++    }
++    if (kernel_data.kernel_features & KERNEL_FEATURE_LIGHT_PASSES) {
++      Spectrum diffuse_weight;
++      Spectrum glossy_weight;
++      if (shadow_flag & PATH_RAY_ANY_PASS) {
++        diffuse_weight = Spectrum(INTEGRATOR_STATE(state, path, pass_diffuse_weight));
++        glossy_weight = Spectrum(INTEGRATOR_STATE(state, path, pass_glossy_weight));
++      }
++      else {
++        shadow_flag |= PATH_RAY_SURFACE_PASS;
++        diffuse_weight = bsdf_eval_pass_diffuse_weight(bsdf_eval);
++        glossy_weight = bsdf_eval_pass_glossy_weight(bsdf_eval);
++      }
++
++      if (shadow_flag & PATH_RAY_SURFACE_PASS) {
++        const int glossy_pass_offset = (bounce == 0) ? kernel_data.film.pass_glossy_direct :
++                                                       kernel_data.film.pass_glossy_indirect;
++        if (glossy_pass_offset != PASS_UNUSED) {
++          film_write_pass_spectrum(buffer + glossy_pass_offset, glossy_weight * contribution);
++        }
++
++        const int transmission_pass_offset = (bounce == 0) ?
++                                                 kernel_data.film.pass_transmission_direct :
++                                                 kernel_data.film.pass_transmission_indirect;
++        if (transmission_pass_offset != PASS_UNUSED) {
++          const Spectrum transmission_weight = one_spectrum() - diffuse_weight - glossy_weight;
++          film_write_pass_spectrum(buffer + transmission_pass_offset,
++                                   transmission_weight * contribution);
++        }
++
++        const int pass_offset = (bounce == 0) ? kernel_data.film.pass_diffuse_direct :
++                                                kernel_data.film.pass_diffuse_indirect;
++        if (pass_offset != PASS_UNUSED) {
++          film_write_pass_spectrum(buffer + pass_offset, diffuse_weight * contribution);
++        }
++      }
++      else if (shadow_flag & PATH_RAY_VOLUME_PASS) {
++        const int pass_offset = (bounce == 0) ? kernel_data.film.pass_volume_direct :
++                                                kernel_data.film.pass_volume_indirect;
++        if (pass_offset != PASS_UNUSED) {
++          film_write_pass_spectrum(buffer + pass_offset, contribution);
++        }
++      }
++    }
++  }
++#  endif
++}
++#endif
++
+ /* Path tracing: sample point on light and evaluate light shader, then
+  * queue shadow ray to be traced. */
+ template<uint64_t node_feature_mask>
+@@ -392,7 +472,12 @@ ccl_device
+     ShaderEvalResult integrate_surface_direct_light(KernelGlobals kg,
+                                                     IntegratorState state,
+                                                     ccl_private ShaderData *sd,
+-                                                    const ccl_private RNGState *rng_state)
++                                                    const ccl_private RNGState *rng_state
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++                                                    ,
++                                                    ccl_global float *ccl_restrict render_buffer
++#endif
++    )
+ {
+   /* Test if there is a light or BSDF that needs direct light. */
+   if (!(kernel_data.integrator.use_direct_light && (sd->runtime_flag & SR_BSDF_HAS_EVAL))) {
+@@ -401,6 +486,9 @@ ccl_device
+ 
+   LightSample ls ccl_optional_struct_init;
+   int mnee_vertex_count = 0;  // NOLINT
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++  bool nee_skip_bounce = false;
++#endif
+ 
+ #ifdef __MNEE__
+   if ((kernel_data.kernel_features & KERNEL_FEATURE_MNEE) &&
+@@ -415,7 +503,47 @@ ccl_device
+     /* Sample position on a light. */
+     const uint32_t path_flag = INTEGRATOR_STATE(state, path, flag);
+     const uint bounce = INTEGRATOR_STATE(state, path, bounce);
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++    if (bounce >= (CYCLES_APPROX_NEE_BOUNCE)) {
++      nee_skip_bounce = true;
++      if (!kernel_data.integrator.use_light_tree) {
++        const int num_lights = kernel_data.integrator.num_lights;
++        bool has_keep_nee = false;
++        for (int i = 0; i < num_lights; i++) {
++          const ccl_global KernelLight *klight = &kernel_data_fetch(lights, i);
++          if (!(klight->shader_id & SHADER_USE_MIS) ||
++              (klight->type == LIGHT_SUN && (int)bounce <= klight->max_bounces))
++          {
++            has_keep_nee = true;
++            break;
++          }
++        }
++        if (!has_keep_nee) {
++          return SHADER_EVAL_EMPTY;
++        }
++      }
++    }
++#endif
+     const float3 rand_light = path_state_rng_3D(kg, rng_state, PRNG_LIGHT);
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++    if (nee_skip_bounce && !kernel_data.integrator.use_light_tree) {
++      const float lamp_start = (kernel_data.integrator.distribution_pdf_triangles > 0.0f) ? 0.5f :
++                                                                                            0.0f;
++      if (rand_light.z < lamp_start) {
++        return SHADER_EVAL_EMPTY;
++      }
++      const int num_lights = kernel_data.integrator.num_lights;
++      const float pdf_lights = kernel_data.integrator.distribution_pdf_lights;
++      const int lamp = clamp(
++          float_to_int((rand_light.z - lamp_start) / pdf_lights), 0, num_lights - 1);
++      const ccl_global KernelLight *klight = &kernel_data_fetch(lights, lamp);
++      if ((klight->shader_id & SHADER_USE_MIS) &&
++          !(klight->type == LIGHT_SUN && (int)bounce <= klight->max_bounces))
++      {
++        return SHADER_EVAL_EMPTY;
++      }
++    }
++#endif
+ 
+     if (!light_sample_from_position(kg,
+                                     rand_light,
+@@ -430,6 +558,11 @@ ccl_device
+     {
+       return SHADER_EVAL_EMPTY;
+     }
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++    if (nee_skip_bounce && (ls.shader & SHADER_USE_MIS) && ls.type != LIGHT_SUN) {
++      return SHADER_EVAL_EMPTY;
++    }
++#endif
+   }
+ 
+   kernel_assert(ls.pdf != 0.0f);
+@@ -501,6 +634,15 @@ ccl_device
+     }
+ 
+     /* Create shadow ray. */
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++    if (nee_skip_bounce && (ls.shader & SHADER_CAST_SHADOW) == 0 && is_constant_light_shader &&
++        !(kernel_data.kernel_features &
++          (KERNEL_FEATURE_VOLUME | KERNEL_FEATURE_SHADOW_CATCHER | KERNEL_FEATURE_PATH_GUIDING)))
++    {
++      integrate_direct_light_write_unshadowed(kg, state, render_buffer, &bsdf_eval, ls.group);
++      return SHADER_EVAL_OK;
++    }
++#endif
+     light_sample_to_surface_shadow_ray(kg, sd, &ls, &ray);
+ 
+ #ifdef __RAY_DIFFERENTIALS__
+@@ -1019,7 +1161,15 @@ ccl_device int integrate_surface(KernelGlobals kg,
+     /* Direct light. */
+     PROFILING_EVENT(PROFILING_SHADE_SURFACE_DIRECT_LIGHT);
+     const ShaderEvalResult result = integrate_surface_direct_light<node_feature_mask>(
+-        kg, state, &sd, &rng_state);
++        kg,
++        state,
++        &sd,
++        &rng_state
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++        ,
++        render_buffer
++#endif
++    );
+     if (result == SHADER_EVAL_CACHE_MISS) {
+       return LABEL_CACHE_MISS;
+     }
+diff --git a/intern/cycles/kernel/integrator/subsurface_walk_steps.h b/intern/cycles/kernel/integrator/subsurface_walk_steps.h
+index ea3042a..3743ac4 100644
+--- a/intern/cycles/kernel/integrator/subsurface_walk_steps.h
++++ b/intern/cycles/kernel/integrator/subsurface_walk_steps.h
+@@ -287,6 +287,21 @@ ccl_device_forceinline bool sss_walk_step(KernelGlobals kg, IntegratorState stat
+    * steps) contribute nothing in stock, so ending them early costs no variance. The random number is a hash of
+    * this walk's RNG state and step, outside the walk's own sample dimensions, so surviving walks draw the same
+    * numbers as stock. */
++#    if defined(CYCLES_SSS_WALK_RR_QI)
++  /* Ours: a stronger walk RR (QI/1000 after K0I steps) for walks that start at an indirect path vertex (path bounce
++   * >= 1), whose noise reaches the image only through indirect light; camera-visible walks keep Q / K0. Unbiased. */
++  const bool sss_indirect = INTEGRATOR_STATE(state, path, bounce) > 0;
++  const int sss_k0 = sss_indirect ? CYCLES_SSS_WALK_RR_K0I : CYCLES_SSS_WALK_RR_K0;
++  if (bounce + 1 >= sss_k0) {
++    const float q = float(sss_indirect ? CYCLES_SSS_WALK_RR_QI : CYCLES_SSS_WALK_RR_Q) * 0.001f;
++    const float u = hash_uint4_to_float(
++        w.rng_state.rng_pixel, uint(w.rng_state.sample), w.rng_state.rng_offset, uint(bounce) ^ 0x5bd1e995u);
++    if (u >= q) {
++      return true; /* w.hit is false: the walk ends without an exit, as at the cap */
++    }
++    w.throughput /= q;
++  }
++#    else
+   if (bounce + 1 >= CYCLES_SSS_WALK_RR_K0) {
+     const float q = float(CYCLES_SSS_WALK_RR_Q) * 0.001f;
+     const float u = hash_uint4_to_float(
+@@ -296,6 +311,7 @@ ccl_device_forceinline bool sss_walk_step(KernelGlobals kg, IntegratorState stat
+     }
+     w.throughput /= q;
+   }
++#    endif
+ #  endif
+   w.bounce = bounce + 1;
+ #  if defined(CYCLES_SSS_STEP_CAP)
+diff --git a/intern/cycles/kernel/light/sample.h b/intern/cycles/kernel/light/sample.h
+index 2ff81df..a581b51 100644
+--- a/intern/cycles/kernel/light/sample.h
++++ b/intern/cycles/kernel/light/sample.h
+@@ -474,6 +474,9 @@ ccl_device_inline float light_sample_mis_weight_forward_surface(
+     const ccl_private ShaderData *sd)
+ {
+   bool has_mis = !(path_flag & PATH_RAY_MIS_SKIP) &&
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++                 !(path_flag & PATH_RAY_APPROX_NEE_SKIP) &&
++#endif
+                  (sd->shader_flag &
+                   ((sd->runtime_flag & SR_BACKFACING) ? SD_MIS_BACK : SD_MIS_FRONT));
+ 
+@@ -527,11 +530,24 @@ ccl_device_inline float light_sample_mis_weight_forward_lamp(
+     const uint32_t path_flag,
+     const int object_id,
+     const float light_sample_pdf,
+-    const float3 P)
++    const float3 P
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++    ,
++    const int lamp = -1
++#endif
++)
+ {
+   if (path_flag & PATH_RAY_MIS_SKIP) {
+     return 1.0f;
+   }
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++  if ((path_flag & PATH_RAY_APPROX_NEE_SKIP) &&
++      (lamp < 0 ||
++       !light_select_reached_max_bounces(kg, lamp, INTEGRATOR_STATE(state, path, bounce) - 1)))
++  {
++    return 1.0f;
++  }
++#endif
+ 
+   const float mis_ray_pdf = INTEGRATOR_STATE(state, path, mis_ray_pdf);
+   float pdf = light_sample_pdf;
+@@ -568,9 +584,20 @@ ccl_device_inline float light_sample_mis_weight_forward_distant(
+     const int object_id,
+     const float light_sample_pdf)
+ {
++  /* Distant (sun) lights keep NEE up to max_bounces so shadow-invisible window portals stay
++   * unbiased; clear PATH_RAY_APPROX_NEE_SKIP so forward sun hits keep their stock MIS weight. */
+   const float3 ray_P = INTEGRATOR_STATE(state, ray, P);
+-  return light_sample_mis_weight_forward_lamp(
+-      kg, state, path_visibility, path_flag, object_id, light_sample_pdf, ray_P);
++  return light_sample_mis_weight_forward_lamp(kg,
++                                              state,
++                                              path_visibility,
++                                              path_flag
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++                                                  & ~uint32_t(PATH_RAY_APPROX_NEE_SKIP)
++#endif
++                                              ,
++                                              object_id,
++                                              light_sample_pdf,
++                                              ray_P);
+ }
+ 
+ ccl_device_inline float light_sample_mis_weight_forward_background(
+@@ -583,6 +610,22 @@ ccl_device_inline float light_sample_mis_weight_forward_background(
+   if (!kernel_data.background.use_mis || (path_flag & PATH_RAY_MIS_SKIP)) {
+     return 1.0f;
+   }
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++  if (path_flag & PATH_RAY_APPROX_NEE_SKIP) {
++    const int prev_bounce = INTEGRATOR_STATE(state, path, bounce) - 1;
++    bool bg_reached_max = false;
++    for (int lamp = 0; lamp < kernel_data.integrator.num_lights; lamp++) {
++      const ccl_global KernelLight *klight = &kernel_data_fetch(lights, lamp);
++      if (klight->type == LIGHT_BACKGROUND) {
++        bg_reached_max = (prev_bounce > klight->max_bounces);
++        break;
++      }
++    }
++    if (!bg_reached_max) {
++      return 1.0f;
++    }
++  }
++#endif
+ 
+   const float3 ray_P = INTEGRATOR_STATE(state, ray, P);
+   const float3 ray_D = INTEGRATOR_STATE(state, ray, D);
+diff --git a/intern/cycles/kernel/svm/svm.h b/intern/cycles/kernel/svm/svm.h
+index 9a0144a..06d5e10 100644
+--- a/intern/cycles/kernel/svm/svm.h
++++ b/intern/cycles/kernel/svm/svm.h
+@@ -108,6 +108,14 @@ CCL_NAMESPACE_BEGIN
+ #  define SVM_CASE(node) case node:
+ #endif
+ 
++CCL_NAMESPACE_END
++
++#if defined(CYCLES_TEX_BATCH) || defined(CYCLES_TEX_BATCH_STATS)
++#  include "kernel/svm/tex_batch.h"
++#endif
++
++CCL_NAMESPACE_BEGIN
++
+ /* Main Interpreter Loop */
+ template<uint64_t node_feature_mask, ShaderType type, typename ConstIntegratorGenericState>
+ ccl_device void svm_eval_nodes(KernelGlobals kg,
+@@ -126,6 +134,9 @@ ccl_device void svm_eval_nodes(KernelGlobals kg,
+ #endif
+   /* Initialize to silence (false positive?) warning about uninitialized use on Windows. */
+   Spectrum closure_weight = zero_spectrum();
++#ifdef CYCLES_TEX_BATCH_STATS
++  SVMEvalTimer svm_eval_timer;
++#endif
+   int offset = (sd->shader & SHADER_MASK) * (1 + sizeof(SVMNodeShaderJump) / sizeof(uint));
+ 
+ #if defined(CYCLES_APPROX_BUMP_INDIRECT) || defined(CYCLES_APPROX_TEX_INDIRECT)
+@@ -349,8 +360,16 @@ ccl_device void svm_eval_nodes(KernelGlobals kg,
+           kg, sd, stack, svm_node_get<SVMNodeVectorDisplacement>(kg, &offset));
+       break;
+       SVM_CASE(NODE_TEX_IMAGE)
++#ifdef CYCLES_TEX_BATCH
++      {
++        const ccl_global auto &node = svm_node_get<SVMNodeTexImage>(kg, &offset);
++        offset = svm_node_tex_image_batch(kg, sd, stack, node, offset);
++      }
++      break;
++#else
+       svm_node_tex_image<float3>(kg, sd, stack, svm_node_get<SVMNodeTexImage>(kg, &offset));
+       break;
++#endif
+       SVM_CASE(NODE_TEX_IMAGE_DERIVATIVE)
+       {
+         const ccl_global auto &node = svm_node_get<SVMNodeTexImage>(kg, &offset);
+diff --git a/intern/cycles/kernel/svm/tex_batch.h b/intern/cycles/kernel/svm/tex_batch.h
+new file mode 100644
+index 0000000..7d72abb
+--- /dev/null
++++ b/intern/cycles/kernel/svm/tex_batch.h
+@@ -0,0 +1,480 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++
++#pragma once
++
++/* Ours (CYCLES_TEX_BATCH): register-only memory-level-parallelism batching for NODE_TEX_IMAGE.
++ *
++ * On reaching a NODE_TEX_IMAGE, svm_node_tex_image_batch consumes a contiguous straight-line run
++ * of up to CYCLES_TEX_BATCH_MAX (4) independent NODE_TEX_IMAGE nodes and any interleaved
++ * NODE_CONVERT nodes (e.g. PBR BaseColor + Metallic->CF + Roughness->CF + Normal, 88.2% of
++ * junkshop's image nodes). It stops at the first non-(TEX_IMAGE|CONVERT) opcode or dependent
++ * coordinate, touches zero extra SVM stack slots (preserving L1 cache working set), issues all
++ * KernelImageTexture loads together, all KernelImageInfo loads together, and all 2-4 tex2D lookups
++ * into disjoint register quads before any alpha/sRGB post-processing reads a result, fuses
++ * interleaved NODE_CONVERT_CF/VF/FI/FV reads directly from registers, and skips dead stack stores
++ * immediately overwritten by the next batched NODE_TEX_IMAGE. */
++
++#include "kernel/svm/convert.h"
++#include "kernel/svm/image.h"
++#include "kernel/svm/node_types.h"
++#include "kernel/svm/util.h"
++#include "util/types_image.h"
++
++CCL_NAMESPACE_BEGIN
++
++#ifdef CYCLES_TEX_BATCH_STATS
++/* [0..3]: batches of size 1..4; [4]: total NODE_TEX_IMAGE nodes; [5]: fused NODE_CONVERTs;
++ * [6]: dead stack[out] stores skipped; [7]: slow-fallback batches; [8]: warp evals; [9]: warp cycles. */
++extern "C" __device__ unsigned long long texb_counts[10];
++__device__ unsigned long long texb_counts[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
++
++struct SVMEvalTimer {
++  uint64_t t0;
++  bool lead;
++  ccl_device_forceinline SVMEvalTimer()
++  {
++    const uint m = __activemask();
++    lead = ((threadIdx.x & 31u) == uint(__ffs(m) - 1));
++    t0 = lead ? clock64() : 0ull;
++  }
++  ccl_device_forceinline ~SVMEvalTimer()
++  {
++    if (lead) {
++      const uint64_t dt = clock64() - t0;
++      atomicAdd(&texb_counts[9], (unsigned long long)dt);
++      const unsigned long long n = atomicAdd(&texb_counts[8], 1ull) + 1ull;
++      if ((n & 0xFFFFull) == 0ull) {
++        printf("TEXB_PROF warps=%llu cyc_per_warp=%.1f b1=%llu b2=%llu b3=%llu b4=%llu imgs=%llu conv=%llu skip=%llu slow=%llu\n",
++               n,
++               double(texb_counts[9]) / double(n),
++               texb_counts[0],
++               texb_counts[1],
++               texb_counts[2],
++               texb_counts[3],
++               texb_counts[4],
++               texb_counts[5],
++               texb_counts[6],
++               texb_counts[7]);
++      }
++    }
++  }
++};
++#endif
++
++#ifdef CYCLES_TEX_BATCH
++
++#  ifndef CYCLES_TEX_BATCH_MAX
++#    define CYCLES_TEX_BATCH_MAX 4
++#  endif
++static_assert(CYCLES_TEX_BATCH_MAX == 4);
++static_assert(alignof(KernelImageTexture) >= alignof(uint2) &&
++              sizeof(KernelImageTexture) % sizeof(uint2) == 0);
++static_assert(alignof(KernelImageInfo) >= alignof(uint2) &&
++              sizeof(KernelImageInfo) % sizeof(uint2) == 0);
++
++ccl_device_forceinline bool texb_dirty_check(const uint64_t dirty,
++                                             const uint offset,
++                                             const uint width)
++{
++  if (offset + width > 64u) {
++    return true;
++  }
++  const uint64_t mask = (1ull << width) - 1ull;
++  return (dirty & (mask << offset)) != 0ull;
++}
++
++ccl_device_forceinline bool texb_dirty_mark(ccl_private uint64_t &dirty,
++                                            const uint offset,
++                                            const uint width)
++{
++  if (!stack_valid(offset)) {
++    return true;
++  }
++  if (offset + width > 64u) {
++    return false;
++  }
++  const uint64_t mask = (1ull << width) - 1ull;
++  dirty |= (mask << offset);
++  return true;
++}
++
++ccl_device_forceinline bool texb_in_f_dirty(const uint64_t dirty, const SVMInputFloat v)
++{
++  if ((v.bits >> 8) == (SVM_INPUT_STACK_OFFSET_MASK >> 8)) {
++    return texb_dirty_check(dirty, v.bits & 0xFFu, 1u);
++  }
++  return false;
++}
++
++ccl_device_forceinline bool texb_in_f3_dirty(const uint64_t dirty, const SVMInputFloat3 v)
++{
++  if ((v.x.bits >> 8) == (SVM_INPUT_STACK_OFFSET_MASK >> 8)) {
++    return texb_dirty_check(dirty, v.x.bits & 0xFFu, 3u);
++  }
++  return false;
++}
++
++enum TexBatchMode : uint {
++  TEXB_MODE_SKIP = 0,
++  TEXB_MODE_4CH = 1,
++  TEXB_MODE_1CH = 2,
++  TEXB_MODE_FALLBACK = 3,
++};
++
++ccl_device_forceinline void svm_tex_batch_decode_node(KernelGlobals kg,
++                                                      const ccl_private float *ccl_restrict stack,
++                                                      const int node_pc,
++                                                      const uint co0_tag,
++                                                      const float2 uv0,
++                                                      ccl_private int &id_out,
++                                                      ccl_private uint &meta_out,
++                                                      ccl_private float2 &uv_out)
++{
++  const uint w0 = kernel_data_fetch(svm_nodes, node_pc + 0);
++  const uint proj = kernel_data_fetch(svm_nodes, node_pc + 1);
++  const uint meta = kernel_data_fetch(svm_nodes, node_pc + 6);
++  id_out = int(w0);
++  meta_out = meta;
++  const uint co = (meta >> 8) & 0xFFu;
++  if (proj == NODE_IMAGE_PROJ_FLAT) {
++    if (co == co0_tag) {
++      uv_out = uv0;
++    }
++    else {
++      uv_out = make_float2(stack[co], stack[co + 1]);
++    }
++  }
++  else {
++    uv_out = svm_node_tex_image_mapping(stack_load_float3(stack, co), proj);
++  }
++}
++
++ccl_device_forceinline uint svm_tex_batch_nibble(const bool active,
++                                                 const int id,
++                                                 const uint meta,
++                                                 const uint2 tpair,
++                                                 const uint2 dt_interp)
++{
++  if (!active) {
++    return TEXB_MODE_SKIP;
++  }
++  if (id < 0 || id == KERNEL_IMAGE_NONE || tpair.y != KERNEL_TILE_LOAD_NONE ||
++      tpair.x == uint(KERNEL_IMAGE_NONE))
++  {
++    return TEXB_MODE_FALLBACK;
++  }
++  const uint dt = dt_interp.x;
++  const uint interp = dt_interp.y;
++  if (interp == INTERPOLATION_CUBIC || interp == INTERPOLATION_SMART) {
++    return TEXB_MODE_FALLBACK;
++  }
++  const bool is_4ch = (dt == IMAGE_DATA_TYPE_FLOAT4 || dt == IMAGE_DATA_TYPE_BYTE4 ||
++                       dt == IMAGE_DATA_TYPE_HALF4 || dt == IMAGE_DATA_TYPE_USHORT4);
++  return (is_4ch ? TEXB_MODE_4CH : TEXB_MODE_1CH) | ((meta & 0x3u) << 2);
++}
++
++ccl_device_forceinline float4 svm_tex_batch_postprocess(const uint nib, float4 r)
++{
++  if ((nib & 0x3u) == TEXB_MODE_1CH) {
++    r = make_float4(r.x, r.x, r.x, 1.0f);
++  }
++  const uint flags = (nib >> 2) & 0x3u;
++  const float alpha = r.w;
++  if ((flags & NODE_IMAGE_ALPHA_UNASSOCIATE) && alpha != 1.0f && alpha != 0.0f) {
++    r /= alpha;
++    r.w = alpha;
++  }
++  if (flags & NODE_IMAGE_COMPRESS_AS_SRGB) {
++    r = color_srgb_to_linear_v4(r);
++  }
++  return r;
++}
++
++/* Commit one batched NODE_TEX_IMAGE result and any NODE_CONVERT immediately following it before
++ * the next NODE_TEX_IMAGE (advancing replay_off from after this TEX_IMAGE to the next TEX_IMAGE or
++ * end_offset). If this TEX_IMAGE's out_offset is overwritten by next_out_offset and any intervening
++ * NODE_CONVERT only reads out_offset, the dead 3-float stack store/reload is bypassed in registers. */
++ccl_device_forceinline void svm_tex_batch_commit_slot(KernelGlobals kg,
++                                                      ccl_private float *ccl_restrict stack,
++                                                      const uint meta,
++                                                      const float4 f,
++                                                      ccl_private int &replay_off,
++                                                      const int stop_off,
++                                                      const uint next_out_offset)
++{
++  const uint out_offset = (meta >> 16) & 0xFFu;
++  const uint alpha_offset = (meta >> 24) & 0xFFu;
++
++  /* Fast register bypass for the ubiquitous PBR pattern:
++   *   TEX_IMAGE(out = X) -> NODE_CONVERT_CF(from = X, to = Y) -> TEX_IMAGE(out = X) */
++  if (stack_valid(out_offset) && replay_off < stop_off) {
++    int peek = replay_off;
++    const uint nt = kernel_data_fetch(svm_nodes, peek++);
++    if (nt == NODE_CONVERT) {
++      const ccl_global SVMNodeConvert &cn = svm_node_get<SVMNodeConvert>(kg, &peek);
++      if (peek == stop_off && cn.convert_type == NODE_CONVERT_CF && cn.from_offset == out_offset) {
++        if (stack_valid(alpha_offset)) {
++          stack_store_float(stack, alpha_offset, f.w);
++        }
++        const float gray = linear_rgb_to_gray(kg, make_float3(f));
++        if (next_out_offset != out_offset || (cn.to_offset >= out_offset && cn.to_offset <= out_offset + 2u)) {
++          stack_store_float3(stack, out_offset, make_float3(f));
++        }
++#  ifdef CYCLES_TEX_BATCH_STATS
++        else {
++          atomicAdd(&texb_counts[6], 1ull);
++        }
++        atomicAdd(&texb_counts[5], 1ull);
++#  endif
++        stack_store_float(stack, cn.to_offset, gray);
++        replay_off = peek;
++        return;
++      }
++    }
++  }
++
++  if (stack_valid(out_offset) && (replay_off < stop_off || next_out_offset != out_offset)) {
++    stack_store_float3(stack, out_offset, make_float3(f));
++  }
++  if (stack_valid(alpha_offset)) {
++    stack_store_float(stack, alpha_offset, f.w);
++  }
++  while (replay_off < stop_off) {
++    const uint nt = kernel_data_fetch(svm_nodes, replay_off++);
++    if (nt == NODE_CONVERT) {
++      svm_node_convert<float, float3>(kg, stack, svm_node_get<SVMNodeConvert>(kg, &replay_off));
++    }
++  }
++}
++
++/* Cold fallback for UDIM, tiled texture-cache, bicubic/smart, or missing-image slots: return
++ * start_offset after evaluating only node0, so remaining nodes run naturally in svm_eval_nodes. */
++ccl_device_noinline int svm_tex_batch_eval_one_slow(
++    KernelGlobals kg,
++    ccl_private ShaderData *sd,
++    ccl_private float *ccl_restrict stack,
++    const int pc0,
++    const int next_offset)
++{
++#  ifdef CYCLES_TEX_BATCH_STATS
++  atomicAdd(&texb_counts[7], 1ull);
++#  endif
++  int off = pc0;
++  const ccl_global SVMNodeTexImage &node = svm_node_get<SVMNodeTexImage>(kg, &off);
++  const float3 missing = stack_load(stack, node.missing);
++  const float missing_alpha = stack_load(stack, node.missing_alpha);
++  const float3 co = stack_load<float3>(stack, node.co);
++  const dual2 tex_co(svm_node_tex_image_mapping(co, node.projection));
++  const float4 f = svm_image_texture(
++      kg, sd, node.id, tex_co, node.flags, make_float4(missing, missing_alpha));
++  if (stack_valid(node.out_offset)) {
++    stack_store_float3(stack, node.out_offset, make_float3(f));
++  }
++  if (stack_valid(node.alpha_offset)) {
++    stack_store_float(stack, node.alpha_offset, f.w);
++  }
++  return next_offset;
++}
++
++ccl_device_noinline int svm_node_tex_image_batch(
++    KernelGlobals kg,
++    ccl_private ShaderData *sd,
++    ccl_private float *ccl_restrict stack,
++    const ccl_global SVMNodeTexImage &ccl_restrict node0,
++    const int next_offset)
++{
++  const int pc0 = next_offset - int(sizeof(SVMNodeTexImage) / sizeof(uint));
++  uint64_t dirty = 0ull;
++  uint count = 1u;
++  int pc1 = 0, pc2 = 0, pc3 = 0;
++  int end_offset = next_offset;
++
++  if (!texb_dirty_check(dirty, node0.co, 3u) && !texb_in_f3_dirty(dirty, node0.missing) &&
++      !texb_in_f_dirty(dirty, node0.missing_alpha) &&
++      texb_dirty_mark(dirty, node0.out_offset, 3u) &&
++      texb_dirty_mark(dirty, node0.alpha_offset, 1u))
++  {
++    int scan = next_offset;
++    while (true) {
++      const int before_nt = scan;
++      const uint nt = kernel_data_fetch(svm_nodes, scan++);
++      if (nt == NODE_TEX_IMAGE) {
++        if (count >= uint(CYCLES_TEX_BATCH_MAX)) {
++          end_offset = before_nt;
++          break;
++        }
++        const int cur_pc = scan;
++        const ccl_global SVMNodeTexImage &tn = svm_node_get<SVMNodeTexImage>(kg, &scan);
++        if (texb_dirty_check(dirty, tn.co, 3u) || texb_in_f3_dirty(dirty, tn.missing) ||
++            texb_in_f_dirty(dirty, tn.missing_alpha) ||
++            !texb_dirty_mark(dirty, tn.out_offset, 3u) ||
++            !texb_dirty_mark(dirty, tn.alpha_offset, 1u))
++        {
++          end_offset = before_nt;
++          break;
++        }
++        if (count == 1u) {
++          pc1 = cur_pc;
++        }
++        else if (count == 2u) {
++          pc2 = cur_pc;
++        }
++        else {
++          pc3 = cur_pc;
++        }
++        ++count;
++        end_offset = scan;
++      }
++      else if (nt == NODE_CONVERT) {
++        const ccl_global SVMNodeConvert &cn = svm_node_get<SVMNodeConvert>(kg, &scan);
++        const uint w = (cn.convert_type == NODE_CONVERT_FV || cn.convert_type == NODE_CONVERT_IV) ?
++                           3u :
++                           1u;
++        if (!texb_dirty_mark(dirty, cn.to_offset, w)) {
++          end_offset = before_nt;
++          break;
++        }
++        end_offset = scan;
++      }
++      else {
++        end_offset = before_nt;
++        break;
++      }
++    }
++  }
++
++#  ifdef CYCLES_TEX_BATCH_STATS
++  atomicAdd(&texb_counts[count - 1u], 1ull);
++  atomicAdd(&texb_counts[4], (unsigned long long)count);
++#  endif
++
++  if (count == 1u) {
++    const float3 missing = stack_load(stack, node0.missing);
++    const float missing_alpha = stack_load(stack, node0.missing_alpha);
++    const float3 co = stack_load<float3>(stack, node0.co);
++    const dual2 tex_co(svm_node_tex_image_mapping(co, node0.projection));
++    const float4 f = svm_image_texture(
++        kg, sd, node0.id, tex_co, node0.flags, make_float4(missing, missing_alpha));
++    if (stack_valid(node0.out_offset)) {
++      stack_store_float3(stack, node0.out_offset, make_float3(f));
++    }
++    if (stack_valid(node0.alpha_offset)) {
++      stack_store_float(stack, node0.alpha_offset, f.w);
++    }
++    return next_offset;
++  }
++
++  /* Stage A: decode 2-4 NODE_TEX_IMAGE headers and UVs (sharing stack[co0..+1] across PBR maps). */
++  int id0 = node0.id, id1 = KERNEL_IMAGE_NONE, id2 = KERNEL_IMAGE_NONE, id3 = KERNEL_IMAGE_NONE;
++  const uint proj0 = node0.projection;
++  const uint meta0 = kernel_data_fetch(svm_nodes, pc0 + 6);
++  uint meta1 = 0xFF000000u, meta2 = 0xFF000000u, meta3 = 0xFF000000u;
++  const uint co0 = (meta0 >> 8) & 0xFFu;
++  const float2 uv0 = (proj0 == NODE_IMAGE_PROJ_FLAT) ?
++                         make_float2(stack[co0], stack[co0 + 1]) :
++                         svm_node_tex_image_mapping(stack_load_float3(stack, co0), proj0);
++  const uint co0_tag = (proj0 == NODE_IMAGE_PROJ_FLAT) ? co0 : 0xFFFFu;
++  float2 uv1 = uv0, uv2 = uv0, uv3 = uv0;
++
++  svm_tex_batch_decode_node(kg, stack, pc1, co0_tag, uv0, id1, meta1, uv1);
++  if (count > 2u) {
++    svm_tex_batch_decode_node(kg, stack, pc2, co0_tag, uv0, id2, meta2, uv2);
++  }
++  if (count > 3u) {
++    svm_tex_batch_decode_node(kg, stack, pc3, co0_tag, uv0, id3, meta3, uv3);
++  }
++
++  /* Stage B: issue all KernelImageTexture header loads together. */
++#  define TEXB_LOAD_TEX(k, active_cond) \
++    uint2 tpair##k = make_uint2(KERNEL_IMAGE_NONE, KERNEL_TILE_LOAD_NONE); \
++    if ((active_cond) && id##k >= 0 && id##k != KERNEL_IMAGE_NONE) { \
++      tpair##k = *reinterpret_cast<const ccl_global uint2 *>( \
++          &kernel_data_fetch(image_textures, id##k)); \
++    }
++  TEXB_LOAD_TEX(0, true);
++  TEXB_LOAD_TEX(1, true);
++  TEXB_LOAD_TEX(2, count > 2u);
++  TEXB_LOAD_TEX(3, count > 3u);
++#  undef TEXB_LOAD_TEX
++
++  /* Stage C: issue all KernelImageInfo header loads together. */
++#  define TEXB_LOAD_INFO(k, active_cond) \
++    ccl_gpu_image_object_2D texobj##k = 0; \
++    uint2 dti##k = make_uint2(IMAGE_DATA_NUM_TYPES, INTERPOLATION_NONE); \
++    if ((active_cond) && id##k >= 0 && tpair##k.y == KERNEL_TILE_LOAD_NONE && \
++        tpair##k.x != uint(KERNEL_IMAGE_NONE)) \
++    { \
++      const ccl_global KernelImageInfo &inf = kernel_data_fetch(image_info, tpair##k.x); \
++      texobj##k = (ccl_gpu_image_object_2D)inf.data; \
++      dti##k = *reinterpret_cast<const ccl_global uint2 *>(&inf.data_type); \
++    } \
++    const uint nib##k = svm_tex_batch_nibble((active_cond), id##k, meta##k, tpair##k, dti##k);
++  TEXB_LOAD_INFO(0, true);
++  TEXB_LOAD_INFO(1, true);
++  TEXB_LOAD_INFO(2, count > 2u);
++  TEXB_LOAD_INFO(3, count > 3u);
++#  undef TEXB_LOAD_INFO
++
++  if (__builtin_expect(((nib0 & 3u) == TEXB_MODE_FALLBACK) ||
++                           ((nib1 & 3u) == TEXB_MODE_FALLBACK) ||
++                           ((nib2 & 3u) == TEXB_MODE_FALLBACK) ||
++                           ((nib3 & 3u) == TEXB_MODE_FALLBACK),
++                       0))
++  {
++    return svm_tex_batch_eval_one_slow(kg, sd, stack, pc0, next_offset);
++  }
++  const uint batch_ctl = nib0 | (nib1 << 4) | (nib2 << 8) | (nib3 << 12);
++
++  /* Stage D: issue all 2-4 hardware texture fetches into 4 disjoint register quads before
++   * touching any texture output register. */
++  float4 r0 = zero_float4(), r1 = zero_float4(), r2 = zero_float4(), r3 = zero_float4();
++#  define TEXB_ISSUE_TEX(k) \
++    if (((batch_ctl >> (4u * (k))) & 3u) == TEXB_MODE_4CH) { \
++      r##k = ccl_gpu_image_object_read_2D<float4>(texobj##k, uv##k.x, uv##k.y); \
++    } \
++    else if (((batch_ctl >> (4u * (k))) & 3u) == TEXB_MODE_1CH) { \
++      r##k.x = ccl_gpu_image_object_read_2D<float>(texobj##k, uv##k.x, uv##k.y); \
++    }
++  TEXB_ISSUE_TEX(0);
++  TEXB_ISSUE_TEX(1);
++  TEXB_ISSUE_TEX(2);
++  TEXB_ISSUE_TEX(3);
++#  undef TEXB_ISSUE_TEX
++
++  /* Stage E: post-process and commit directly to shader stack (fusing NODE_CONVERT in registers). */
++  r0 = svm_tex_batch_postprocess((batch_ctl >> 0u) & 0xFu, r0);
++  r1 = svm_tex_batch_postprocess((batch_ctl >> 4u) & 0xFu, r1);
++  if (count > 2u) {
++    r2 = svm_tex_batch_postprocess((batch_ctl >> 8u) & 0xFu, r2);
++  }
++  if (count > 3u) {
++    r3 = svm_tex_batch_postprocess((batch_ctl >> 12u) & 0xFu, r3);
++  }
++
++  constexpr int tex_words = int(sizeof(SVMNodeTexImage) / sizeof(uint));
++  int rep0 = next_offset;
++  const int stop0 = pc1 - 1;
++  svm_tex_batch_commit_slot(kg, stack, meta0, r0, rep0, stop0, (meta1 >> 16) & 0xFFu);
++
++  int rep1 = pc1 + tex_words;
++  const int stop1 = (count > 2u) ? (pc2 - 1) : end_offset;
++  const uint next_out1 = (count > 2u) ? ((meta2 >> 16) & 0xFFu) : uint(SVM_STACK_INVALID);
++  svm_tex_batch_commit_slot(kg, stack, meta1, r1, rep1, stop1, next_out1);
++
++  if (count > 2u) {
++    int rep2 = pc2 + tex_words;
++    const int stop2 = (count > 3u) ? (pc3 - 1) : end_offset;
++    const uint next_out2 = (count > 3u) ? ((meta3 >> 16) & 0xFFu) : uint(SVM_STACK_INVALID);
++    svm_tex_batch_commit_slot(kg, stack, meta2, r2, rep2, stop2, next_out2);
++  }
++  if (count > 3u) {
++    int rep3 = pc3 + tex_words;
++    svm_tex_batch_commit_slot(kg, stack, meta3, r3, rep3, end_offset, uint(SVM_STACK_INVALID));
++  }
++
++  return end_offset;
++}
++
++#endif /* CYCLES_TEX_BATCH */
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/kernel/types.h b/intern/cycles/kernel/types.h
+index f4e9571..4f609a3 100644
+--- a/intern/cycles/kernel/types.h
++++ b/intern/cycles/kernel/types.h
+@@ -301,6 +301,12 @@ enum PathRayFlag : uint32_t {
+ 
+   /* Path has associated wavelength. */
+   PATH_RAY_SPECTRAL = (1U << 27U),
++
++#ifdef CYCLES_APPROX_NEE_BOUNCE
++  /* NEE was skipped for MIS-enabled emitters at the previous surface bounce; give forward
++   * BSDF-sampled light hits full weight (MIS weight 1). */
++  PATH_RAY_APPROX_NEE_SKIP = (1U << 30U),
++#endif
+ };
+ 
+ // 8bit enum, just in case we need to move more variables in it

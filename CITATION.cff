@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this recipe, please cite it as below."
+title: "RTX H100: Blender Cycles on One H100"
+type: software
+authors:
+  - family-names: Chai
+    given-names: Wenhao
+  - family-names: Chen
+    given-names: Liyan
+  - family-names: Li
+    given-names: Zhifei
+  - family-names: Guo
+    given-names: Wentao
+  - family-names: You
+    given-names: Jiacheng
+  - family-names: Li
+    given-names: Kunjun
+  - family-names: Wei
+    given-names: Qingfu
+  - family-names: Peng
+    given-names: Bo
+repository-code: "https://github.com/wenhaochai/rtx-h100"
+license: Apache-2.0

@@ -1,0 +1,956 @@
+diff --git a/intern/cycles/kernel/bvh/bvh2_dynamic.h b/intern/cycles/kernel/bvh/bvh2_dynamic.h
+index 73e24d0..f08742f 100644
+--- a/intern/cycles/kernel/bvh/bvh2_dynamic.h
++++ b/intern/cycles/kernel/bvh/bvh2_dynamic.h
+@@ -646,6 +646,97 @@ ccl_device_forceinline void bvh2df_run(Work &work, uint *counter, const int work
+     }
+   }
+ }
++
++#  ifdef CYCLES_SSSDF
++/* The same fetch / refill / deferred-finish loop for per-lane work whose step is not a BVH2
++ * traversal step (the subsurface random walk: one bounce per step). Work provides
++ *   int state(int index); bool begin(int state)   (false: nothing to step, finish at once)
++ *   bool step(int state)  (true: finished);       void finish(int state)
++ * Policy knobs as above (CYCLES_BVH2DF_POLICY / _MINLIVE / _ND / _NW / _DEFER / _FETCH);
++ * CYCLES_BVH2DF_CHUNK is not applied here. */
++template<class Work>
++ccl_device_forceinline void bvh2df_run_work(Work &work, uint *counter, const int work_size)
++{
++  const uint lane = threadIdx.x & 31;
++  const uint warp_mask = __activemask();
++  bool active = false;
++  bool exhausted = false;
++#    if CYCLES_BVH2DF_DEFER
++  bool pending = false;
++#    endif
++  int state = 0;
++  while (true) {
++#    if CYCLES_BVH2DF_DEFER
++    if (pending) {
++      work.finish(state);
++      pending = false;
++    }
++#    endif
++    const bool idle = !active && !exhausted;
++    const uint fetch_mask = __ballot_sync(warp_mask, idle);
++    if (fetch_mask) {
++#    if CYCLES_BVH2DF_FETCH == 0
++      const int leader = __ffs(fetch_mask) - 1;
++      uint base = 0;
++      if (lane == leader) {
++        base = atomicAdd(counter, uint(__popc(fetch_mask)));
++      }
++      base = __shfl_sync(warp_mask, base, leader);
++#    endif
++      if (idle) {
++#    if CYCLES_BVH2DF_FETCH == 0
++        const uint next = base + __popc(fetch_mask & ((1u << lane) - 1));
++#    else
++        const uint next = atomicAdd(counter, 1u);
++#    endif
++        exhausted = next >= uint(work_size);
++        if (!exhausted) {
++          state = work.state(int(next));
++          active = work.begin(state);
++          if (!active) {
++            work.finish(state);
++          }
++        }
++      }
++    }
++    if (!__any_sync(warp_mask, active)) {
++      if (__all_sync(warp_mask, exhausted)) {
++        return;
++      }
++      continue;
++    }
++#    if CYCLES_BVH2DF_POLICY == 0
++    int lost_iterations = 0;
++#    endif
++    while (true) {
++      if (active) {
++        if (work.step(state)) {
++#    if CYCLES_BVH2DF_DEFER
++          pending = true;
++#    else
++          work.finish(state);
++#    endif
++          active = false;
++        }
++      }
++      const uint live = __ballot_sync(warp_mask, active);
++      if (!live) {
++        break;
++      }
++#    if CYCLES_BVH2DF_POLICY == 0
++      lost_iterations += __popc(warp_mask & ~live) - CYCLES_BVH2DF_ND;
++      if (lost_iterations >= CYCLES_BVH2DF_NW) {
++        break;
++      }
++#    else
++      if (__popc(live) < CYCLES_BVH2DF_MINLIVE && !__all_sync(warp_mask, exhausted || active)) {
++        break;
++      }
++#    endif
++    }
++  }
++}
++#  endif /* CYCLES_SSSDF */
+ #endif
+ 
+ CCL_NAMESPACE_END
+diff --git a/intern/cycles/kernel/bvh/local.h b/intern/cycles/kernel/bvh/local.h
+index 1d25571..7aca1a8 100644
+--- a/intern/cycles/kernel/bvh/local.h
++++ b/intern/cycles/kernel/bvh/local.h
+@@ -22,7 +22,7 @@
+ #ifndef __KERNEL_GPU__
+ ccl_device
+ #else
+-ccl_device_inline
++ccl_device_hot
+ #endif
+     bool BVH_FUNCTION_FULL_NAME(BVH)(KernelGlobals kg,
+                                      const ccl_private Ray *ray,
+@@ -219,7 +219,7 @@ ccl_device_inline
+   return false;
+ }
+ 
+-ccl_device_inline bool BVH_FUNCTION_NAME(KernelGlobals kg,
++ccl_device_hot bool BVH_FUNCTION_NAME(KernelGlobals kg,
+                                          const ccl_private Ray *ray,
+                                          ccl_private LocalIntersection *local_isect,
+                                          const int local_object,
+diff --git a/intern/cycles/kernel/closure/bsdf.h b/intern/cycles/kernel/closure/bsdf.h
+index b8d72a5..28922b1 100644
+--- a/intern/cycles/kernel/closure/bsdf.h
++++ b/intern/cycles/kernel/closure/bsdf.h
+@@ -170,7 +170,7 @@ ccl_device_inline bool bsdf_is_transmission(const ccl_private ShaderClosure *sc,
+   return dot(sc->N, wo) < 0.0f;
+ }
+ 
+-ccl_device_inline int bsdf_sample(KernelGlobals kg,
++ccl_device_hot int bsdf_sample(KernelGlobals kg,
+                                   ccl_private ShaderData *sd,
+                                   const ccl_private ShaderClosure *sc,
+                                   const float3 rand,
+@@ -549,7 +549,7 @@ ccl_device_inline int bsdf_label(const KernelGlobals kg,
+ #ifndef __KERNEL_CUDA__
+ ccl_device
+ #else
+-ccl_device_inline
++ccl_device_hot
+ #endif
+     Spectrum bsdf_eval(KernelGlobals kg,
+                        ccl_private ShaderData *sd,
+diff --git a/intern/cycles/kernel/closure/bsdf_microfacet.h b/intern/cycles/kernel/closure/bsdf_microfacet.h
+index b9261e4..2bcb2a2 100644
+--- a/intern/cycles/kernel/closure/bsdf_microfacet.h
++++ b/intern/cycles/kernel/closure/bsdf_microfacet.h
+@@ -1222,7 +1222,7 @@ ccl_device void bsdf_microfacet_blur(ccl_private ShaderClosure *sc, const float
+   bsdf->alpha_y = fmaxf(roughness, bsdf->alpha_y);
+ }
+ 
+-ccl_device Spectrum bsdf_microfacet_ggx_eval(KernelGlobals kg,
++ccl_device_hot Spectrum bsdf_microfacet_ggx_eval(KernelGlobals kg,
+                                              const ccl_private ShaderClosure *sc,
+                                              const float3 wi,
+                                              const float3 wo,
+@@ -1232,7 +1232,7 @@ ccl_device Spectrum bsdf_microfacet_ggx_eval(KernelGlobals kg,
+   return bsdf->energy_scale * bsdf_microfacet_eval<MicrofacetType::GGX>(kg, sc, wi, wo, pdf);
+ }
+ 
+-ccl_device int bsdf_microfacet_ggx_sample(KernelGlobals kg,
++ccl_device_hot int bsdf_microfacet_ggx_sample(KernelGlobals kg,
+                                           const ccl_private ShaderClosure *sc,
+                                           const float3 Ng,
+                                           const float3 wi,
+diff --git a/intern/cycles/kernel/device/cuda/compat.h b/intern/cycles/kernel/device/cuda/compat.h
+index fe130c3..3dd2fad 100644
+--- a/intern/cycles/kernel/device/cuda/compat.h
++++ b/intern/cycles/kernel/device/cuda/compat.h
+@@ -35,6 +35,19 @@ typedef unsigned long long uint64_t;
+ #define ccl_device_inline __device__ __inline__
+ #define ccl_device_forceinline __device__ __forceinline__
+ #define ccl_device_noinline __device__ __noinline__
++/* Ours: CYCLES_INLINE_HOT=1 force-inlines the hot BSDF, shader-setup, local-BVH and light-tree functions that
++ * nvcc inlines once SVM node pruning shrinks the interpreter; =2 also the surface_shader BSDF evaluators.
++ * Unset: the same qualifier as before (__inline__), so the cubin does not change. */
++#if defined(CYCLES_INLINE_HOT) && CYCLES_INLINE_HOT >= 1
++#  define ccl_device_hot __device__ __forceinline__
++#else
++#  define ccl_device_hot __device__ __inline__
++#endif
++#if defined(CYCLES_INLINE_HOT) && CYCLES_INLINE_HOT >= 2
++#  define ccl_device_hot2 __device__ __forceinline__
++#else
++#  define ccl_device_hot2 __device__ __inline__
++#endif
+ #define ccl_device_noinline_cpu ccl_device
+ #define ccl_device_inline_method ccl_device
+ #define ccl_device_template_spec template<> ccl_device_inline
+diff --git a/intern/cycles/kernel/device/gpu/kernel.h b/intern/cycles/kernel/device/gpu/kernel.h
+index 4f40235..ed0d375 100644
+--- a/intern/cycles/kernel/device/gpu/kernel.h
++++ b/intern/cycles/kernel/device/gpu/kernel.h
+@@ -59,6 +59,10 @@
+     (defined(CYCLES_BVH2DF_CLOSEST) || defined(CYCLES_BVH2DF_SHADOW))
+ #  include "kernel/integrator/intersect_dynamic.h"
+ #endif
++/* Dynamic-fetch subsurface random walk for intersect_subsurface (CYCLES_SSSDF). */
++#if defined(__KERNEL_CUDA__) && !defined(__KERNEL_OPTIX__) && defined(CYCLES_SSSDF)
++#  include "kernel/integrator/intersect_subsurface_dynamic.h"
++#endif
+ 
+ /* --------------------------------------------------------------------
+  * Integrator.
+@@ -223,6 +227,11 @@ ccl_gpu_kernel_sss
+                              const ccl_global int *path_index_array,
+                              const int work_size)
+ {
++#if defined(__KERNEL_CUDA__) && !defined(__KERNEL_OPTIX__) && defined(CYCLES_SSSDF) && \
++    defined(__SUBSURFACE__)
++  integrator_intersect_subsurface_df(path_index_array, work_size);
++  return;
++#endif
+   const int global_index = ccl_gpu_global_id_x();
+ 
+   if (ccl_gpu_kernel_within_bounds(global_index, work_size)) {
+diff --git a/intern/cycles/kernel/geom/shader_data.h b/intern/cycles/kernel/geom/shader_data.h
+index ed9525f..b2f4957 100644
+--- a/intern/cycles/kernel/geom/shader_data.h
++++ b/intern/cycles/kernel/geom/shader_data.h
+@@ -43,7 +43,7 @@ ccl_device void shader_setup_object_transforms(KernelGlobals kg,
+ #ifdef __KERNEL_HIP__
+ ccl_device_noinline
+ #else
+-ccl_device_inline
++ccl_device_hot
+ #endif
+     void shader_setup_from_ray(KernelGlobals kg,
+                                ccl_private ShaderData *ccl_restrict sd,
+diff --git a/intern/cycles/kernel/integrator/intersect_subsurface_dynamic.h b/intern/cycles/kernel/integrator/intersect_subsurface_dynamic.h
+new file mode 100644
+index 0000000..0649495
+--- /dev/null
++++ b/intern/cycles/kernel/integrator/intersect_subsurface_dynamic.h
+@@ -0,0 +1,153 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++
++#pragma once
++
++/* Dynamic-fetch version of the intersect_subsurface kernel (CYCLES_SSSDF), Blender 5.3.0: random
++ * walks advance one bounce per step through bvh2df_run_work, and a lane whose walk ends takes the
++ * next path, so warps stay full. Begin, step and end are subsurface_random_walk's own code
++ * (subsurface_walk_steps.h); the rest is subsurface_scatter / integrator_intersect_subsurface,
++ * unchanged. Every walk runs to its end inside the launch. Paths that do not take a random walk
++ * (disk BSSRDF) run the stock kernel body.
++ *
++ * Launch: the host's normal grid, no host change; the last block to finish resets the counter. */
++
++#include "kernel/bvh/bvh2_dynamic.h"
++#include "kernel/integrator/subsurface_walk_steps.h"
++
++CCL_NAMESPACE_BEGIN
++
++#ifdef __SUBSURFACE__
++
++/* subsurface_scatter after subsurface_random_walk returned true. */
++ccl_device_forceinline void subsurface_scatter_exit(KernelGlobals kg,
++                                                    IntegratorState state,
++                                                    ccl_private Ray &ray,
++                                                    const ccl_private Intersection &exit_isect)
++{
++#  ifdef __VOLUME__
++  /* Update volume stack if needed. */
++  if (kernel_data.integrator.use_volumes) {
++    const int object = exit_isect.object;
++    const uint object_flag = kernel_data_fetch(object_flag, object);
++
++    if (object_flag & SD_OBJECT_INTERSECTS_VOLUME) {
++      const float3 P = INTEGRATOR_STATE(state, ray, P);
++
++      integrator_volume_stack_update_for_subsurface(kg, state, P, ray.P);
++    }
++  }
++#  endif /* __VOLUME__ */
++
++  /* Pretend ray is coming from the outside towards the exit point. This ensures
++   * correct front/back facing normals.
++   * TODO: find a more elegant solution? */
++  ray.P += ray.D * ray.tmax * 2.0f;
++  ray.D = -ray.D;
++
++  integrator_state_write_isect(state, &exit_isect);
++  integrator_state_write_ray(state, &ray);
++
++  /* Advance random number offset for bounce. */
++  INTEGRATOR_STATE_WRITE(state, path, rng_offset) += PRNG_BOUNCE_NUM;
++
++  const int shader = intersection_get_shader(kg, &exit_isect);
++  const int shader_flags = kernel_data_fetch(shaders, shader).flags;
++  const uint object_flags = intersection_get_object_flags(kg, &exit_isect);
++  const bool use_caustics = kernel_data.integrator.use_caustics &&
++                            (object_flags & SD_OBJECT_CAUSTICS_RECEIVER);
++  const bool use_raytrace_kernel = (shader_flags & SD_HAS_RAYTRACE);
++
++  if (use_caustics) {
++    integrator_path_next(state,
++                         DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE,
++                         DEVICE_KERNEL_INTEGRATOR_INTERSECT_MNEE);
++  }
++  else if (use_raytrace_kernel) {
++    integrator_path_next_sorted(kg,
++                                state,
++                                DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE,
++                                DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE,
++                                shader);
++  }
++  else {
++    integrator_path_next_sorted(kg,
++                                state,
++                                DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE,
++                                DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE,
++                                shader);
++  }
++}
++
++struct IntersectSubsurfaceDFWork {
++  const ccl_global int *path_index_array;
++  SSSWalk w;
++  /* 0: walk returned false before its loop, 1: walk loop ended, 2: not a random walk (stock
++   * kernel body). */
++  int status;
++
++  ccl_device_forceinline int state(const int index)
++  {
++    return path_index_array ? path_index_array[index] : index;
++  }
++
++  ccl_device_forceinline bool begin(const int state)
++  {
++    if (!(INTEGRATOR_STATE(state, path, flag) & PATH_RAY_SUBSURFACE_RANDOM_WALK)) {
++      status = 2;
++      return false;
++    }
++    /* subsurface_scatter: rng_state is loaded before the walk, which takes a copy. */
++    path_state_rng_load(state, &w.rng_state);
++    if (!sss_walk_begin(nullptr, state, w)) {
++      status = 0;
++      return false;
++    }
++    status = 1;
++    return true;
++  }
++
++  ccl_device_forceinline bool step(const int state)
++  {
++    return sss_walk_step(nullptr, state, w);
++  }
++
++  ccl_device_forceinline void finish(const int state)
++  {
++    KernelGlobals kg = nullptr;
++    if (status == 2) {
++      integrator_intersect_subsurface(kg, state);
++      return;
++    }
++    if (status == 1 && sss_walk_end(kg, state, w)) {
++      subsurface_scatter_exit(kg, state, w.ray, w.ss_isect.hits[0]);
++      return;
++    }
++    /* integrator_intersect_subsurface after subsurface_scatter returned false. */
++    integrator_path_terminate(kg, state, nullptr, DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE);
++  }
++};
++
++/* [0] the fetch counter, [1] blocks finished in the current launch. */
++extern "C" __device__ uint sssdf_counters[2];
++__device__ uint sssdf_counters[2] = {0, 0};
++
++ccl_device_forceinline void integrator_intersect_subsurface_df(
++    const ccl_global int *path_index_array, const int work_size)
++{
++  IntersectSubsurfaceDFWork work;
++  work.path_index_array = path_index_array;
++  bvh2df_run_work(work, &sssdf_counters[0], work_size);
++  __syncthreads();
++  if (threadIdx.x == 0) {
++    __threadfence();
++    if (atomicAdd(&sssdf_counters[1], 1u) == gridDim.x - 1) {
++      sssdf_counters[0] = 0;
++      sssdf_counters[1] = 0;
++      __threadfence();
++    }
++  }
++}
++
++#endif /* __SUBSURFACE__ */
++
++CCL_NAMESPACE_END
+diff --git a/intern/cycles/kernel/integrator/state_flow.h b/intern/cycles/kernel/integrator/state_flow.h
+index c8939b2..b58188b 100644
+--- a/intern/cycles/kernel/integrator/state_flow.h
++++ b/intern/cycles/kernel/integrator/state_flow.h
+@@ -71,7 +71,7 @@ ccl_device_inline void write_optical_depth(KernelGlobals kg,
+ ccl_device_forceinline void integrator_path_init(IntegratorState state,
+                                                  const DeviceKernel next_kernel)
+ {
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.queue_counter->num_queued[next_kernel], 1);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.queue_counter->num_queued[next_kernel]);
+   INTEGRATOR_STATE_WRITE(state, path, queued_kernel) = next_kernel;
+ }
+ 
+@@ -79,9 +79,8 @@ ccl_device_forceinline void integrator_path_next(IntegratorState state,
+                                                  const DeviceKernel current_kernel,
+                                                  const DeviceKernel next_kernel)
+ {
+-  atomic_fetch_and_sub_uint32(&kernel_integrator_state.queue_counter->num_queued[current_kernel],
+-                              1);
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.queue_counter->num_queued[next_kernel], 1);
++  CYCLES_COUNTER_SUB1(&kernel_integrator_state.queue_counter->num_queued[current_kernel]);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.queue_counter->num_queued[next_kernel]);
+   INTEGRATOR_STATE_WRITE(state, path, queued_kernel) = next_kernel;
+ }
+ 
+@@ -92,8 +91,7 @@ ccl_device_forceinline void integrator_path_terminate(KernelGlobals kg,
+ {
+   write_optical_depth(kg, state, render_buffer);
+ 
+-  atomic_fetch_and_sub_uint32(&kernel_integrator_state.queue_counter->num_queued[current_kernel],
+-                              1);
++  CYCLES_COUNTER_SUB1(&kernel_integrator_state.queue_counter->num_queued[current_kernel]);
+   INTEGRATOR_STATE_WRITE(state, path, queued_kernel) = 0;
+ }
+ 
+@@ -115,15 +113,14 @@ ccl_device_forceinline void integrator_path_cache_miss_sorted(IntegratorState st
+   }
+ 
+   const int key_ = INTEGRATOR_STATE_WRITE(state, path, shader_sort_key);
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.sort_key_counter[current_kernel][key_], 1);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.sort_key_counter[current_kernel][key_]);
+ }
+ 
+ ccl_device_forceinline IntegratorShadowState integrator_shadow_path_init(
+     KernelGlobals kg, IntegratorState state, const DeviceKernel next_kernel, const bool is_ao)
+ {
+-  IntegratorShadowState shadow_state = atomic_fetch_and_add_uint32(
+-      &kernel_integrator_state.next_shadow_path_index[0], 1);
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.queue_counter->num_queued[next_kernel], 1);
++  IntegratorShadowState shadow_state = CYCLES_COUNTER_FETCH_INC(&kernel_integrator_state.next_shadow_path_index[0]);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.queue_counter->num_queued[next_kernel]);
+   INTEGRATOR_STATE_WRITE(shadow_state, shadow_path, queued_kernel) = next_kernel;
+ #  if defined(__PATH_GUIDING__)
+   if ((kernel_data.kernel_features & KERNEL_FEATURE_PATH_GUIDING)) {
+@@ -137,17 +134,15 @@ ccl_device_forceinline void integrator_shadow_path_next(IntegratorShadowState st
+                                                         const DeviceKernel current_kernel,
+                                                         const DeviceKernel next_kernel)
+ {
+-  atomic_fetch_and_sub_uint32(&kernel_integrator_state.queue_counter->num_queued[current_kernel],
+-                              1);
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.queue_counter->num_queued[next_kernel], 1);
++  CYCLES_COUNTER_SUB1(&kernel_integrator_state.queue_counter->num_queued[current_kernel]);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.queue_counter->num_queued[next_kernel]);
+   INTEGRATOR_STATE_WRITE(state, shadow_path, queued_kernel) = next_kernel;
+ }
+ 
+ ccl_device_forceinline void integrator_shadow_path_terminate(IntegratorShadowState state,
+                                                              const DeviceKernel current_kernel)
+ {
+-  atomic_fetch_and_sub_uint32(&kernel_integrator_state.queue_counter->num_queued[current_kernel],
+-                              1);
++  CYCLES_COUNTER_SUB1(&kernel_integrator_state.queue_counter->num_queued[current_kernel]);
+   INTEGRATOR_STATE_WRITE(state, shadow_path, queued_kernel) = 0;
+ }
+ 
+@@ -168,7 +163,7 @@ ccl_device_forceinline void integrator_path_init_sorted(KernelGlobals kg,
+                                                         const uint32_t key)
+ {
+   const int key_ = INTEGRATOR_SORT_KEY(key, state);
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.queue_counter->num_queued[next_kernel], 1);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.queue_counter->num_queued[next_kernel]);
+   INTEGRATOR_STATE_WRITE(state, path, queued_kernel) = next_kernel;
+   INTEGRATOR_STATE_WRITE(state, path, shader_sort_key) = key_;
+ 
+@@ -176,7 +171,7 @@ ccl_device_forceinline void integrator_path_init_sorted(KernelGlobals kg,
+     return;
+   }
+ 
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.sort_key_counter[next_kernel][key_], 1);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.sort_key_counter[next_kernel][key_]);
+ }
+ 
+ ccl_device_forceinline void integrator_path_next_sorted(KernelGlobals kg,
+@@ -186,9 +181,8 @@ ccl_device_forceinline void integrator_path_next_sorted(KernelGlobals kg,
+                                                         const uint32_t key)
+ {
+   const int key_ = INTEGRATOR_SORT_KEY(key, state);
+-  atomic_fetch_and_sub_uint32(&kernel_integrator_state.queue_counter->num_queued[current_kernel],
+-                              1);
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.queue_counter->num_queued[next_kernel], 1);
++  CYCLES_COUNTER_SUB1(&kernel_integrator_state.queue_counter->num_queued[current_kernel]);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.queue_counter->num_queued[next_kernel]);
+   INTEGRATOR_STATE_WRITE(state, path, queued_kernel) = next_kernel;
+   INTEGRATOR_STATE_WRITE(state, path, shader_sort_key) = key_;
+ 
+@@ -196,7 +190,7 @@ ccl_device_forceinline void integrator_path_next_sorted(KernelGlobals kg,
+     return;
+   }
+ 
+-  atomic_fetch_and_add_uint32(&kernel_integrator_state.sort_key_counter[next_kernel][key_], 1);
++  CYCLES_COUNTER_ADD1(&kernel_integrator_state.sort_key_counter[next_kernel][key_]);
+ }
+ 
+ #else
+diff --git a/intern/cycles/kernel/integrator/subsurface.h b/intern/cycles/kernel/integrator/subsurface.h
+index 0a92c27..2b6ae78 100644
+--- a/intern/cycles/kernel/integrator/subsurface.h
++++ b/intern/cycles/kernel/integrator/subsurface.h
+@@ -169,7 +169,7 @@ ccl_device void subsurface_shader_data_setup(KernelGlobals kg, ccl_private Shade
+   bsdf_diffuse_setup(sd, N, weight);
+ }
+ 
+-ccl_device_inline bool subsurface_scatter(KernelGlobals kg, IntegratorState state)
++ccl_device_hot bool subsurface_scatter(KernelGlobals kg, IntegratorState state)
+ {
+   RNGState rng_state;
+   path_state_rng_load(state, &rng_state);
+diff --git a/intern/cycles/kernel/integrator/subsurface_walk_steps.h b/intern/cycles/kernel/integrator/subsurface_walk_steps.h
+new file mode 100644
+index 0000000..0c34544
+--- /dev/null
++++ b/intern/cycles/kernel/integrator/subsurface_walk_steps.h
+@@ -0,0 +1,311 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++
++#pragma once
++
++/* subsurface_random_walk (kernel/integrator/subsurface_random_walk.h, Blender 5.3.0) split into
++ * begin / one bounce / end, so that a dynamic-fetch loop can advance many walks one bounce at a
++ * time (CYCLES_SSSDF). The code of each part is the stock function's own, in the same order, with
++ * the same random numbers; only the variables the bounce loop carries live in SSSWalk instead of
++ * locals. The stock function is left as it is. Each walk runs to its end inside one launch (no
++ * split walk on 5.3.0).
++ *
++ *   sss_walk_begin  the function up to the bounce loop; false = it returns false before the loop
++ *   sss_walk_step   one iteration of the bounce loop; true = the loop ended (exit hit, small
++ *                   throughput or BSSRDF_MAX_BOUNCES)
++ *   sss_walk_end    the function after the loop; returns its result (true: exit hit)
++ */
++
++#ifdef __SUBSURFACE__
++
++#  ifndef SUBSURFACE_RANDOM_WALK_SIMILARITY_LEVEL
++#    error "subsurface_walk_steps.h mirrors 5.3.0 with SUBSURFACE_RANDOM_WALK_SIMILARITY_LEVEL set"
++#  endif
++
++CCL_NAMESPACE_BEGIN
++
++struct SSSWalk {
++  Ray ray;
++  /* subsurface_scatter's ss_isect, as stock carries it through the walk. A local per bounce
++   * instead (only hits[0] kept) gives the same results but spills more (dfsss10: 384 vs 82 B). */
++  LocalIntersection ss_isect;
++  RNGState rng_state;
++  /* The walk's constants (stock locals P, D, N, object, albedo, alpha, diffusion_length,
++   * phase_log; sigma_t, sigma_s, anisotropy, guided_fraction are the stock *_org values). */
++  float3 P, D, N;
++  int object;
++  Spectrum albedo, alpha, sigma_t, sigma_s, sigma_t_star, sigma_s_star;
++  float anisotropy, guided_fraction, diffusion_length, phase_log;
++  /* Loop-carried. */
++  Spectrum throughput;
++  float opposite_distance;
++  int bounce;
++  bool hit, have_opposite_interface;
++};
++
++/* rng_state must hold path_state_rng_load(state) on entry, as subsurface_scatter passes it. */
++ccl_device_forceinline bool sss_walk_begin(KernelGlobals kg, IntegratorState state, SSSWalk &w)
++{
++  Ray &ray = w.ray;
++  RNGState &rng_state = w.rng_state;
++
++  w.P = INTEGRATOR_STATE(state, ray, P);
++  w.D = INTEGRATOR_STATE(state, ray, D);
++  const float ray_dP = INTEGRATOR_STATE(state, ray, dP);
++  const float time = INTEGRATOR_STATE(state, ray, time);
++  w.N = INTEGRATOR_STATE(state, subsurface, N);
++  w.object = INTEGRATOR_STATE(state, isect, object);
++  const int prim = INTEGRATOR_STATE(state, isect, prim);
++
++  /* Setup ray. */
++  ray.P = w.P;
++  ray.D = w.D;
++  ray.tmin = 0.0f;
++  ray.tmax = FLT_MAX;
++  ray.time = time;
++  ray.dP = ray_dP;
++  ray.dD = differential_zero_compact();
++  ray.self.object = w.object;
++  ray.self.prim = prim;
++  ray.self.light_object = OBJECT_NONE;
++  ray.self.light_prim = PRIM_NONE;
++
++  /* Convert subsurface to volume coefficients. */
++  w.albedo = INTEGRATOR_STATE(state, subsurface, albedo);
++  const Spectrum radius = INTEGRATOR_STATE(state, subsurface, radius);
++  float anisotropy = INTEGRATOR_STATE(state, subsurface, anisotropy);
++
++  bool van_de_hulst;
++  if (anisotropy >= 1.0f) {
++    /* Legacy random walk was mapped from (-1, 1) to (1, 3) when stored in integrator state. */
++    anisotropy -= 2.0f;
++    van_de_hulst = anisotropy < 0.0f;
++  }
++  else {
++    van_de_hulst = true;
++  }
++
++  Spectrum sigma_t;
++  Spectrum alpha;
++  Spectrum throughput = INTEGRATOR_STATE(state, path, throughput);
++  subsurface_random_walk_coefficients(
++      w.albedo, radius, anisotropy, van_de_hulst, &sigma_t, &alpha, &throughput);
++  const Spectrum sigma_s = sigma_t * alpha;
++
++  const float diffusion_length = diffusion_length_dwivedi(reduce_max(alpha));
++
++  if (diffusion_length == 1.0f) {
++    return false;
++  }
++
++  /* Precompute term for phase sampling. */
++  w.phase_log = logf((diffusion_length + 1.0f) / (diffusion_length - 1.0f));
++
++  /* Modify state for RNGs, decorrelated from other paths. */
++  path_state_rng_scramble(&rng_state, 0xdeadbeef);
++
++  /* Random walk until we hit the surface again. */
++  w.hit = false;
++  w.have_opposite_interface = false;
++  w.opposite_distance = 0.0f;
++
++  const float guided_fraction = 1.0f - fmaxf(0.5f, powf(fabsf(anisotropy), 0.125f));
++
++  w.sigma_s_star = sigma_s * (1.0f - anisotropy);
++  w.sigma_t_star = sigma_t - sigma_s + w.sigma_s_star;
++  w.sigma_t = sigma_t;
++  w.sigma_s = sigma_s;
++  w.anisotropy = anisotropy;
++  w.guided_fraction = guided_fraction;
++
++  w.alpha = alpha;
++  w.throughput = throughput;
++  w.diffusion_length = diffusion_length;
++  w.bounce = 0;
++  return true;
++}
++
++/* One iteration of the bounce loop, for bounce w.bounce; true when the loop has ended. */
++ccl_device_forceinline bool sss_walk_step(KernelGlobals kg, IntegratorState state, SSSWalk &w)
++{
++  Ray &ray = w.ray;
++  RNGState &rng_state = w.rng_state;
++  const int bounce = w.bounce;
++  const float3 P = w.P;
++  const float3 N = w.N;
++  const float diffusion_length = w.diffusion_length;
++  const float phase_log = w.phase_log;
++  LocalIntersection &ss_isect = w.ss_isect;
++  bool hit;
++
++  /* Advance random number offset. */
++  rng_state.rng_offset += PRNG_BOUNCE_NUM;
++
++  float anisotropy;
++  float guided_fraction;
++  Spectrum sigma_s;
++  Spectrum sigma_t;
++  if (bounce <= SUBSURFACE_RANDOM_WALK_SIMILARITY_LEVEL) {
++    anisotropy = w.anisotropy;
++    guided_fraction = w.guided_fraction;
++    sigma_t = w.sigma_t;
++    sigma_s = w.sigma_s;
++  }
++  else {
++    anisotropy = 0.0f;
++    guided_fraction = 0.75f;  // back to isotropic heuristic from Blender
++    sigma_t = w.sigma_t_star;
++    sigma_s = w.sigma_s_star;
++  }
++
++  /* Sample color channel, use MIS with balance heuristic. */
++  float rchannel = path_state_rng_1D(kg, &rng_state, PRNG_SUBSURFACE_COLOR_CHANNEL);
++  Spectrum channel_pdf;
++  const int channel = volume_sample_channel(w.alpha, w.throughput, &rchannel, &channel_pdf);
++  float sample_sigma_t = volume_channel_get(sigma_t, channel);
++  const float randt = path_state_rng_1D(kg, &rng_state, PRNG_SUBSURFACE_SCATTER_DISTANCE);
++
++  float backward_fraction = 0.0f;
++  float forward_pdf_factor = 0.0f;
++  float forward_stretching = 1.0f;
++  float backward_pdf_factor = 0.0f;
++  float backward_stretching = 1.0f;
++
++  /* For the initial ray, we already know the direction, so just do classic distance sampling. */
++  if (bounce > 0) {
++    /* Decide whether we should use guided or classic sampling. */
++    const bool guided = (path_state_rng_1D(kg, &rng_state, PRNG_SUBSURFACE_GUIDE_STRATEGY) <
++                         guided_fraction);
++
++    bool guide_backward = false;
++    if (w.have_opposite_interface) {
++      const float x = clamp(dot(ray.P - P, -N), 0.0f, w.opposite_distance);
++      backward_fraction = 1.0f /
++                          (1.0f + expf((w.opposite_distance - 2.0f * x) / diffusion_length));
++      guide_backward = path_state_rng_1D(kg, &rng_state, PRNG_SUBSURFACE_GUIDE_DIRECTION) <
++                       backward_fraction;
++    }
++
++    /* Sample scattering direction. */
++    const float2 rand_scatter = path_state_rng_2D(kg, &rng_state, PRNG_SUBSURFACE_BSDF);
++    float cos_theta;
++    float hg_pdf;
++    if (guided) {
++      cos_theta = sample_phase_dwivedi(diffusion_length, phase_log, rand_scatter.x);
++      if (guide_backward) {
++        cos_theta = -cos_theta;
++      }
++      const float3 newD = direction_from_cosine(N, cos_theta, rand_scatter.y);
++      hg_pdf = phase_henyey_greenstein(dot(ray.D, newD), anisotropy);
++      ray.D = newD;
++    }
++    else {
++      const float3 newD = phase_henyey_greenstein_sample(ray.D, anisotropy, rand_scatter, &hg_pdf);
++      cos_theta = dot(newD, N);
++      ray.D = newD;
++    }
++
++    forward_pdf_factor = M_1_2PI_F * eval_phase_dwivedi(diffusion_length, phase_log, cos_theta) /
++                         hg_pdf;
++    backward_pdf_factor = M_1_2PI_F *
++                          eval_phase_dwivedi(diffusion_length, phase_log, -cos_theta) / hg_pdf;
++
++    forward_stretching = (1.0f - cos_theta / diffusion_length);
++    backward_stretching = (1.0f + cos_theta / diffusion_length);
++    if (guided) {
++      sample_sigma_t *= guide_backward ? backward_stretching : forward_stretching;
++    }
++  }
++
++  /* Sample distance along ray. */
++  float t = -logf(1.0f - randt) / sample_sigma_t;
++
++  if (bounce == 0) {
++    ray.tmax = max(t, 10.0f / (reduce_min(sigma_t)));
++  }
++  else {
++    ray.tmax = t;
++    /* After the first bounce the object can intersect the same surface again */
++    ray.self.object = OBJECT_NONE;
++    ray.self.prim = PRIM_NONE;
++  }
++  scene_intersect_local<true>(kg, &ray, &ss_isect, w.object, nullptr, 1);
++  hit = (ss_isect.num_hits > 0);
++
++  if (hit) {
++    ray.tmax = ss_isect.hits[0].t;
++  }
++
++  if (bounce == 0) {
++    /* Check if we hit the opposite side. */
++    if (hit) {
++      w.have_opposite_interface = true;
++      w.opposite_distance = dot(ray.P + ray.tmax * ray.D - P, -N);
++    }
++    hit = ray.tmax < t;
++  }
++
++  /* Use the distance to the exit point for the throughput update if we found one. */
++  if (hit) {
++    t = ray.tmax;
++  }
++
++  /* Advance to new scatter location. */
++  ray.P += t * ray.D;
++
++  Spectrum transmittance;
++  Spectrum pdf = subsurface_random_walk_pdf(sigma_t, t, hit, &transmittance);
++  if (bounce > 0) {
++    Spectrum guided_pdf = subsurface_random_walk_pdf(
++        forward_stretching * sigma_t, t, hit, nullptr);
++
++    if (w.have_opposite_interface) {
++      const Spectrum back_pdf = subsurface_random_walk_pdf(
++          backward_stretching * sigma_t, t, hit, nullptr);
++      guided_pdf = mix(
++          guided_pdf * forward_pdf_factor, back_pdf * backward_pdf_factor, backward_fraction);
++    }
++    else {
++      guided_pdf *= forward_pdf_factor;
++    }
++
++    pdf = mix(pdf, guided_pdf, guided_fraction);
++  }
++
++  w.throughput *= (hit ? transmittance : sigma_s * transmittance) / dot(channel_pdf, pdf);
++  w.hit = hit;
++
++  if (hit) {
++    /* If we hit the surface, we are done. */
++    return true;
++  }
++  if (reduce_max(w.throughput) < VOLUME_THROUGHPUT_EPSILON) {
++    return true;
++  }
++  w.bounce = bounce + 1;
++  return w.bounce >= BSSRDF_MAX_BOUNCES;
++}
++
++/* The function after its bounce loop; returns its result. */
++ccl_device_forceinline bool sss_walk_end(KernelGlobals kg, IntegratorState state, SSSWalk &w)
++{
++  if (w.hit) {
++    kernel_assert(isfinite_safe(w.throughput));
++
++    guiding_record_bssrdf_bounce(
++        kg,
++        state,
++        1.0f,
++        w.N,
++        w.D,
++        safe_divide_color(w.throughput, INTEGRATOR_STATE(state, path, throughput)),
++        w.albedo);
++
++    INTEGRATOR_STATE_WRITE(state, path, throughput) = w.throughput;
++  }
++
++  return w.hit;
++}
++
++CCL_NAMESPACE_END
++
++#endif /* __SUBSURFACE__ */
+diff --git a/intern/cycles/kernel/integrator/surface_shader.h b/intern/cycles/kernel/integrator/surface_shader.h
+index 43b8662..2d34ec0 100644
+--- a/intern/cycles/kernel/integrator/surface_shader.h
++++ b/intern/cycles/kernel/integrator/surface_shader.h
+@@ -274,7 +274,7 @@ ccl_device_forceinline bool _surface_shader_exclude(ClosureType type,
+   return false;
+ }
+ 
+-ccl_device_inline float _surface_shader_bsdf_eval_mis(KernelGlobals kg,
++ccl_device_hot2 float _surface_shader_bsdf_eval_mis(KernelGlobals kg,
+                                                       ccl_private ShaderData *sd,
+                                                       const float3 wo,
+                                                       const ccl_private ShaderClosure *skip_sc,
+@@ -384,7 +384,7 @@ ccl_device_inline float surface_shader_bsdf_eval_pdfs(const KernelGlobals kg,
+ #ifndef __KERNEL_CUDA__
+ ccl_device
+ #else
+-ccl_device_inline
++ccl_device_hot2
+ #endif
+     float surface_shader_bsdf_eval(KernelGlobals kg,
+                                    ccl_attr_maybe_unused IntegratorState state,
+@@ -975,7 +975,7 @@ ccl_device int surface_shader_bsdf_guided_sample_closure(
+ 
+ /* Sample direction for picked BSDF, and return evaluation and pdf for all
+  * BSDFs combined using MIS. */
+-ccl_device int surface_shader_bsdf_sample_closure(KernelGlobals kg,
++ccl_device_hot2 int surface_shader_bsdf_sample_closure(KernelGlobals kg,
+                                                   ccl_private ShaderData *sd,
+                                                   const ccl_private ShaderClosure *sc,
+                                                   const float3 rand_bsdf,
+@@ -1273,6 +1273,11 @@ ccl_device void surface_shader_eval(KernelGlobals kg,
+   }
+   else {
+     max_closures = use_caustics_storage ? CAUSTICS_MAX_CLOSURE : kernel_data.max_closures;
++#ifdef __MAX_CLOSURE__
++    /* Ours: a per-scene build with a smaller closure array (-D__MAX_CLOSURE__ >= the scene's count) never
++     * writes past it, even if the host asks for more. */
++    max_closures = min(max_closures, MAX_CLOSURE);
++#endif
+   }
+ 
+   sd->num_closure = 0;
+diff --git a/intern/cycles/kernel/light/tree.h b/intern/cycles/kernel/light/tree.h
+index e20208a..4b030f4 100644
+--- a/intern/cycles/kernel/light/tree.h
++++ b/intern/cycles/kernel/light/tree.h
+@@ -811,7 +811,7 @@ ccl_device bool light_tree_sample(KernelGlobals kg,
+ 
+ /* We need to be able to find the probability of selecting a given light for MIS. */
+ template<bool in_volume_segment>
+-ccl_device float light_tree_pdf(KernelGlobals kg,
++ccl_device_hot float light_tree_pdf(KernelGlobals kg,
+                                 float3 P,
+                                 float3 N,
+                                 const float dt,
+diff --git a/intern/cycles/kernel/svm/svm.h b/intern/cycles/kernel/svm/svm.h
+index 9fd2fcf..c26694f 100644
+--- a/intern/cycles/kernel/svm/svm.h
++++ b/intern/cycles/kernel/svm/svm.h
+@@ -94,6 +94,15 @@ CCL_NAMESPACE_BEGIN
+     case node: \
+       if (!kernel_data_svm_usage_##node) \
+         break;
++#elif defined(CYCLES_SVM_NODES_USED)
++/* Ours: per-scene build. svm_nodes_used.h (jobs/svm_nodes_header.py, from the host's "SVM nodes used" log
++ * line) defines CYCLES_SVM_USED_<node> as 1 for every node type the scene's shaders use and 0 otherwise, so
++ * the cases of unused node types compile to nothing, as Metal does with function constants. */
++#  include "svm_nodes_used.h"
++#  define SVM_CASE(node) \
++    case node: \
++      if (!CYCLES_SVM_USED_##node) \
++        break;
+ #else
+ #  define SVM_CASE(node) case node:
+ #endif
+diff --git a/intern/cycles/util/atomic.h b/intern/cycles/util/atomic.h
+index 697df94..4db699b 100644
+--- a/intern/cycles/util/atomic.h
++++ b/intern/cycles/util/atomic.h
+@@ -327,4 +327,40 @@ ccl_device_inline int atomic_load_local(int *p)
+ 
+ #  endif /* __KERNEL_ONEAPI__ */
+ 
++/* Ours, CYCLES_WARP_ATOMICS (final4's warp-aggregated atomics, Zhifei Li, ported to 5.3.0): the lanes of a warp
++ * that update the same queue counter combine their updates into one atomic by the lowest such lane. A counter
++ * ends with the same value as with one atomic per lane; only which lane gets which returned index changes, and
++ * that order was already decided by atomic arrival order. Unset: the stock calls, unchanged. */
++#  if defined(CYCLES_WARP_ATOMICS) && defined(__KERNEL_CUDA__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
++ccl_device_forceinline void atomic_add_aggregated_uint32(ccl_global uint *p, const uint x)
++{
++  const unsigned int mask = __activemask();
++  const unsigned int peers = __match_any_sync(mask, (unsigned long long)p);
++  const unsigned int sum = __reduce_add_sync(peers, x);
++  if ((threadIdx.x & 31) == (__ffs(peers) - 1)) {
++    atomicAdd((unsigned int *)p, sum);
++  }
++}
++ccl_device_forceinline uint atomic_fetch_add_one_aggregated_uint32(ccl_global uint *p)
++{
++  const unsigned int mask = __activemask();
++  const unsigned int peers = __match_any_sync(mask, (unsigned long long)p);
++  const int leader = __ffs(peers) - 1;
++  const unsigned int lane = threadIdx.x & 31;
++  unsigned int base = 0;
++  if (lane == leader) {
++    base = atomicAdd((unsigned int *)p, __popc(peers));
++  }
++  base = __shfl_sync(peers, base, leader);
++  return base + __popc(peers & ((1u << lane) - 1u));
++}
++#    define CYCLES_COUNTER_ADD1(p) atomic_add_aggregated_uint32((ccl_global uint *)(p), 1u)
++#    define CYCLES_COUNTER_SUB1(p) atomic_add_aggregated_uint32((ccl_global uint *)(p), (uint)-1)
++#    define CYCLES_COUNTER_FETCH_INC(p) atomic_fetch_add_one_aggregated_uint32((ccl_global uint *)(p))
++#  else
++#    define CYCLES_COUNTER_ADD1(p) atomic_fetch_and_add_uint32((p), 1)
++#    define CYCLES_COUNTER_SUB1(p) atomic_fetch_and_sub_uint32((p), 1)
++#    define CYCLES_COUNTER_FETCH_INC(p) atomic_fetch_and_add_uint32((p), 1)
++#  endif
++
+ #endif /* __KERNEL_GPU__ */

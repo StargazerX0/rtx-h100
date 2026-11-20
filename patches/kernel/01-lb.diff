@@ -1,0 +1,170 @@
+diff --git a/intern/cycles/kernel/bvh/nodes.h b/intern/cycles/kernel/bvh/nodes.h
+index 7063a8b..3554ff6 100644
+--- a/intern/cycles/kernel/bvh/nodes.h
++++ b/intern/cycles/kernel/bvh/nodes.h
+@@ -39,6 +39,26 @@ ccl_device_forceinline int bvh_aligned_node_intersect(KernelGlobals kg,
+   float4 node1 = kernel_data_fetch(bvh_nodes, node_addr + 2);
+   float4 node2 = kernel_data_fetch(bvh_nodes, node_addr + 3);
+ 
++#ifdef CYCLES_BVH_FMA
++  const float pidx = P.x * idir.x, pidy = P.y * idir.y, pidz = P.z * idir.z;
++  float c0lox = fmaf(node0.x, idir.x, -pidx);
++  float c0hix = fmaf(node0.z, idir.x, -pidx);
++  float c0loy = fmaf(node1.x, idir.y, -pidy);
++  float c0hiy = fmaf(node1.z, idir.y, -pidy);
++  float c0loz = fmaf(node2.x, idir.z, -pidz);
++  float c0hiz = fmaf(node2.z, idir.z, -pidz);
++  float c0min = max4(tmin, min(c0lox, c0hix), min(c0loy, c0hiy), min(c0loz, c0hiz));
++  float c0max = min4(tmax, max(c0lox, c0hix), max(c0loy, c0hiy), max(c0loz, c0hiz));
++
++  float c1lox = fmaf(node0.y, idir.x, -pidx);
++  float c1hix = fmaf(node0.w, idir.x, -pidx);
++  float c1loy = fmaf(node1.y, idir.y, -pidy);
++  float c1hiy = fmaf(node1.w, idir.y, -pidy);
++  float c1loz = fmaf(node2.y, idir.z, -pidz);
++  float c1hiz = fmaf(node2.w, idir.z, -pidz);
++  float c1min = max4(tmin, min(c1lox, c1hix), min(c1loy, c1hiy), min(c1loz, c1hiz));
++  float c1max = min4(tmax, max(c1lox, c1hix), max(c1loy, c1hiy), max(c1loz, c1hiz));
++#else
+   /* intersect ray against child nodes */
+   float c0lox = (node0.x - P.x) * idir.x;
+   float c0hix = (node0.z - P.x) * idir.x;
+@@ -57,6 +77,7 @@ ccl_device_forceinline int bvh_aligned_node_intersect(KernelGlobals kg,
+   float c1hiz = (node2.w - P.z) * idir.z;
+   float c1min = max4(tmin, min(c1lox, c1hix), min(c1loy, c1hiy), min(c1loz, c1hiz));
+   float c1max = min4(tmax, max(c1lox, c1hix), max(c1loy, c1hiy), max(c1loz, c1hiz));
++#endif
+ 
+   dist[0] = c0min;
+   dist[1] = c1min;
+diff --git a/intern/cycles/kernel/device/cuda/config.h b/intern/cycles/kernel/device/cuda/config.h
+index 2fda2a6..e16e53b 100644
+--- a/intern/cycles/kernel/device/cuda/config.h
++++ b/intern/cycles/kernel/device/cuda/config.h
+@@ -52,6 +52,42 @@
+                                                GPU_MULTIPRESSOR_MAX_REGISTERS / \
+                                                    (block_num_threads * thread_num_registers))
+ 
++#ifndef CYCLES_ISECT_BLOCK
++#  define CYCLES_ISECT_BLOCK GPU_KERNEL_BLOCK_NUM_THREADS
++#endif
++#ifndef CYCLES_ISECT_MINBLOCKS
++#  define CYCLES_ISECT_MINBLOCKS \
++    (GPU_MULTIPRESSOR_MAX_REGISTERS / (CYCLES_ISECT_BLOCK * GPU_KERNEL_MAX_REGISTERS))
++#endif
++#ifndef CYCLES_SHADE_BLOCK
++#  define CYCLES_SHADE_BLOCK GPU_KERNEL_BLOCK_NUM_THREADS
++#endif
++#ifndef CYCLES_SHADE_MINBLOCKS
++#  define CYCLES_SHADE_MINBLOCKS \
++    (GPU_MULTIPRESSOR_MAX_REGISTERS / (CYCLES_SHADE_BLOCK * GPU_KERNEL_MAX_REGISTERS))
++#endif
++#ifndef CYCLES_SSS_BLOCK
++#  define CYCLES_SSS_BLOCK CYCLES_ISECT_BLOCK
++#endif
++#ifndef CYCLES_SSS_MINBLOCKS
++#  define CYCLES_SSS_MINBLOCKS CYCLES_ISECT_MINBLOCKS
++#endif
++#ifndef CYCLES_NEE_BLOCK
++#  define CYCLES_NEE_BLOCK GPU_KERNEL_BLOCK_NUM_THREADS
++#endif
++#ifndef CYCLES_NEE_MINBLOCKS
++#  define CYCLES_NEE_MINBLOCKS \
++    (GPU_MULTIPRESSOR_MAX_REGISTERS / (CYCLES_NEE_BLOCK * GPU_KERNEL_MAX_REGISTERS))
++#endif
++#define ccl_gpu_kernel_isect \
++  extern "C" __global__ void __launch_bounds__(CYCLES_ISECT_BLOCK, CYCLES_ISECT_MINBLOCKS)
++#define ccl_gpu_kernel_sss \
++  extern "C" __global__ void __launch_bounds__(CYCLES_SSS_BLOCK, CYCLES_SSS_MINBLOCKS)
++#define ccl_gpu_kernel_shade \
++  extern "C" __global__ void __launch_bounds__(CYCLES_SHADE_BLOCK, CYCLES_SHADE_MINBLOCKS)
++#define ccl_gpu_kernel_nee \
++  extern "C" __global__ void __launch_bounds__(CYCLES_NEE_BLOCK, CYCLES_NEE_MINBLOCKS)
++
+ #define ccl_gpu_kernel_threads(block_num_threads) \
+   extern "C" __global__ void __launch_bounds__(block_num_threads)
+ 
+diff --git a/intern/cycles/kernel/device/gpu/kernel.h b/intern/cycles/kernel/device/gpu/kernel.h
+index 837d75c..59d7d7e 100644
+--- a/intern/cycles/kernel/device/gpu/kernel.h
++++ b/intern/cycles/kernel/device/gpu/kernel.h
+@@ -155,7 +155,20 @@ ccl_gpu_kernel_postfix
+ #    include "kernel/device/oneapi/context_intersect_begin.h"
+ #  endif
+ 
+-ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++#ifndef ccl_gpu_kernel_isect
++#  define ccl_gpu_kernel_isect ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++#endif
++#ifndef ccl_gpu_kernel_sss
++#  define ccl_gpu_kernel_sss ccl_gpu_kernel_isect
++#endif
++#ifndef ccl_gpu_kernel_shade
++#  define ccl_gpu_kernel_shade ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++#endif
++#ifndef ccl_gpu_kernel_nee
++#  define ccl_gpu_kernel_nee ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++#endif
++
++ccl_gpu_kernel_isect
+     ccl_gpu_kernel_signature(integrator_intersect_closest,
+                              const ccl_global int *path_index_array,
+                              ccl_global float *render_buffer,
+@@ -170,7 +183,7 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+ }
+ ccl_gpu_kernel_postfix
+ 
+-ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++ccl_gpu_kernel_isect
+     ccl_gpu_kernel_signature(integrator_intersect_shadow,
+                              const ccl_global int *path_index_array,
+                              const int work_size)
+@@ -184,7 +197,7 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+ }
+ ccl_gpu_kernel_postfix
+ 
+-ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++ccl_gpu_kernel_sss
+     ccl_gpu_kernel_signature(integrator_intersect_subsurface,
+                              const ccl_global int *path_index_array,
+                              const int work_size)
+@@ -265,7 +278,7 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+ }
+ ccl_gpu_kernel_postfix
+ 
+-ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++ccl_gpu_kernel_nee
+     ccl_gpu_kernel_signature(integrator_shade_light_nee,
+                              const ccl_global int *path_index_array,
+                              ccl_global float *render_buffer,
+@@ -295,7 +308,7 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+ }
+ ccl_gpu_kernel_postfix
+ 
+-ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++ccl_gpu_kernel_shade
+     ccl_gpu_kernel_signature(integrator_shade_shadow,
+                              const ccl_global int *path_index_array,
+                              ccl_global float *render_buffer,
+@@ -310,7 +323,7 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+ }
+ ccl_gpu_kernel_postfix
+ 
+-ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
++ccl_gpu_kernel_shade
+     ccl_gpu_kernel_signature(integrator_shade_surface,
+                              const ccl_global int *path_index_array,
+                              ccl_global float *render_buffer,
+diff --git a/intern/cycles/scene/scene.cpp b/intern/cycles/scene/scene.cpp
+index fe56ce4..12e1cba 100644
+--- a/intern/cycles/scene/scene.cpp
++++ b/intern/cycles/scene/scene.cpp
+@@ -688,6 +688,8 @@ bool Scene::update_camera_resolution(Progress &progress, int width, int height)
+ static void log_kernel_features(const uint64_t features)
+ {
+   LOG_INFO << "Requested features:";
++  /* Ours (logging only): the numeric mask, to compile a per-scene kernel with -D__KERNEL_FEATURES__. */
++  LOG_INFO << "Kernel features mask " << features;
+   LOG_INFO << "Use BSDF " << string_from_bool(features & KERNEL_FEATURE_NODE_BSDF);
+   LOG_INFO << "Use Emission " << string_from_bool(features & KERNEL_FEATURE_NODE_EMISSION);
+   LOG_INFO << "Use Volume " << string_from_bool(features & KERNEL_FEATURE_NODE_VOLUME);

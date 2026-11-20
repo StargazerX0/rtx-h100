@@ -1,0 +1,32 @@
+diff --git a/intern/cycles/kernel/sample/tabulated_sobol.h b/intern/cycles/kernel/sample/tabulated_sobol.h
+index 1874d62..c6fe877 100644
+--- a/intern/cycles/kernel/sample/tabulated_sobol.h
++++ b/intern/cycles/kernel/sample/tabulated_sobol.h
+@@ -16,7 +16,18 @@ ccl_device uint tabulated_sobol_shuffled_sample_index(KernelGlobals kg,
+                                                       const uint dimension,
+                                                       const uint seed)
+ {
++#if defined(CYCLES_TABSOBOL_CAP)
++  /* ours: shuffle samples within aligned blocks of at most CYCLES_TABSOBOL_CAP points of the host table (stride and
++   * wrap stay the host's). All pixels are at about the same sample index at a time, so the table area in use shrinks
++   * from size x 256 patterns x 16 B (32 MiB at the benchmark's 2^24 samples) to CAP x 256 x 16 B; per pixel and
++   * dimension the first N samples use the same point set (aligned blocks of a scrambled Sobol sequence). At <= CAP
++   * samples the result is identical to stock. */
++  const uint table_count = kernel_data.integrator.tabulated_sobol_sequence_size;
++  const uint sample_count = min(table_count, (uint)CYCLES_TABSOBOL_CAP);
++#else
+   const uint sample_count = kernel_data.integrator.tabulated_sobol_sequence_size;
++  const uint table_count = sample_count;
++#endif
+ 
+   /* Shuffle the pattern order and sample index to decorrelate
+    * dimensions and make the most of the finite patterns we have.
+@@ -30,7 +41,7 @@ ccl_device uint tabulated_sobol_shuffled_sample_index(KernelGlobals kg,
+                                                        hash_wang_seeded_uint(dimension, seed));
+   sample = (sample & ~sample_mask) | (sample_shuffled & sample_mask);
+ 
+-  return ((pattern_i * sample_count) + sample) % (sample_count * NUM_TAB_SOBOL_PATTERNS);
++  return ((pattern_i * table_count) + sample) % (table_count * NUM_TAB_SOBOL_PATTERNS);
+ }
+ 
+ ccl_device float tabulated_sobol_sample_1D(KernelGlobals kg,
