@@ -12,7 +12,7 @@ Exact per-scene kernel specialization gives the first 2.0 times. A per-scene bak
 
 ## News
 
-- **2026-11-21** RTX PRO 6000 support: the `exact` and `nrc` configurations ported to the RTX PRO 6000 Blackwell (sm_120) and tuned there, plus an OptiX route on its RT cores. `nrc` at 78,297 samples per minute with OptiX and 74,847 with CUDA; `exact` at 19,942 with CUDA, 25,864 with OptiX. [RESULTS-rtxpro6000.md](RESULTS-rtxpro6000.md)
+- **2026-11-21** RTX PRO 6000 support: the `exact` and `nrc` configurations ported to the RTX PRO 6000 Blackwell (sm_120) and tuned there, plus an OptiX route on its RT cores. `nrc` at 78,297 samples per minute with OptiX and 74,847 with CUDA; `exact` at 19,942 with CUDA, 25,864 with OptiX. [#7](https://github.com/wenhaochai/rtx-h100/pull/7)
 - **2026-11-21** `nrc-scatter`: the cache answers the light the first hit scatters toward the camera and learns it from targets that average eight samples at that hit. 55,148 samples per minute, up from 48,641; 40.4 images per second at the 32-spp bar, up from 28.6. [#5](https://github.com/wenhaochai/rtx-h100/pull/5)
 - **2026-11-21** Negative result: sampling K bounces and querying the cache K times per ending path cuts the cache's noise but costs more than it saves at the bar. [#4](https://github.com/wenhaochai/rtx-h100/pull/4)
 - **2026-11-20** Negative result: the scattered query trained on one-sample targets shows where the low-sample noise comes from, but its caches are biased. [#3](https://github.com/wenhaochai/rtx-h100/pull/3)
