@@ -96,6 +96,8 @@ The same recipe on one NVIDIA RTX PRO 6000 Blackwell Server Edition (sm_120, 188
 
 Counted as for the H100 table above: images per second that reach the PSNR of an exact 32-spp render against the 65,536-spp reference, one over the median render time of three seed-0 renders at the fewest samples that clear the bar, without scene load. `nrc` clears it at 16, 20 and 20 samples on this card, against 20, 20 and 24 on the H100, and gives 39.9 images per second against 28.6 there; its mean luminance at those counts is off by +1.8%, -1.3% and +5.0%. The CUDA and OptiX routes render the same `nrc` images. `nrc-scatter` (40.4 on the H100) is not ported yet: its inference engine, `nrc_infer.cu`, uses wgmma and builds for sm_90a only.
 
+[RESULTS-rtxpro6000.md](RESULTS-rtxpro6000.md) has every step, the image checks and the reproduction.
+
 ## Reproduce
 
 Needs an H100, the CUDA 12.9 toolkit, GCC 14, CMake, git-lfs, and Python 3 with numpy and OpenEXR. `$W` is one work directory.
