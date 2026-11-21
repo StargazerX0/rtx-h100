@@ -85,8 +85,6 @@ The same recipe on one NVIDIA RTX PRO 6000 Blackwell Server Edition (sm_120, 188
 | `nrc`, CUDA | 33,890 | 19,571 | 21,385 | 74,847 | approximate, passes the image gate |
 | **`nrc`, OptiX** | **35,634** | **22,040** | **20,623** | **78,297** | approximate, passes the image gate |
 
-The largest change from the H100 configuration is the shade kernels' register budget: the H100's 64 registers are the worst point measured on sm_120, and 384 threads at 168 registers give +40%. The rest comes from gathering the hash grid inside the fused MLP kernel, fp16 accumulation in its `mma.sync` core, scrambling distance 0, per-scene build choices, and on the OptiX route an OptiX module register limit and the walk roulette of the CUDA SSS walk. Applied to an earlier OptiX tree for this card, the exact shading changes of this repository give 28,187 within the exact tier and 31,384 within the strict tier, below the seed-to-seed noise floor. [RESULTS-rtxpro6000.md](RESULTS-rtxpro6000.md) has every step, the image checks, what did not help and the reproduction; the configurations are in `configs/pro6000/` (CUDA), `configs/pro6000-optix/` and `patches/optix/` (OptiX), and `configs/pro6000-v53/` and `patches/v53/`.
-
 | images per second at the 32-spp bar | monster | junkshop | classroom | total | vs stock, same device |
 |---|---|---|---|---|---|
 | stock Blender 5.3.0, CUDA, 32 spp | 1.65 | 1.04 | 0.77 | 3.46 | 1.0x |
